@@ -1,0 +1,1113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>petrify. Freeze the world. Keep the clock ticking.</title>
+  <meta name="description" content="petrify removes people from security footage while preserving the live timestamp. Built by starside.io." />
+  <meta property="og:title" content="petrify. Freeze the world. Keep the clock ticking." />
+  <meta property="og:description" content="Open-source computer vision pipeline that removes people from security footage while preserving the live timestamp." />
+  <meta property="og:image" content="demo_camera1.gif" />
+  <link rel="icon" type="image/png" href="starside.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ── Reset & Base ── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --red:        #ef4444;
+      --red-dark:   #dc2626;
+      --red-deep:   #b91c1c;
+      --bg:         #0a0a0a;
+      --bg2:        #111111;
+      --bg3:        #181818;
+      --white:      #ffffff;
+      --gray:       #d1d5db;
+      --gray-dim:   #6b7280;
+      --glass:      rgba(255,255,255,0.05);
+      --glass-border: rgba(255,255,255,0.10);
+      --red-glass:  rgba(239,68,68,0.08);
+      --red-border: rgba(239,68,68,0.25);
+      --radius:     16px;
+      --radius-lg:  24px;
+      --max-w:      1160px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--white);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    /* ── Stars ── */
+    .stars {
+      position: fixed; inset: 0; pointer-events: none; z-index: 0;
+      overflow: hidden;
+    }
+    .star {
+      position: absolute;
+      border-radius: 50%;
+      background: white;
+      animation: twinkle var(--d, 3s) ease-in-out infinite;
+      animation-delay: var(--delay, 0s);
+      opacity: 0;
+    }
+    @keyframes twinkle {
+      0%, 100% { opacity: 0; transform: scale(1); }
+      50%       { opacity: var(--max-op, 0.7); transform: scale(1.3); }
+    }
+
+    /* ── Ambient background glow ── */
+    .ambient {
+      position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    }
+    .ambient::before {
+      content: '';
+      position: absolute;
+      top: -20%; left: 30%;
+      width: 700px; height: 700px;
+      background: radial-gradient(circle, rgba(239,68,68,0.12) 0%, transparent 70%);
+      animation: drift 20s ease-in-out infinite alternate;
+    }
+    .ambient::after {
+      content: '';
+      position: absolute;
+      bottom: 10%; right: -10%;
+      width: 500px; height: 500px;
+      background: radial-gradient(circle, rgba(185,28,28,0.08) 0%, transparent 70%);
+      animation: drift 16s ease-in-out infinite alternate-reverse;
+    }
+    @keyframes drift {
+      from { transform: translate(0,0) scale(1); }
+      to   { transform: translate(-60px, 40px) scale(1.15); }
+    }
+
+    /* ── Layout ── */
+    .container { max-width: var(--max-w); margin: 0 auto; padding: 0 2rem; position: relative; z-index: 1; }
+
+    /* ── NAV ── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      padding: 1.1rem 2rem;
+      display: flex; align-items: center; justify-content: space-between;
+      background: rgba(10,10,10,0.7);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--glass-border);
+      transition: background 0.3s;
+    }
+    .nav-logo {
+      display: flex; align-items: center; gap: 0.65rem;
+      text-decoration: none; color: var(--white);
+    }
+    .nav-logo-icon { display: none; }
+    .nav-logo-svg {
+      height: 28px; width: auto;
+      filter: drop-shadow(0 0 8px rgba(239,68,68,0.35));
+      flex-shrink: 0;
+    }
+    .nav-logo-text { display: none; }
+    .nav-links { display: flex; align-items: center; gap: 2rem; }
+    .nav-links a {
+      color: var(--gray); text-decoration: none; font-size: 0.9rem; font-weight: 500;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--white); }
+    .nav-cta {
+      background: linear-gradient(135deg, var(--red), var(--red-dark));
+      color: white; text-decoration: none;
+      padding: 0.55rem 1.4rem; border-radius: 50px;
+      font-size: 0.85rem; font-weight: 600;
+      transition: transform 0.2s, box-shadow 0.2s;
+      box-shadow: 0 0 16px rgba(239,68,68,0.3);
+      white-space: nowrap; flex-shrink: 0;
+    }
+    .nav-cta:hover { transform: translateY(-2px); box-shadow: 0 4px 24px rgba(239,68,68,0.45); }
+    .nav-cta-short { display: none; }  /* mobile short label */
+
+    /* ── HERO ── */
+    #hero {
+      min-height: 100vh;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      text-align: center;
+      padding: 8rem 2rem 5rem;
+      position: relative;
+    }
+
+    .hero-eyebrow {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      background: var(--red-glass);
+      border: 1px solid var(--red-border);
+      border-radius: 50px;
+      padding: 0.4rem 1rem;
+      font-size: 0.78rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+      color: #fca5a5;
+      margin-bottom: 2rem;
+    }
+    .hero-eyebrow-dot {
+      width: 6px; height: 6px; border-radius: 50%; background: var(--red);
+      animation: pulse-dot 2s ease-in-out infinite;
+    }
+    @keyframes pulse-dot {
+      0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.6); }
+      50%      { box-shadow: 0 0 0 5px rgba(239,68,68,0); }
+    }
+
+    .hero-logo {
+      width: clamp(260px, 55vw, 620px);
+      height: auto;
+      margin-bottom: 2rem;
+      filter: drop-shadow(0 0 30px rgba(239,68,68,0.45)) drop-shadow(0 0 60px rgba(239,68,68,0.15));
+      animation: glow-logo 3s ease-in-out infinite;
+    }
+    @keyframes glow-logo {
+      0%,100% { filter: drop-shadow(0 0 20px rgba(239,68,68,0.35)) drop-shadow(0 0 50px rgba(239,68,68,0.1)); }
+      50%      { filter: drop-shadow(0 0 40px rgba(239,68,68,0.6)) drop-shadow(0 0 80px rgba(239,68,68,0.25)); }
+    }
+
+    .hero-tagline {
+      font-size: clamp(1.1rem, 2.5vw, 1.5rem);
+      font-weight: 400; color: var(--gray);
+      letter-spacing: 0.15em; text-transform: uppercase;
+      margin-bottom: 1.5rem;
+    }
+    .hero-tagline strong { color: var(--white); font-weight: 700; }
+
+    .hero-sub {
+      max-width: 600px;
+      font-size: clamp(1rem, 2vw, 1.2rem);
+      color: var(--gray-dim);
+      line-height: 1.7;
+      margin-bottom: 3rem;
+    }
+    .hero-sub em { color: var(--gray); font-style: normal; }
+
+    .hero-actions { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; margin-bottom: 4rem; }
+
+    .btn-primary {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      background: linear-gradient(135deg, var(--red), var(--red-dark));
+      color: white; text-decoration: none;
+      padding: 0.9rem 2.2rem; border-radius: 50px;
+      font-size: 1rem; font-weight: 600;
+      box-shadow: 0 0 24px rgba(239,68,68,0.35);
+      transition: transform 0.2s, box-shadow 0.2s;
+      position: relative; overflow: hidden;
+    }
+    .btn-primary::after {
+      content: '';
+      position: absolute; inset: 0;
+      background: linear-gradient(45deg, transparent 40%, rgba(255,255,255,0.15) 50%, transparent 60%);
+      transform: translateX(-100%);
+      transition: transform 0s;
+    }
+    .btn-primary:hover::after { transform: translateX(200%); transition: transform 0.5s ease; }
+    .btn-primary:hover { transform: translateY(-3px); box-shadow: 0 8px 32px rgba(239,68,68,0.5); }
+
+    .btn-ghost {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      background: var(--glass);
+      border: 1px solid var(--glass-border);
+      color: var(--gray); text-decoration: none;
+      padding: 0.9rem 2.2rem; border-radius: 50px;
+      font-size: 1rem; font-weight: 500;
+      backdrop-filter: blur(10px);
+      transition: all 0.2s;
+    }
+    .btn-ghost:hover { background: rgba(255,255,255,0.1); color: var(--white); transform: translateY(-3px); }
+
+    /* scroll indicator */
+    .scroll-hint {
+      display: flex; flex-direction: column; align-items: center; gap: 0.5rem;
+      color: var(--gray-dim); font-size: 0.78rem; letter-spacing: 0.1em; text-transform: uppercase;
+    }
+    .scroll-arrow {
+      width: 28px; height: 28px; border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.15);
+      display: flex; align-items: center; justify-content: center;
+      animation: bounce 2s ease-in-out infinite;
+    }
+    .scroll-arrow svg { width: 12px; height: 12px; stroke: var(--gray-dim); }
+    @keyframes bounce {
+      0%,100% { transform: translateY(0); }
+      50%      { transform: translateY(6px); }
+    }
+
+    /* ── SECTION COMMON ── */
+    section { padding: 6rem 0; position: relative; z-index: 1; }
+    .section-label {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      font-size: 0.73rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+      color: var(--red); margin-bottom: 1.2rem;
+    }
+    .section-label::before {
+      content: ''; display: block; width: 20px; height: 1px; background: var(--red);
+    }
+    h2 {
+      font-size: clamp(1.8rem, 3.5vw, 2.8rem);
+      font-weight: 800; letter-spacing: -0.03em; line-height: 1.2;
+      margin-bottom: 1rem;
+    }
+    .gradient-text {
+      background: linear-gradient(135deg, #fff 40%, var(--red) 100%);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .section-intro {
+      font-size: 1.1rem; color: var(--gray); max-width: 560px; line-height: 1.7;
+      margin-bottom: 3.5rem;
+    }
+
+    /* ── DEMO section ── */
+    #demo { background: var(--bg2); border-top: 1px solid var(--glass-border); border-bottom: 1px solid var(--glass-border); }
+
+    .demo-grid { display: flex; flex-direction: column; gap: 4rem; }
+
+    .demo-card {
+      background: var(--glass);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      position: relative;
+      transition: transform 0.3s, box-shadow 0.3s;
+    }
+    .demo-card:hover {
+      transform: translateY(-4px);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 0 40px rgba(239,68,68,0.1);
+    }
+    .demo-card-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 1.2rem 1.5rem;
+      background: rgba(0,0,0,0.4);
+      border-bottom: 1px solid var(--glass-border);
+    }
+    .demo-card-title { font-weight: 600; font-size: 0.9rem; color: var(--gray); }
+    .demo-labels {
+      display: flex; gap: 1rem; font-size: 0.72rem; font-weight: 600;
+      letter-spacing: 0.08em; text-transform: uppercase; color: var(--gray-dim);
+    }
+    .demo-labels .orig { color: #fbbf24; }
+    .demo-labels .proc { color: #34d399; }
+    .demo-separator { color: var(--gray-dim); }
+
+    .demo-card-body { padding: 0; position: relative; }
+    .demo-card-body img {
+      width: 100%; display: block;
+      image-rendering: auto;
+    }
+    .demo-card-footer {
+      padding: 1rem 1.5rem;
+      background: rgba(0,0,0,0.3);
+      border-top: 1px solid var(--glass-border);
+      font-size: 0.83rem; color: var(--gray-dim); line-height: 1.5;
+    }
+    .demo-card-footer strong { color: var(--gray); }
+
+    .demo-divider {
+      position: absolute; top: 0; bottom: 0;
+      left: 50%; width: 1px;
+      background: rgba(239,68,68,0.5);
+      pointer-events: none; z-index: 2;
+    }
+    .demo-divider::before {
+      content: '│';
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      color: var(--red); font-size: 0;
+    }
+
+    /* ── HOW IT WORKS ── */
+    #how { }
+
+    .pipeline {
+      display: flex; align-items: stretch; gap: 0;
+      margin-bottom: 4rem;
+      position: relative;
+    }
+    .pipeline-step {
+      flex: 1;
+      background: var(--glass);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius);
+      padding: 2rem 1.5rem;
+      position: relative;
+      transition: all 0.3s;
+      cursor: default;
+    }
+    .pipeline-step:not(:last-child) {
+      border-right: none;
+      border-radius: var(--radius) 0 0 var(--radius);
+    }
+    .pipeline-step:not(:first-child):not(:last-child) {
+      border-radius: 0;
+    }
+    .pipeline-step:last-child {
+      border-radius: 0 var(--radius) var(--radius) 0;
+    }
+    .pipeline-step:hover {
+      background: var(--red-glass);
+      border-color: var(--red-border);
+      z-index: 2;
+    }
+    .pipeline-arrow {
+      position: absolute; right: -14px; top: 50%; transform: translateY(-50%);
+      z-index: 3;
+      width: 28px; height: 28px; border-radius: 50%;
+      background: var(--bg2);
+      border: 1px solid var(--glass-border);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.7rem; color: var(--red);
+    }
+    .pipeline-num {
+      font-size: 2.5rem; font-weight: 900; color: var(--red);
+      font-family: 'JetBrains Mono', monospace;
+      opacity: 0.25; line-height: 1; margin-bottom: 0.5rem;
+    }
+    .pipeline-icon { font-size: 1.8rem; margin-bottom: 0.75rem; }
+    .pipeline-name { font-weight: 700; font-size: 0.95rem; margin-bottom: 0.4rem; }
+    .pipeline-desc { font-size: 0.82rem; color: var(--gray-dim); line-height: 1.5; }
+    .pipeline-tag {
+      display: inline-block; margin-top: 0.75rem;
+      background: var(--red-glass);
+      border: 1px solid var(--red-border);
+      border-radius: 4px;
+      padding: 0.2rem 0.5rem;
+      font-size: 0.7rem; font-weight: 600; color: #fca5a5;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .passes-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    .pass-card {
+      background: var(--glass);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius);
+      padding: 2rem;
+      transition: all 0.3s;
+    }
+    .pass-card:hover { background: var(--red-glass); border-color: var(--red-border); transform: translateY(-4px); }
+    .pass-card-header {
+      display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem;
+    }
+    .pass-badge {
+      background: linear-gradient(135deg, var(--red), var(--red-deep));
+      color: white; border-radius: 8px;
+      padding: 0.3rem 0.7rem;
+      font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .pass-name { font-weight: 700; font-size: 1rem; }
+    .pass-desc { font-size: 0.87rem; color: var(--gray-dim); line-height: 1.6; }
+    .pass-desc strong { color: var(--gray); }
+
+    /* ── FEATURES ── */
+    #features { background: var(--bg2); border-top: 1px solid var(--glass-border); border-bottom: 1px solid var(--glass-border); }
+
+    .features-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.5rem;
+    }
+    .feature-card {
+      background: var(--glass);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius);
+      padding: 2rem;
+      transition: all 0.3s;
+    }
+    .feature-card:hover {
+      background: var(--red-glass);
+      border-color: var(--red-border);
+      transform: translateY(-6px);
+      box-shadow: 0 16px 40px rgba(0,0,0,0.4);
+    }
+    .feature-icon {
+      width: 46px; height: 46px; border-radius: 12px;
+      background: var(--red-glass);
+      border: 1px solid var(--red-border);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.3rem; margin-bottom: 1.1rem;
+    }
+    .feature-title { font-weight: 700; font-size: 1rem; margin-bottom: 0.5rem; }
+    .feature-desc { font-size: 0.87rem; color: var(--gray-dim); line-height: 1.6; }
+
+    /* ── INSTALL ── */
+    #install { }
+
+    .install-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; align-items: start; min-width: 0; }
+    /* grid children must opt in to shrinking below content size */
+    .install-grid > * { min-width: 0; overflow: hidden; }
+    .code-block {
+      background: #0d0d0d;
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      min-width: 0;
+    }
+    .code-block-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0.75rem 1.2rem;
+      background: rgba(255,255,255,0.03);
+      border-bottom: 1px solid var(--glass-border);
+    }
+    .code-dots { display: flex; gap: 0.4rem; }
+    .code-dot { width: 10px; height: 10px; border-radius: 50%; }
+    .code-dot.r { background: #ff5f57; }
+    .code-dot.y { background: #febc2e; }
+    .code-dot.g { background: #28c840; }
+    .code-file { font-size: 0.75rem; color: var(--gray-dim); font-family: 'JetBrains Mono', monospace; }
+    .code-block pre {
+      padding: 1.4rem 1.5rem;
+      overflow-x: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      line-height: 1.7;
+      color: var(--gray);
+      /* force pre to scroll rather than expand its parent */
+      max-width: 100%;
+      box-sizing: border-box;
+    }
+
+    .cli-demo { overflow-x: auto; max-width: 100%; }
+    .c-comment { color: var(--gray-dim); }
+    .c-cmd     { color: #f87171; }
+    .c-flag    { color: #93c5fd; }
+    .c-val     { color: #86efac; }
+    .c-prompt  { color: var(--gray-dim); user-select: none; }
+
+    .install-cta-box {
+      background: var(--red-glass);
+      border: 1px solid var(--red-border);
+      border-radius: var(--radius);
+      padding: 2rem;
+    }
+    .install-cta-box h3 { font-size: 1.2rem; font-weight: 700; margin-bottom: 0.75rem; }
+    .install-cta-box p { font-size: 0.9rem; color: var(--gray-dim); line-height: 1.6; margin-bottom: 1.5rem; }
+
+    .cli-demo {
+      background: #0d0d0d;
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius);
+      padding: 1.4rem 1.5rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      line-height: 1.8;
+      color: var(--gray);
+      margin-top: 1.5rem;
+    }
+
+    /* ── USE CASES ── */
+    #usecases { background: var(--bg2); border-top: 1px solid var(--glass-border); border-bottom: 1px solid var(--glass-border); }
+
+    .disclaimer {
+      display: flex; align-items: flex-start; gap: 0.75rem;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-left: 3px solid rgba(255,255,255,0.15);
+      border-radius: var(--radius);
+      padding: 1rem 1.25rem;
+      margin-top: 3rem;
+      font-size: 0.78rem; color: var(--gray-dim); line-height: 1.6;
+    }
+    .disclaimer-icon { font-size: 0.9rem; flex-shrink: 0; margin-top: 0.05rem; opacity: 0.6; }
+    .disclaimer a { color: var(--gray-dim); text-decoration: underline; text-underline-offset: 2px; }
+    .disclaimer a:hover { color: var(--gray); }
+
+    .usecases-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+    .usecase-card {
+      background: var(--glass);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      transition: all 0.3s;
+    }
+    .usecase-card:hover {
+      border-color: var(--red-border);
+      background: var(--red-glass);
+      transform: translateY(-4px);
+    }
+    .usecase-emoji { font-size: 1.6rem; margin-bottom: 0.75rem; }
+    .usecase-title { font-weight: 700; font-size: 0.9rem; margin-bottom: 0.4rem; }
+    .usecase-removes { font-size: 0.78rem; color: #f87171; margin-bottom: 0.25rem; }
+    .usecase-keeps { font-size: 0.78rem; color: #86efac; }
+    .usecase-label { display: inline-block; margin-right: 0.3rem; opacity: 0.6; font-size: 0.7rem; text-transform: uppercase; font-weight: 600; }
+
+    /* ── FOOTER ── */
+    footer {
+      padding: 4rem 2rem 3rem;
+      text-align: center;
+      border-top: 1px solid var(--glass-border);
+      position: relative; z-index: 1;
+    }
+    .footer-logo {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      text-decoration: none; color: var(--white);
+      margin-bottom: 1.25rem;
+    }
+    .footer-logo-icon {
+      width: 36px; height: 36px; border-radius: 50%;
+      box-shadow: 0 0 16px rgba(239,68,68,0.4);
+      overflow: hidden; flex-shrink: 0;
+    }
+    .footer-logo-icon img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .footer-logo-text { font-weight: 700; font-size: 1.2rem; }
+    .footer-tagline { font-size: 0.9rem; color: var(--gray-dim); margin-bottom: 1.5rem; }
+    .footer-links { display: flex; gap: 2rem; justify-content: center; margin-bottom: 2rem; flex-wrap: wrap; }
+    .footer-links a { color: var(--gray-dim); text-decoration: none; font-size: 0.85rem; transition: color 0.2s; }
+    .footer-links a:hover { color: var(--red); }
+    .footer-love {
+      font-size: 0.83rem; color: var(--gray-dim);
+    }
+    .footer-love a { color: var(--red); text-decoration: none; font-weight: 600; }
+    .footer-love a:hover { text-decoration: underline; }
+    .footer-love .heart { color: var(--red); animation: heartbeat 1.5s ease-in-out infinite; display: inline-block; }
+    @keyframes heartbeat {
+      0%,100% { transform: scale(1); }
+      14%      { transform: scale(1.25); }
+      28%      { transform: scale(1); }
+      42%      { transform: scale(1.15); }
+    }
+    .footer-apache { margin-top: 0.75rem; font-size: 0.76rem; color: var(--gray-dim); opacity: 0.6; }
+
+    /* ── Divider ── */
+    .divider {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(239,68,68,0.3), transparent);
+      margin: 0;
+    }
+
+    /* ── Scroll animations ── */
+    .reveal {
+      opacity: 0; transform: translateY(30px);
+      transition: opacity 0.7s ease, transform 0.7s ease;
+    }
+    .reveal.visible { opacity: 1; transform: translateY(0); }
+    .reveal-delay-1 { transition-delay: 0.1s; }
+    .reveal-delay-2 { transition-delay: 0.2s; }
+    .reveal-delay-3 { transition-delay: 0.3s; }
+    .reveal-delay-4 { transition-delay: 0.4s; }
+
+    /* ── Responsive ── */
+    @media (max-width: 768px) {
+      /* Nav: hide links, show short GitHub label */
+      nav { padding: 0.85rem 1rem; gap: 0.5rem; }
+      .nav-links { display: none; }
+      .nav-cta { padding: 0.45rem 1rem; font-size: 0.8rem; }
+      .nav-cta-full { display: none; }
+      .nav-cta-short { display: inline; }
+
+      /* Containers */
+      .container { padding: 0 1rem; }
+
+      /* Hero */
+      #hero { padding: 6rem 1rem 3rem; }
+      .hero-sub { font-size: 0.95rem; }
+      .hero-actions { gap: 0.75rem; }
+      .btn-primary, .btn-ghost { padding: 0.75rem 1.5rem; font-size: 0.9rem; }
+
+      /* Sections */
+      section { padding: 3.5rem 0; }
+
+      /* Demo card header: stack on mobile */
+      .demo-card-header { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+
+      /* Pipeline: vertical stack with full borders */
+      .pipeline { flex-direction: column; gap: 1rem; }
+      .pipeline-step {
+        border-radius: var(--radius) !important;
+        border: 1px solid var(--glass-border) !important;
+      }
+      .pipeline-arrow { display: none; }
+
+      /* Grids: single column */
+      .passes-grid { grid-template-columns: 1fr; gap: 1rem; }
+      .features-grid { grid-template-columns: 1fr; gap: 1rem; }
+      .usecases-grid { grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+      .install-grid { grid-template-columns: 1fr; }
+
+      /* Code blocks: smaller font to prevent overflow */
+      .code-block pre { font-size: 0.72rem; padding: 1rem; overflow-x: auto; }
+      .cli-demo { font-size: 0.68rem; padding: 1rem; overflow-x: auto; }
+
+      /* Footer links: tighter gap */
+      .footer-links { gap: 1rem; }
+    }
+
+    @media (max-width: 480px) {
+.usecases-grid { grid-template-columns: 1fr; }
+      nav { padding: 0.75rem 0.85rem; }
+      .nav-logo-text { font-size: 0.95rem; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Stars -->
+<div class="stars" id="stars"></div>
+<!-- Ambient -->
+<div class="ambient"></div>
+
+<!-- NAV -->
+<nav>
+  <a href="#" class="nav-logo">
+    <img src="logo.svg" alt="petrify" class="nav-logo-svg" />
+  </a>
+  <div class="nav-links">
+    <a href="#demo">Demo</a>
+    <a href="#how">How it works</a>
+    <a href="#features">Features</a>
+    <a href="#install">Install</a>
+    <a href="https://starside.io" target="_blank">starside.io</a>
+  </div>
+  <a href="https://github.com/starside-io/petrify" target="_blank" class="nav-cta">
+    <span class="nav-cta-full">View on GitHub ↗</span>
+    <span class="nav-cta-short">GitHub ↗</span>
+  </a>
+</nav>
+
+<!-- HERO -->
+<section id="hero">
+  <div class="container" style="display:flex;flex-direction:column;align-items:center;">
+
+    <div class="hero-eyebrow">
+      <span class="hero-eyebrow-dot"></span>
+      Open Source · Apache 2.0 · Built by starside.io
+    </div>
+
+    <img src="logo.svg" alt="petrify" class="hero-logo" />
+
+    <p class="hero-tagline"><strong>Freeze the world.</strong> Keep the clock ticking.</p>
+
+    <p class="hero-sub">
+      An open-source computer vision pipeline that <em>removes people from security footage</em>
+      while preserving the live timestamp. Frame-perfect, zero-config, fully local.
+    </p>
+
+    <div class="hero-actions">
+      <a href="#demo" class="btn-primary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        See it in action
+      </a>
+      <a href="https://github.com/starside-io/petrify" target="_blank" class="btn-ghost">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+        GitHub
+      </a>
+    </div>
+
+    <div class="scroll-hint">
+      <span>Scroll to explore</span>
+      <div class="scroll-arrow">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- DEMO -->
+<section id="demo">
+  <div class="container">
+    <div class="section-label">Live Demo</div>
+    <h2 class="gradient-text">See the difference</h2>
+    <p class="section-intro">
+      Real security footage. Real results. Left side is the original recording. Right side is petrify's output.
+      The timestamp keeps running. The people are gone.
+    </p>
+
+    <div class="demo-grid">
+
+      <!-- Camera 1 -->
+      <div class="demo-card reveal">
+        <div class="demo-card-header">
+          <span class="demo-card-title">📍 Driveway / Outdoor Camera</span>
+          <div class="demo-labels">
+            <span class="orig">◀ Original</span>
+            <span class="demo-separator">│</span>
+            <span class="proc">petrify ▶</span>
+          </div>
+        </div>
+        <div class="demo-card-body">
+          <img src="demo_camera1.gif" alt="Driveway camera: person removed, timestamp preserved" loading="lazy" />
+        </div>
+        <div class="demo-card-footer">
+          <strong>Person enters from street.</strong> petrify holds the empty driveway frame while the burned-in clock
+          continues ticking in real-time. Detected via MOG2 motion + HOG person shape.
+        </div>
+      </div>
+
+      <!-- Camera 2 -->
+      <div class="demo-card reveal reveal-delay-1">
+        <div class="demo-card-header">
+          <span class="demo-card-title">📍 School Corridor / Indoor Camera</span>
+          <div class="demo-labels">
+            <span class="orig">◀ Original</span>
+            <span class="demo-separator">│</span>
+            <span class="proc">petrify ▶</span>
+          </div>
+        </div>
+        <div class="demo-card-body">
+          <img src="demo_camera2.gif" alt="School corridor: standing person removed, timestamp preserved" loading="lazy" />
+        </div>
+        <div class="demo-card-footer">
+          <strong>Person walks then stands still.</strong> The static-diff detector catches them even after MOG2
+          adapts them into the background. The corridor looks perpetually empty.
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- HOW IT WORKS -->
+<section id="how">
+  <div class="container">
+    <div class="section-label">Under the hood</div>
+    <h2 class="gradient-text">Three detectors. One clean result.</h2>
+    <p class="section-intro">
+      A single detector is never enough. petrify chains three complementary signals so every subject is caught.
+      fast movers, standing-still loiterers, and distant figures barely larger than noise.
+    </p>
+
+    <div class="pipeline reveal">
+      <div class="pipeline-step">
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-num">01</div>
+        <div class="pipeline-icon">🌫️</div>
+        <div class="pipeline-name">MOG2 Background Subtractor</div>
+        <div class="pipeline-desc">Gaussian mixture model trained on the first 90 frames. Catches anything moving against the learned background, the primary detection net.</div>
+        <span class="pipeline-tag">OpenCV MOG2</span>
+      </div>
+      <div class="pipeline-step">
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-num">02</div>
+        <div class="pipeline-icon">🧍</div>
+        <div class="pipeline-name">HOG Person Detector</div>
+        <div class="pipeline-desc">Histogram of Oriented Gradients shape detector. Catches partial figures and distant silhouettes that produce too little motion for MOG2 to flag.</div>
+        <span class="pipeline-tag">cv2.HOGDescriptor</span>
+      </div>
+      <div class="pipeline-step">
+        <div class="pipeline-num">03</div>
+        <div class="pipeline-icon">🔒</div>
+        <div class="pipeline-name">Static Background Differ</div>
+        <div class="pipeline-desc">Locked reference frame diff that never adapts. Finds subjects that stood still long enough for MOG2 to absorb them. The failsafe that never forgets.</div>
+        <span class="pipeline-tag">BackgroundDiffer</span>
+      </div>
+    </div>
+
+    <div class="passes-grid reveal">
+      <div class="pass-card">
+        <div class="pass-card-header">
+          <span class="pass-badge">Pass 1</span>
+          <span class="pass-name">Background Extraction</span>
+        </div>
+        <p class="pass-desc">
+          Scans every frame to identify the <strong>cleanest background window</strong>.
+          The longest uninterrupted stretch with no detected motion. That window is median-composited
+          into the locked reference frame that persists for the entire render.
+        </p>
+      </div>
+      <div class="pass-card">
+        <div class="pass-card-header">
+          <span class="pass-badge">Pass 2</span>
+          <span class="pass-name">Composite Rendering</span>
+        </div>
+        <p class="pass-desc">
+          Every frame is classified as person or not. Person frames swap in the locked background.
+          The timestamp ROI is <strong>auto-detected via Laplacian edge scanning</strong> and
+          composited live onto each frozen frame so the clock never stops.
+        </p>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- FEATURES -->
+<section id="features">
+  <div class="container">
+    <div class="section-label">Features</div>
+    <h2 class="gradient-text">Everything you need. Nothing you don't.</h2>
+    <p class="section-intro">
+      Zero-config by default. Every parameter tunable when defaults aren't enough.
+    </p>
+
+    <div class="features-grid">
+      <div class="feature-card reveal">
+        <div class="feature-icon">🔍</div>
+        <div class="feature-title">Auto ROI Detection</div>
+        <div class="feature-desc">Automatically locates the timestamp bounding box using a two-pass frequency map + Laplacian edge scan. No manual coordinates needed.</div>
+      </div>
+      <div class="feature-card reveal reveal-delay-1">
+        <div class="feature-icon">🧠</div>
+        <div class="feature-title">Three-Detector Pipeline</div>
+        <div class="feature-desc">MOG2 + HOG + static BackgroundDiffer run in sequence. Each catches what the others miss. No false negatives, minimal false positives.</div>
+      </div>
+      <div class="feature-card reveal reveal-delay-2">
+        <div class="feature-icon">🕐</div>
+        <div class="feature-title">Live Timestamp Overlay</div>
+        <div class="feature-desc">The burned-in security clock is cropped from each original frame and composited onto every frozen output frame. Time is always authentic.</div>
+      </div>
+      <div class="feature-card reveal reveal-delay-3">
+        <div class="feature-icon">⚡</div>
+        <div class="feature-title">FFmpeg-Accelerated Output</div>
+        <div class="feature-desc">Raw frames are written to a pipe and re-encoded by FFmpeg with H.264, preserving the original audio and container metadata.</div>
+      </div>
+      <div class="feature-card reveal reveal-delay-1">
+        <div class="feature-icon">🔧</div>
+        <div class="feature-title">Fully Tunable CLI</div>
+        <div class="feature-desc">Every threshold, scan window, detector weight, and output codec is exposed as a flag. Start with zero args and tune from there.</div>
+      </div>
+      <div class="feature-card reveal reveal-delay-2">
+        <div class="feature-icon">🖥️</div>
+        <div class="feature-title">100% Local. Zero Cloud.</div>
+        <div class="feature-desc">Runs entirely on your machine. No API keys, no upload, no data leaving your environment. Privacy by default, not by policy.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- INSTALL -->
+<section id="install">
+  <div class="container">
+    <div class="section-label">Get started</div>
+    <h2 class="gradient-text">Up and running in 60 seconds.</h2>
+    <p class="section-intro">
+      Install once, run anywhere. petrify puts itself on your PATH via pipx. No virtualenv juggling.
+    </p>
+
+    <div class="install-grid reveal">
+
+      <div>
+        <div class="code-block" style="margin-bottom:1.5rem">
+          <div class="code-block-header">
+            <div class="code-dots"><div class="code-dot r"></div><div class="code-dot y"></div><div class="code-dot g"></div></div>
+            <span class="code-file">terminal</span>
+          </div>
+          <pre><span class="c-comment"># 1. Install system FFmpeg</span>
+<span class="c-prompt">$ </span><span class="c-cmd">brew install ffmpeg</span>         <span class="c-comment"># macOS</span>
+<span class="c-prompt">$ </span><span class="c-cmd">sudo apt install ffmpeg</span>    <span class="c-comment"># Linux</span>
+
+<span class="c-comment"># 2. Install petrify (adds to PATH)</span>
+<span class="c-prompt">$ </span><span class="c-cmd">pipx install petrify</span>
+
+<span class="c-comment"># Or from source</span>
+<span class="c-prompt">$ </span><span class="c-cmd">git clone</span> <span class="c-val">https://github.com/starside-io/petrify</span>
+<span class="c-prompt">$ </span><span class="c-cmd">cd</span> petrify <span class="c-flag">&&</span> <span class="c-cmd">pipx install -e .</span></pre>
+        </div>
+
+        <div class="code-block">
+          <div class="code-block-header">
+            <div class="code-dots"><div class="code-dot r"></div><div class="code-dot y"></div><div class="code-dot g"></div></div>
+            <span class="code-file">usage</span>
+          </div>
+          <pre><span class="c-comment"># Zero-config. Auto-detects everything</span>
+<span class="c-prompt">$ </span><span class="c-cmd">petrify</span> <span class="c-val">input.mp4</span> <span class="c-val">output.mp4</span>
+
+<span class="c-comment"># Explicit ROI (faster, skips scan)</span>
+<span class="c-prompt">$ </span><span class="c-cmd">petrify</span> <span class="c-val">input.mp4</span> <span class="c-val">output.mp4</span> <span class="c-flag">--roi</span> 0 55 700 60
+
+<span class="c-comment"># Higher sensitivity</span>
+<span class="c-prompt">$ </span><span class="c-cmd">petrify</span> <span class="c-val">input.mp4</span> <span class="c-val">output.mp4</span> \
+    <span class="c-flag">--threshold</span> 200 \
+    <span class="c-flag">--bg-diff-area-threshold</span> 100
+
+<span class="c-comment"># Disable auto-ROI scan</span>
+<span class="c-prompt">$ </span><span class="c-cmd">petrify</span> <span class="c-val">input.mp4</span> <span class="c-val">output.mp4</span> <span class="c-flag">--no-roi</span></pre>
+        </div>
+      </div>
+
+      <div>
+        <div class="install-cta-box">
+          <h3>Zero config. Real results.</h3>
+          <p>
+            Run <code style="color:#f87171;font-family:'JetBrains Mono',monospace;font-size:0.85em">petrify input.mp4 output.mp4</code> and walk away.
+            petrify will auto-detect the timestamp position, build the background reference,
+            and produce a clean output. No flags required.
+          </p>
+          <a href="https://github.com/starside-io/petrify" target="_blank" class="btn-primary" style="display:inline-flex">
+            Read the full docs ↗
+          </a>
+        </div>
+
+        <div class="cli-demo">
+<span style="color:#f87171">██████╗ ███████╗████████╗██████╗ ██╗███████╗██╗  ██╗</span>
+<span style="color:var(--gray-dim)">  Freeze the world. Keep the clock ticking.</span>
+<span style="color:var(--gray-dim)">  Made with ❤️  by <a href="https://starside.io" target="_blank" style="color:var(--red);text-decoration:none">starside.io</a>  ·  https://starside.io</span>
+
+<span style="color:#86efac">→ ROI auto-detect     </span><span style="color:var(--gray-dim)">scanning 60 frames…</span>
+<span style="color:#86efac">  found timestamp      </span><span style="color:#93c5fd">x=0 y=55 w=700 h=60</span>
+<span style="color:#86efac">→ Pass 1 background   </span><span style="color:var(--gray-dim)">building reference…</span>
+<span style="color:#86efac">  locked window        </span><span style="color:#93c5fd">frames 42–312</span>
+<span style="color:#86efac">→ Pass 2 render       </span><span style="color:var(--gray-dim)">compositing 1847 frames…</span>
+<span style="color:#86efac">✓ Done                </span><span style="color:var(--gray)">output.mp4 written</span>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- USE CASES -->
+<section id="usecases">
+  <div class="container">
+    <div class="section-label">Use cases</div>
+    <h2 class="gradient-text">Any fixed camera. Any subject.</h2>
+    <p class="section-intro">
+      If there's a locked-down camera and a burned-in clock, petrify can strip the subjects while preserving the timeline.
+    </p>
+
+    <div class="usecases-grid">
+      <div class="usecase-card reveal">
+        <div class="usecase-emoji">🔏</div>
+        <div class="usecase-title">Privacy compliance</div>
+        <div class="usecase-removes"><span class="usecase-label">removes</span> Identifiable individuals</div>
+        <div class="usecase-keeps"><span class="usecase-label">keeps</span> Scene context · verified timeline</div>
+      </div>
+      <div class="usecase-card reveal reveal-delay-1">
+        <div class="usecase-emoji">📦</div>
+        <div class="usecase-title">Footage compression</div>
+        <div class="usecase-removes"><span class="usecase-label">removes</span> Sparse motion (bird, leaf, flag)</div>
+        <div class="usecase-keeps"><span class="usecase-label">keeps</span> Static background · clean stream</div>
+      </div>
+      <div class="usecase-card reveal reveal-delay-2">
+        <div class="usecase-emoji">📐</div>
+        <div class="usecase-title">Space &amp; layout analysis</div>
+        <div class="usecase-removes"><span class="usecase-label">removes</span> People occluding floor plans</div>
+        <div class="usecase-keeps"><span class="usecase-label">keeps</span> Clean geometry · heatmap-ready</div>
+      </div>
+      <div class="usecase-card reveal reveal-delay-3">
+        <div class="usecase-emoji">⚠️</div>
+        <div class="usecase-title">Hazard detection</div>
+        <div class="usecase-removes"><span class="usecase-label">removes</span> Humans masking static hazards</div>
+        <div class="usecase-keeps"><span class="usecase-label">keeps</span> Spills, obstacles, trip points</div>
+      </div>
+      <div class="usecase-card reveal">
+        <div class="usecase-emoji">🤖</div>
+        <div class="usecase-title">AI training data</div>
+        <div class="usecase-removes"><span class="usecase-label">removes</span> Subject identity from scenes</div>
+        <div class="usecase-keeps"><span class="usecase-label">keeps</span> Environment · ground truth labels</div>
+      </div>
+      <div class="usecase-card reveal reveal-delay-1">
+        <div class="usecase-emoji">🌐</div>
+        <div class="usecase-title">Any fixed camera</div>
+        <div class="usecase-removes"><span class="usecase-label">removes</span> All foreground subjects</div>
+        <div class="usecase-keeps"><span class="usecase-label">keeps</span> Clean background · live timestamp</div>
+      </div>
+    </div>
+
+    <div class="disclaimer reveal">
+      <span class="disclaimer-icon">ℹ️</span>
+      <span>
+        <strong style="color:var(--gray);font-weight:600">Educational &amp; research use.</strong>
+        petrify is an open-source tool intended for lawful, authorised applications only.
+        Always ensure you have the legal right to process any footage, including compliance with
+        applicable privacy regulations (PDPA, GDPR, CCPA, and local equivalents).
+        Do not process footage of individuals without proper authorisation, consent, or a lawful basis.
+      </span>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- FOOTER -->
+<footer>
+  <a href="https://starside.io" target="_blank" class="footer-logo">
+    <div class="footer-logo-icon"><img src="starside.png" alt="starside.io" /></div>
+    <span class="footer-logo-text">starside.io</span>
+  </a>
+  <p class="footer-tagline">Where computer vision meets human experience.</p>
+  <div class="footer-links">
+    <a href="https://github.com/starside-io/petrify" target="_blank">GitHub</a>
+    <a href="https://github.com/starside-io/petrify/blob/main/CHANGELOG.md" target="_blank">Changelog</a>
+    <a href="https://github.com/starside-io/petrify/blob/main/CONTRIBUTING.md" target="_blank">Contributing</a>
+    <a href="https://github.com/starside-io/petrify/issues" target="_blank">Issues</a>
+    <a href="https://github.com/starside-io/petrify/blob/main/LICENSE" target="_blank">Apache 2.0</a>
+    <a href="https://starside.io" target="_blank">starside.io</a>
+  </div>
+  <p class="footer-love">
+    Made with <span class="heart">❤️</span> by <a href="https://starside.io" target="_blank">starside.io</a>
+  </p>
+  <p class="footer-apache">Released under the Apache 2.0 License · Free to use, modify, and distribute.</p>
+</footer>
+
+<script>
+  // ── Star field ──────────────────────────────────────────────────────────────
+  const starsEl = document.getElementById('stars');
+  for (let i = 0; i < 140; i++) {
+    const s = document.createElement('div');
+    s.className = 'star';
+    const size = Math.random() * 2 + 0.5;
+    s.style.cssText = `
+      width:${size}px; height:${size}px;
+      top:${Math.random() * 100}%;
+      left:${Math.random() * 100}%;
+      --d:${(Math.random() * 4 + 2).toFixed(1)}s;
+      --delay:${(Math.random() * 5).toFixed(1)}s;
+      --max-op:${(Math.random() * 0.5 + 0.2).toFixed(2)};
+    `;
+    starsEl.appendChild(s);
+  }
+
+  // ── Scroll reveal ────────────────────────────────────────────────────────────
+  const revealEls = document.querySelectorAll('.reveal');
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('visible'); io.unobserve(e.target); } });
+  }, { threshold: 0.12 });
+  revealEls.forEach(el => io.observe(el));
+
+  // ── Active nav link on scroll ────────────────────────────────────────────────
+  const sections = document.querySelectorAll('section[id]');
+  const navLinks = document.querySelectorAll('.nav-links a[href^="#"]');
+  const scrollSpy = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        navLinks.forEach(a => a.style.color = '');
+        const active = document.querySelector(`.nav-links a[href="#${e.target.id}"]`);
+        if (active) active.style.color = '#ef4444';
+      }
+    });
+  }, { rootMargin: '-40% 0px -50% 0px' });
+  sections.forEach(s => scrollSpy.observe(s));
+
+  // ── Nav blur on scroll ───────────────────────────────────────────────────────
+  const navEl = document.querySelector('nav');
+  window.addEventListener('scroll', () => {
+    navEl.style.background = window.scrollY > 20
+      ? 'rgba(10,10,10,0.92)' : 'rgba(10,10,10,0.7)';
+  }, { passive: true });
+
+  // ── Mouse trail ──────────────────────────────────────────────────────────────
+  document.addEventListener('mousemove', (e) => {
+    if (Math.random() > 0.85) {
+      const p = document.createElement('div');
+      p.style.cssText = `position:fixed;pointer-events:none;z-index:999;
+        left:${e.clientX}px;top:${e.clientY}px;
+        width:4px;height:4px;border-radius:50%;
+        background:rgba(239,68,68,${(Math.random()*0.4+0.2).toFixed(2)});
+        transform:translate(-50%,-50%);
+        animation:trailFade 0.8s ease forwards;`;
+      document.body.appendChild(p);
+      setTimeout(() => p.remove(), 800);
+    }
+  });
+  const trailStyle = document.createElement('style');
+  trailStyle.textContent = '@keyframes trailFade{0%{opacity:1;transform:translate(-50%,-50%) scale(1)}100%{opacity:0;transform:translate(-50%,-50%) scale(0)}}';
+  document.head.appendChild(trailStyle);
+</script>
+
+</body>
+</html>
