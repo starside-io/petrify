@@ -303,13 +303,42 @@ usage: petrify [options] INPUT OUTPUT
 
 ---
 
+## System requirements
+
+| Dependency | Minimum version | Notes |
+|---|---|---|
+| Python | 3.10 | Required for `match` syntax and type union hints |
+| opencv-python-headless | 4.8 | MOG2, HOG, Laplacian edge detection |
+| numpy | 1.24 | Frame array operations |
+| tqdm | 4.65 | Progress bars |
+| FFmpeg | Any recent | System binary. `brew install ffmpeg` / `apt install ffmpeg` |
+| RAM | 2 GB | 4 GB recommended for 1080p |
+| Storage | Source file size × 2 | Temporary uncompressed frame buffer during Pass 2 |
+
+No GPU required. All detection runs on CPU via OpenCV.
+
+---
+
 ## Performance
+
+### Benchmarks
+
+Measured on **MacBook Pro · Apple M2 Pro · 12 cores (8P + 4E) · 16 GB RAM · macOS 26.3**.
+
+| Video | Resolution | FPS | Duration | Frames | Wall time | Speed |
+|---|---|---|---|---|---|---|
+| camera.mp4 | 1920x1080 | 25 | 46.8s | 1 169 | **45.7s** | 1.0x real-time |
+| camera2.mp4 | 640x480 | 6 | 109.2s | 655 | **4.95s** | 22x real-time |
+
+Speed scales with resolution and source frame rate. Low-FPS cameras (6fps) process in a fraction of real-time even at longer durations. High-FPS 1080p tracks close to real-time on Apple Silicon.
+
+### General guidance
 
 | Resolution | CPU (libx264 medium) | Apple M-series | NVIDIA NVENC |
 |---|---|---|---|
 | 480p | Real-time | Real-time | Real-time |
 | 720p | Real-time | Real-time | Real-time |
-| 1080p | 0.5–1× real-time | Real-time | Real-time |
+| 1080p | 0.5–1x real-time | Real-time | Real-time |
 | 4K | Needs GPU | Recommended | Recommended |
 
 - Use `--downsample 0.25` for 4K to reduce MOG2 cost.

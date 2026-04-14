@@ -659,6 +659,7 @@
     <a href="#demo">Demo</a>
     <a href="#how">How it works</a>
     <a href="#features">Features</a>
+    <a href="#performance">Performance</a>
     <a href="#install">Install</a>
     <a href="https://starside.io" target="_blank">starside.io</a>
   </div>
@@ -955,6 +956,97 @@
       </div>
 
     </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- PERFORMANCE -->
+<section id="performance">
+  <div class="container">
+    <div class="section-label">Performance</div>
+    <h2 class="gradient-text">Benchmarks and requirements.</h2>
+    <p class="section-intro">
+      Tested on real security footage. No GPU required. Everything runs on CPU via OpenCV.
+    </p>
+
+    <div class="reveal" style="margin-bottom:3rem;display:flex;flex-direction:column;gap:1.5rem">
+      <div class="pass-card">
+        <div class="pass-card-header">
+          <span class="pass-badge">Benchmark</span>
+          <span class="pass-name">MacBook Pro · M2 Pro · 16 GB</span>
+        </div>
+        <p class="pass-desc" style="margin-bottom:1.25rem">
+          macOS 26.3 · Python 3.14 · FFmpeg 8.1 · opencv-python 4.13 · numpy 2.4
+        </p>
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:0.8rem;font-family:'JetBrains Mono',monospace">
+            <thead>
+              <tr style="border-bottom:1px solid var(--glass-border)">
+                <th style="text-align:left;padding:0.5rem 0.75rem;color:var(--gray-dim);font-weight:600">Video</th>
+                <th style="text-align:left;padding:0.5rem 0.75rem;color:var(--gray-dim);font-weight:600">Resolution</th>
+                <th style="text-align:left;padding:0.5rem 0.75rem;color:var(--gray-dim);font-weight:600">FPS</th>
+                <th style="text-align:left;padding:0.5rem 0.75rem;color:var(--gray-dim);font-weight:600">Duration</th>
+                <th style="text-align:left;padding:0.5rem 0.75rem;color:var(--gray-dim);font-weight:600">Wall time</th>
+                <th style="text-align:left;padding:0.5rem 0.75rem;color:var(--gray-dim);font-weight:600">Speed</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr style="border-bottom:1px solid rgba(255,255,255,0.05)">
+                <td style="padding:0.6rem 0.75rem;color:var(--gray)">camera.mp4</td>
+                <td style="padding:0.6rem 0.75rem;color:var(--gray)">1920x1080</td>
+                <td style="padding:0.6rem 0.75rem;color:var(--gray)">25</td>
+                <td style="padding:0.6rem 0.75rem;color:var(--gray)">46.8s</td>
+                <td style="padding:0.6rem 0.75rem;color:#86efac;font-weight:600">45.7s</td>
+                <td style="padding:0.6rem 0.75rem;color:#86efac">1.0x real-time</td>
+              </tr>
+              <tr>
+                <td style="padding:0.6rem 0.75rem;color:var(--gray)">camera2.mp4</td>
+                <td style="padding:0.6rem 0.75rem;color:var(--gray)">640x480</td>
+                <td style="padding:0.6rem 0.75rem;color:var(--gray)">6</td>
+                <td style="padding:0.6rem 0.75rem;color:var(--gray)">109.2s</td>
+                <td style="padding:0.6rem 0.75rem;color:#86efac;font-weight:600">4.95s</td>
+                <td style="padding:0.6rem 0.75rem;color:#86efac">22x real-time</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="pass-card">
+        <div class="pass-card-header">
+          <span class="pass-badge">Requirements</span>
+          <span class="pass-name">Minimum to run</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:0.6rem;font-size:0.83rem">
+          <div style="display:flex;justify-content:space-between;padding-bottom:0.5rem;border-bottom:1px solid var(--glass-border)">
+            <span style="color:var(--gray-dim)">Python</span>
+            <span style="color:var(--gray);font-family:'JetBrains Mono',monospace">3.10+</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding-bottom:0.5rem;border-bottom:1px solid var(--glass-border)">
+            <span style="color:var(--gray-dim)">opencv-python-headless</span>
+            <span style="color:var(--gray);font-family:'JetBrains Mono',monospace">4.8+</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding-bottom:0.5rem;border-bottom:1px solid var(--glass-border)">
+            <span style="color:var(--gray-dim)">numpy</span>
+            <span style="color:var(--gray);font-family:'JetBrains Mono',monospace">1.24+</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding-bottom:0.5rem;border-bottom:1px solid var(--glass-border)">
+            <span style="color:var(--gray-dim)">FFmpeg</span>
+            <span style="color:var(--gray);font-family:'JetBrains Mono',monospace">any recent</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;padding-bottom:0.5rem;border-bottom:1px solid var(--glass-border)">
+            <span style="color:var(--gray-dim)">RAM</span>
+            <span style="color:var(--gray);font-family:'JetBrains Mono',monospace">2 GB min · 4 GB for 1080p</span>
+          </div>
+          <div style="display:flex;justify-content:space-between">
+            <span style="color:var(--gray-dim)">GPU</span>
+            <span style="color:#86efac;font-family:'JetBrains Mono',monospace">not required</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </div>
 </section>
 
