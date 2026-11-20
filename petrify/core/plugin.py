@@ -80,6 +80,10 @@ class Sink(Protocol):
 
     def close(self) -> None: ...
 
+    def abort(self) -> None:
+        """Discard any partial output; called instead of close when a run fails."""
+        ...
+
 
 @runtime_checkable
 class Source(Protocol):
