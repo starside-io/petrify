@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import pytest
 
+import petrify.cli
 from petrify.compositor import Compositor
 from tests.golden.harness import SCHEMA_VERSION, GoldenRecord, capture_legacy, from_json, to_json
 
@@ -65,7 +66,7 @@ def test_cold_start_frozen(default_record: GoldenRecord) -> None:
 
 
 def test_metadata(default_record: GoldenRecord, clip: Path) -> None:
-    assert default_record.schema_version == 2
+    assert default_record.schema_version == 3
     assert default_record.clip == clip.name
     assert default_record.argv == []
     assert (default_record.width, default_record.height) == (_W, _H)
@@ -161,4 +162,29 @@ def test_from_json_rejects_schema_version_1(default_record: GoldenRecord) -> Non
     data["schema_version"] = 1
     with pytest.raises(ValueError, match="schema_version"):
         from_json(json.dumps(data))
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
+
+
+def test_output_matches_clip(default_record: GoldenRecord) -> None:
+    out = default_record.output
+    assert (out["width"], out["height"]) == (_W, _H)
+    assert out["fps"] == default_record.fps == 25.0
+
+
+def test_encode_defaults_match_cli(default_record: GoldenRecord) -> None:
+    defaults = petrify.cli._build_parser().parse_args(["in.mp4", "out.mp4"])
+    assert default_record.output["encode"] == {
+        "codec": defaults.codec,
+        "crf": defaults.crf,
+        "preset": defaults.preset,
+        "hwaccel": defaults.hwaccel,
+        "audio_from_input": True,
+        "output_is_requested_path": True,
+    }
+
+
+def test_encode_options_recorded(clip: Path) -> None:
+    argv = ["--no-roi", "--background-frame", "0"]
+    argv += ["--crf", "31", "--codec", "libx265", "--preset", "veryfast"]
+    encode = capture_legacy(clip, argv).output["encode"]
+    assert (encode["crf"], encode["codec"], encode["preset"]) == (31, "libx265", "veryfast")
