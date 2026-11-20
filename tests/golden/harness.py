@@ -3,6 +3,9 @@
 Runs the real, unmodified ``petrify.pipeline.run()`` and records its per-frame
 classification by spying on the helpers it calls. The JSON format produced by
 ``to_json`` is producer-neutral so another engine can be compared against it.
+``capture_engine`` is that second producer: it runs the streaming engine
+(``petrify.pipeline.run_file``) and records the same fields from its observer,
+report, and output stand-ins.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import json
 import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 from unittest import mock
 
@@ -23,6 +27,9 @@ import cv2
 import petrify.cli
 import petrify.encoder
 import petrify.pipeline
+import petrify.sinks.file
+from petrify.core.config import PetrifyConfig
+from petrify.core.engine import FrameTrace
 
 SCHEMA_VERSION = 3
 
@@ -138,8 +145,10 @@ def _record_written_frames(
 
 
 @contextlib.contextmanager
-def _record_encode_requests(requests: list[inspect.BoundArguments]) -> Iterator[None]:
-    """Replace the pipeline's encode step with a no-op that records its bound arguments."""
+def _record_encode_requests(
+    requests: list[inspect.BoundArguments], module: ModuleType = petrify.pipeline
+) -> Iterator[None]:
+    """Replace *module*'s encode step with a no-op that records its bound arguments."""
     signature = inspect.signature(petrify.encoder.ffmpeg_encode)
 
     def recorder(*args: Any, **kwargs: Any) -> None:
@@ -147,8 +156,73 @@ def _record_encode_requests(requests: list[inspect.BoundArguments]) -> Iterator[
         bound.apply_defaults()
         requests.append(bound)
 
-    with mock.patch.object(petrify.pipeline, "ffmpeg_encode", new=recorder):
+    with mock.patch.object(module, "ffmpeg_encode", new=recorder):
         yield
+
+
+def _output_request(
+    writers: list[dict[str, Any]],
+    encodes: list[inspect.BoundArguments],
+    clip: Path,
+    requested_output: Path,
+) -> dict[str, Any]:
+    """Build the record's ``output`` field, failing loudly unless one writer and one encode."""
+    if len(writers) != 1:
+        raise RuntimeError(
+            f"Expected the output video writer to be opened exactly once, got {len(writers)}."
+        )
+    if len(encodes) != 1:
+        raise RuntimeError(
+            f"Expected the encode step to be requested exactly once, got {len(encodes)}."
+        )
+    encode = encodes[0].arguments
+    return {
+        **writers[0],
+        "encode": {
+            "codec": encode["codec"],
+            "crf": int(encode["crf"]),
+            "preset": encode["preset"],
+            "hwaccel": encode["hwaccel"],
+            "audio_from_input": _same_path(encode["original_audio_source"], clip),
+            "output_is_requested_path": _same_path(encode["output_path"], requested_output),
+        },
+    }
+
+
+def _build_record(
+    clip: Path,
+    argv: list[str],
+    *,
+    background_index: int,
+    roi: list[int] | None,
+    raw: Sequence[bool],
+    filled: Sequence[bool],
+    final: Sequence[bool],
+    frame_digests: list[str],
+    output: dict[str, Any],
+) -> GoldenRecord:
+    """Assemble a record, adding the clip probe and metadata shared by every producer."""
+    if not frame_digests:
+        raise RuntimeError("Expected at least one composited frame to be written, got none.")
+    fps, width, height, total_frames = _probe(clip)
+    return GoldenRecord(
+        schema_version=SCHEMA_VERSION,
+        clip=clip.name,
+        clip_sha256=_sha256(clip),
+        argv=argv,
+        opencv_version=cv2.__version__,
+        fps=fps,
+        width=width,
+        height=height,
+        total_frames=total_frames,
+        background_index=background_index,
+        roi=roi,
+        raw=[bool(v) for v in raw],
+        filled=[bool(v) for v in filled],
+        final=[bool(v) for v in final],
+        frame_digests=frame_digests,
+        output=output,
+    )
 
 
 def _same_path(a: Any, b: Path) -> bool:
@@ -190,26 +264,7 @@ def capture_legacy(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> Gol
             stack.enter_context(_record_written_frames(frame_digests, writers))
             petrify.pipeline.run(args)
 
-        if len(writers) != 1:
-            raise RuntimeError(
-                f"Expected the output video writer to be opened exactly once, got {len(writers)}."
-            )
-        if len(encodes) != 1:
-            raise RuntimeError(
-                f"Expected the encode step to be requested exactly once, got {len(encodes)}."
-            )
-        encode = encodes[0].arguments
-        output: dict[str, Any] = {
-            **writers[0],
-            "encode": {
-                "codec": encode["codec"],
-                "crf": int(encode["crf"]),
-                "preset": encode["preset"],
-                "hwaccel": encode["hwaccel"],
-                "audio_from_input": _same_path(encode["original_audio_source"], clip),
-                "output_is_requested_path": _same_path(encode["output_path"], tmp_out),
-            },
-        }
+        output = _output_request(writers, encodes, clip, tmp_out)
 
     if not frame_digests:
         raise RuntimeError("Expected at least one composited frame to be written, got none.")
@@ -232,23 +287,54 @@ def capture_legacy(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> Gol
         detected = _single(results, "auto_detect_roi")
         roi = None if detected is None else [int(v) for v in detected]
 
-    fps, width, height, total_frames = _probe(clip)
-
-    return GoldenRecord(
-        schema_version=SCHEMA_VERSION,
-        clip=clip.name,
-        clip_sha256=_sha256(clip),
-        argv=argv,
-        opencv_version=cv2.__version__,
-        fps=fps,
-        width=width,
-        height=height,
-        total_frames=total_frames,
+    return _build_record(
+        clip,
+        argv,
         background_index=background_index,
         roi=roi,
-        raw=[bool(v) for v in raw],
-        filled=[bool(v) for v in filled],
-        final=[bool(v) for v in final],
+        raw=raw,
+        filled=filled,
+        final=final,
+        frame_digests=frame_digests,
+        output=output,
+    )
+
+
+def capture_engine(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> GoldenRecord:
+    """Run the streaming engine (``run_file``) on *clip_path* and return its per-frame record.
+
+    The record is built only from what the run exposes: the observer traces, the
+    returned report, and the video writer and encoder stand-ins, plus the clip probe.
+    """
+    clip = Path(clip_path)
+    argv = [str(a) for a in extra_argv]
+    traces: list[FrameTrace] = []
+    frame_digests: list[str] = []
+    writers: list[dict[str, Any]] = []
+    encodes: list[inspect.BoundArguments] = []
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_out = Path(tmp_dir) / "out.mp4"
+        args = petrify.cli._build_parser().parse_args([str(clip), str(tmp_out), *argv])
+        config = PetrifyConfig.from_namespace(args)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_record_encode_requests(encodes, petrify.sinks.file))
+            stack.enter_context(_record_written_frames(frame_digests, writers))
+            report = petrify.pipeline.run_file(args.input, args.output, config, traces.append)
+
+        output = _output_request(writers, encodes, clip, tmp_out)
+
+    if [t.index for t in traces] != list(range(len(traces))):
+        raise RuntimeError("Expected the engine to report frames in stream order, exactly once.")
+
+    return _build_record(
+        clip,
+        argv,
+        background_index=int(report.background_index),
+        roi=None if report.roi is None else [int(v) for v in report.roi],
+        raw=[t.raw for t in traces],
+        filled=[t.filled for t in traces],
+        final=[t.final for t in traces],
         frame_digests=frame_digests,
         output=output,
     )
