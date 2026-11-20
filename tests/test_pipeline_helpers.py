@@ -144,9 +144,9 @@ class TestFreezeColdStart:
         assert out == _bits("..1..1..")
         assert out is not src
 
-    def test_negative_warmup_leaves_list_unchanged(self) -> None:
-        # Pinned quirk: a negative window is silently treated like 0.
-        assert _freeze_cold_start(_bits("..1.."), warmup_frames=-3) == _bits("..1..")
+    def test_negative_warmup_raises(self) -> None:
+        with pytest.raises(ValueError, match="warmup_frames must be >= 0"):
+            _freeze_cold_start(_bits("..1.."), warmup_frames=-3)
 
     @pytest.mark.parametrize(
         ("warmup", "expected"),

@@ -97,30 +97,6 @@ def _find_clean_background(
     return best_frame, best_idx
 
 
-def _warmup_motion_detector(
-    motion_detector: MotionDetector,
-    background_frame: np.ndarray,
-) -> None:
-    """Pre-train MOG2 by feeding it the clean background frame ``history`` times.
-
-    Without this, MOG2 starts cold: the first ``history`` frames are used to
-    build its background model, so motion scores are unreliable during that
-    window.  By replaying the locked background frame we give MOG2 a fully
-    trained model *before* processing frame 0, meaning even the very first
-    frame of the video is compared against a correct background reference.
-
-    This is the "establish baseline first" pass: we feed one known-clean
-    frame instead of running through the whole video twice.
-    """
-    n = motion_detector.history
-    logger.info(
-        "MOG2 pre-warmup: feeding background frame x%d to establish baseline...", n
-    )
-    for _ in range(n):
-        motion_detector.is_motion(background_frame)
-    logger.info("MOG2 pre-warmup complete.")
-
-
 def _classify_frames(
     cap: cv2.VideoCapture,
     total_frames: int,
@@ -226,6 +202,8 @@ def _freeze_cold_start(has_subject: list[bool], warmup_frames: int = 50) -> list
     fix: if the background is truly empty at the start those frames look
     identical to the locked background anyway, so there is no visual cost.
     """
+    if warmup_frames < 0:
+        raise ValueError(f"warmup_frames must be >= 0, got {warmup_frames}")
     filled = list(has_subject)
     n = min(warmup_frames, len(filled))
     for i in range(n):
@@ -373,11 +351,6 @@ def run(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Pass 1 — classify every frame
     # ------------------------------------------------------------------
-    # Pre-warm MOG2 using the locked background frame so it has a trained
-    # model before it sees frame 0 of the actual video.
-    if motion_detector is not None:
-        _warmup_motion_detector(motion_detector, locked_background)
-
     # Build static background differ (always on unless --no-bg-diff is set).
     # This catches subjects that MOG2 has adapted away (standing still) and
     # tiny/partial subjects that HOG misses.
