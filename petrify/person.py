@@ -104,8 +104,23 @@ class PersonDetector:
         -------
         bool
             ``True`` when a confident person detection is found.
+
+        Raises
+        ------
+        ValueError
+            If the frame is smaller than the HOG detection window, in which
+            case detection is impossible (OpenCV would crash the process).
         """
         small = self._maybe_downsample(frame)
+
+        win_w, win_h = self._hog.winSize
+        small_h, small_w = small.shape[:2]
+        if small_w < win_w or small_h < win_h:
+            raise ValueError(
+                f"frame too small for person detection: {small_w}x{small_h} "
+                f"(source {frame.shape[1]}x{frame.shape[0]}), minimum is "
+                f"{win_w}x{win_h} (width x height)"
+            )
 
         boxes, weights = self._hog.detectMultiScale(
             small,
@@ -143,6 +158,8 @@ class PersonDetector:
         if self.downsample >= 1.0:
             return frame
         h, w = frame.shape[:2]
-        new_w = max(64, int(w * self.downsample))
-        new_h = max(64, int(h * self.downsample))
+        win_w, win_h = self._hog.winSize
+        # Never shrink below the HOG window, but never upscale past the source.
+        new_w = max(min(w, win_w), int(w * self.downsample))
+        new_h = max(min(h, win_h), int(h * self.downsample))
         return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
