@@ -257,18 +257,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     bg_group.add_argument(
-        "--adaptive-background",
-        action="store_true",
-        default=False,
-        dest="adaptive_background",
-        help=(
-            "Re-enable adaptive background updates: whenever no motion is detected "
-            "the current frame replaces the background reference. This can cause "
-            "contamination if the subject stands still long enough for MOG2 to "
-            "absorb them into the background model. Off by default."
-        ),
-    )
-    bg_group.add_argument(
         "--no-bg-diff",
         action="store_true",
         default=False,
