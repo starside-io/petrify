@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 import petrify.cli
-from petrify.compositor import Compositor
+from petrify.stages.roi_overlay import Compositor
 from tests.golden.harness import SCHEMA_VERSION, GoldenRecord, capture_legacy, from_json, to_json
 
 # Height must stay >= 256 so the default HOG downsample (0.5) keeps frames at least as

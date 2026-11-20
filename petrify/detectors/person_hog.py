@@ -19,9 +19,14 @@
 from __future__ import annotations
 
 import logging
+from typing import ClassVar
 
 import cv2
 import numpy as np
+
+from petrify.core.config import PersonHogConfig
+from petrify.core.detections import Box, DetectionKind, Detections
+from petrify.core.frame import Frame
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,9 @@ class PersonDetector:
         Minimum bounding-box area in *downsampled* pixels.  Rejects tiny
         spurious detections caused by partial views at frame edges.
     """
+
+    provides: ClassVar[frozenset[DetectionKind]] = frozenset({DetectionKind.PERSONS})
+    stateful: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -88,9 +96,60 @@ class PersonDetector:
             min_box_area,
         )
 
+    @classmethod
+    def from_config(cls, cfg: PersonHogConfig) -> PersonDetector:
+        """Build a detector from a :class:`PersonHogConfig` (padding keeps its default)."""
+        return cls(
+            downsample=cfg.downsample,
+            win_stride=cfg.win_stride,
+            scale=cfg.scale,
+            min_confidence=cfg.min_confidence,
+            min_box_area=cfg.min_box_area,
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def detect(self, frame: Frame) -> Detections:
+        """Return detections with only ``persons`` set (see :meth:`detect_boxes`)."""
+        return Detections(persons=self.detect_boxes(frame.image))
+
+    def reset(self) -> None:
+        """No-op: the detector keeps no per-frame state."""
+
+    def detect_boxes(self, frame: np.ndarray) -> tuple[Box, ...]:
+        """Return every detection that passes the confidence and area filters.
+
+        Boxes are scaled back to full-resolution coordinates using the actual
+        resize ratio on each axis; ``score`` is the SVM weight. The result is
+        non-empty exactly when :meth:`is_person` returns True.
+
+        Raises
+        ------
+        ValueError
+            If the frame is smaller than the HOG detection window.
+        """
+        small, boxes, weights = self._raw_detections(frame)
+        frame_h, frame_w = frame.shape[:2]
+        small_h, small_w = small.shape[:2]
+        sx = frame_w / small_w
+        sy = frame_h / small_h
+
+        out: list[Box] = []
+        for i, (x, y, w, h) in enumerate(boxes):
+            confidence = float(weights[i])
+            if self._passes(confidence, w * h):
+                out.append(
+                    Box(
+                        x=int(round(x * sx)),
+                        y=int(round(y * sy)),
+                        w=int(round(w * sx)),
+                        h=int(round(h * sy)),
+                        score=confidence,
+                    )
+                )
+        return tuple(out)
 
     def is_person(self, frame: np.ndarray) -> bool:
         """Return True if at least one person is detected in *frame*.
@@ -111,6 +170,39 @@ class PersonDetector:
             If the frame is smaller than the HOG detection window, in which
             case detection is impossible (OpenCV would crash the process).
         """
+        _, boxes, weights = self._raw_detections(frame)
+
+        if len(weights) == 0:
+            logger.debug("PersonDetector: no detections")
+            return False
+
+        for i, (x, y, w, h) in enumerate(boxes):
+            confidence = float(weights[i])
+            area = w * h
+            if self._passes(confidence, area):
+                logger.debug(
+                    "PersonDetector: person detected box=(%d,%d,%d,%d) "
+                    "confidence=%.3f area=%d",
+                    x, y, w, h, confidence, area,
+                )
+                return True
+
+        logger.debug(
+            "PersonDetector: %d raw detections rejected (below confidence/area thresholds)",
+            len(weights),
+        )
+        return False
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _raw_detections(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Downsample *frame* and run HOG; return ``(small, boxes, weights)`` unfiltered.
+
+        Raises ``ValueError`` before calling OpenCV when the downsampled frame is
+        smaller than the HOG window.
+        """
         small = self._maybe_downsample(frame)
 
         win_w, win_h = self._hog.winSize
@@ -128,31 +220,11 @@ class PersonDetector:
             padding=self.padding,
             scale=self.scale,
         )
+        return small, boxes, weights
 
-        if len(weights) == 0:
-            logger.debug("PersonDetector: no detections")
-            return False
-
-        for i, (x, y, w, h) in enumerate(boxes):
-            confidence = float(weights[i])
-            area = w * h
-            if confidence >= self.min_confidence and area >= self.min_box_area:
-                logger.debug(
-                    "PersonDetector: person detected box=(%d,%d,%d,%d) "
-                    "confidence=%.3f area=%d",
-                    x, y, w, h, confidence, area,
-                )
-                return True
-
-        logger.debug(
-            "PersonDetector: %d raw detections rejected (below confidence/area thresholds)",
-            len(weights),
-        )
-        return False
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
+    def _passes(self, confidence: float, area: int) -> bool:
+        """Return True when a raw detection clears both the confidence and area filters."""
+        return confidence >= self.min_confidence and area >= self.min_box_area
 
     def _maybe_downsample(self, frame: np.ndarray) -> np.ndarray:
         if self.downsample >= 1.0:

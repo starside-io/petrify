@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from petrify.person import PersonDetector
+from petrify.detectors.person_hog import PersonDetector
 
 WIN_W, WIN_H = 64, 128
 

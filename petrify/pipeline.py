@@ -28,12 +28,12 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from petrify.bgdiff import BackgroundDiffer
-from petrify.compositor import Compositor
+from petrify.detectors.bgdiff import BackgroundDiffer
+from petrify.detectors.motion import MotionDetector
+from petrify.detectors.person_hog import PersonDetector
 from petrify.encoder import ffmpeg_encode
-from petrify.motion import MotionDetector
-from petrify.person import PersonDetector
 from petrify.roi_detect import auto_detect_roi
+from petrify.stages.roi_overlay import Compositor
 
 logger = logging.getLogger(__name__)
 

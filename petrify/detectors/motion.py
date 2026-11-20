@@ -19,9 +19,14 @@
 from __future__ import annotations
 
 import logging
+from typing import ClassVar
 
 import cv2
 import numpy as np
+
+from petrify.core.config import MotionConfig
+from petrify.core.detections import DetectionKind, Detections
+from petrify.core.frame import Frame
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,9 @@ class MotionDetector:
         measured in the downsampled coordinate space, so keep that in mind
         when choosing ``threshold``.
     """
+
+    provides: ClassVar[frozenset[DetectionKind]] = frozenset({DetectionKind.MOTION})
+    stateful: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -78,9 +86,24 @@ class MotionDetector:
             downsample,
         )
 
+    @classmethod
+    def from_config(cls, cfg: MotionConfig) -> MotionDetector:
+        """Build a detector from a :class:`MotionConfig`."""
+        return cls(
+            history=cfg.history,
+            var_threshold=cfg.var_threshold,
+            detect_shadows=cfg.detect_shadows,
+            threshold=cfg.threshold,
+            downsample=cfg.downsample,
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def detect(self, frame: Frame) -> Detections:
+        """Return detections with only ``motion`` set (see :meth:`is_motion`)."""
+        return Detections(motion=self.is_motion(frame.image))
 
     def motion_score(self, frame: np.ndarray) -> float:
         """Return raw foreground contour area without thresholding.

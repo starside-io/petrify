@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from petrify.motion import MotionDetector
+from petrify.detectors.motion import MotionDetector
 
 
 def _random_frame(h: int = 240, w: int = 320, seed: int = 0) -> np.ndarray:

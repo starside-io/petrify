@@ -29,6 +29,7 @@ import pytest
 import petrify.background.locked as locked_mod
 from petrify.background.locked import find_clean_background, locked_background
 from petrify.core import BackgroundConfig, PersonHogConfig
+from petrify.detectors.person_hog import PersonDetector
 from petrify.sources.file import FileSource
 
 WIDTH, HEIGHT, FPS, N_FRAMES = 160, 256, 10.0, 20
@@ -99,6 +100,17 @@ def test_all_dirty_falls_back_to_zero(source: FileSource, caplog: pytest.LogCapt
     assert "no person-free frame" in caplog.text
 
 
+def test_all_dirty_and_frame_zero_unreadable_raises(source: FileSource) -> None:
+    class _Unreadable:
+        info = source.info
+
+        def read_frame(self, idx: int) -> np.ndarray | None:
+            return None
+
+    with pytest.raises(ValueError, match=r"Cannot read any frame for the background reference\."):
+        find_clean_background(_Unreadable(), _FakeDetector(dirty=set()), scan_step=5)  # type: ignore[arg-type]
+
+
 def test_result_is_a_copy(source: FileSource) -> None:
     frame, _ = find_clean_background(source, _FakeDetector(dirty=set()), scan_step=5)
     assert frame.flags.owndata
@@ -130,6 +142,8 @@ def test_scan_builds_detector_from_config(
     built: dict[str, Any] = {}
 
     class _Recorder(_FakeDetector):
+        from_config = classmethod(PersonDetector.from_config.__func__)  # type: ignore[attr-defined]
+
         def __init__(self, **kwargs: Any) -> None:
             built.update(kwargs)
             super().__init__(dirty={10})
@@ -151,6 +165,8 @@ def test_scan_builds_detector_from_config(
 
 def test_detector_error_propagates(source: FileSource, monkeypatch: pytest.MonkeyPatch) -> None:
     class _Raising:
+        from_config = classmethod(PersonDetector.from_config.__func__)  # type: ignore[attr-defined]
+
         def __init__(self, **kwargs: Any) -> None:
             pass
 
