@@ -340,6 +340,36 @@ def capture_engine(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> Gol
     )
 
 
+def capture_cli_output(
+    clip_path: str | Path, extra_argv: Sequence[str] = ()
+) -> tuple[list[str], dict[str, Any]]:
+    """Run ``petrify.cli.main`` on *clip_path* and return its frame digests and output request.
+
+    Only the written frames and the output stage request are recorded: the CLI exposes
+    no per-frame classification.
+    """
+    clip = Path(clip_path)
+    argv = [str(a) for a in extra_argv]
+    frame_digests: list[str] = []
+    writers: list[dict[str, Any]] = []
+    encodes: list[inspect.BoundArguments] = []
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_out = Path(tmp_dir) / "out.mp4"
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_record_encode_requests(encodes, petrify.sinks.file))
+            stack.enter_context(_record_written_frames(frame_digests, writers))
+            code = petrify.cli.main([str(clip), str(tmp_out), *argv])
+        if code != 0:
+            raise RuntimeError(f"Expected petrify.cli.main to exit 0, got {code}.")
+
+        output = _output_request(writers, encodes, clip, tmp_out)
+
+    if not frame_digests:
+        raise RuntimeError("Expected at least one composited frame to be written, got none.")
+    return frame_digests, output
+
+
 def _encode_bits(values: Sequence[bool]) -> str:
     return "".join("1" if v else "0" for v in values)
 

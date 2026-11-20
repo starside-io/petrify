@@ -9,19 +9,29 @@ import pytest
 
 from tests.golden.cases import (
     CASES,
+    DIGEST_FIELD,
     GoldenCase,
+    _compare_frames,
     compare_records,
     describe_failure,
     file_sha256,
     load_fixture,
 )
-from tests.golden.harness import GoldenRecord, capture_engine, capture_legacy
+from tests.golden.harness import (
+    GoldenRecord,
+    capture_cli_output,
+    capture_engine,
+    capture_legacy,
+)
 
 Producer = Callable[[Path, Sequence[str]], GoldenRecord]
 
 
-def _check_case(case: GoldenCase, producer: Producer) -> None:
-    """Fail on a missing or mismatched fixture, skip without the clip, then compare."""
+CLI_CASES = tuple(c for c in CASES if c.clip == "camera2.mp4")
+
+
+def _load_checked_fixture(case: GoldenCase) -> GoldenRecord:
+    """Fail on a missing or mismatched fixture, skip without the clip, return the fixture."""
     if not case.fixture_path.exists():
         pytest.fail(
             f"Golden fixture missing for case {case.case_id!r}: {case.fixture_path}. "
@@ -44,7 +54,12 @@ def _check_case(case: GoldenCase, producer: Producer) -> None:
             f"clip {case.clip_path} has sha256 {actual_sha}, fixture was captured from "
             f"{expected.clip_sha256}"
         )
+    return expected
 
+
+def _check_case(case: GoldenCase, producer: Producer) -> None:
+    """Check the shared preconditions, then compare the full record with the fixture."""
+    expected = _load_checked_fixture(case)
     actual = producer(case.clip_path, case.argv)
     diffs = compare_records(actual, expected)
     if diffs:
@@ -61,3 +76,18 @@ def test_legacy_matches_golden(case: GoldenCase) -> None:
 @pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
 def test_engine_matches_golden(case: GoldenCase) -> None:
     _check_case(case, capture_engine)
+
+
+@pytest.mark.golden
+@pytest.mark.parametrize("case", CLI_CASES, ids=[c.case_id for c in CLI_CASES])
+def test_cli_matches_golden(case: GoldenCase) -> None:
+    expected = _load_checked_fixture(case)
+    frame_digests, output = capture_cli_output(case.clip_path, case.argv)
+    diffs: list[str] = []
+    if output != expected.output:
+        diffs.append(f"output: actual {output!r}, expected {expected.output!r}")
+    diffs.extend(_compare_frames(DIGEST_FIELD, frame_digests, expected.frame_digests))
+    if diffs:
+        lines = [f"CLI golden mismatch for case {case.case_id!r}:"]
+        lines.extend(f"  - {d}" for d in diffs)
+        pytest.fail("\n".join(lines), pytrace=False)

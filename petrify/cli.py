@@ -445,10 +445,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"--downsample must be in (0, 1], got {args.downsample}")
 
     # Import here to keep startup fast when --version / --help is used.
-    from petrify.pipeline import run  # noqa: PLC0415
+    from petrify.core.config import PetrifyConfig  # noqa: PLC0415
+    from petrify.pipeline import run_file  # noqa: PLC0415
 
     try:
-        run(args)
+        # A report with failed-closed frames still exits 0: those frames are
+        # written black, and run_file logs a warning for them.
+        run_file(args.input, args.output, PetrifyConfig.from_namespace(args))
     except FileNotFoundError as exc:
         logging.getLogger(__name__).error("%s", exc)
         return 2
