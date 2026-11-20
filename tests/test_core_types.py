@@ -358,6 +358,9 @@ class _DummySink:
     def close(self) -> None:
         pass
 
+    def abort(self) -> None:
+        pass
+
 
 class _DummySource:
     def __init__(self) -> None:
