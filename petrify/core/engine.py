@@ -319,9 +319,19 @@ def _close_all(sinks: Sequence[Sink]) -> None:
 
 
 def _abort_all(sinks: Sequence[Sink]) -> None:
-    """Abort every sink, logging (not raising) any error so the original one propagates."""
+    """Abort every sink, logging (not raising) any error so the original one propagates.
+
+    Every sink is attempted even if an abort raises a non-``Exception`` error such as
+    ``KeyboardInterrupt``; the first such error is re-raised once all were attempted.
+    """
+    interrupt: BaseException | None = None
     for sink in sinks:
         try:
             sink.abort()
         except Exception:
             logger.exception("Sink %s failed to abort", type(sink).__name__)
+        except BaseException as exc:
+            if interrupt is None:
+                interrupt = exc
+    if interrupt is not None:
+        raise interrupt

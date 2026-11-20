@@ -53,6 +53,49 @@ CASES: tuple[GoldenCase, ...] = (
         "camera2-no-bg-diff-gap-fill-0", "camera2.mp4", ("--no-bg-diff", "--gap-fill", "0")
     ),
     GoldenCase("camera2-detect-shadows", "camera2.mp4", ("--detect-shadows",)),
+    GoldenCase("camera2-no-roi", "camera2.mp4", ("--no-roi",)),
+    GoldenCase("camera2-roi-200-150-240-120", "camera2.mp4", ("--roi", "200", "150", "240", "120")),
+    GoldenCase("camera2-gap-fill-40", "camera2.mp4", ("--gap-fill", "40")),
+    GoldenCase(
+        "camera2-detector-person-hog-tuned",
+        "camera2.mp4",
+        ("--detector", "person", "--hog-min-confidence", "0.8", "--hog-scale", "1.1"),
+    ),
+    GoldenCase(
+        "camera2-downsample-0.25-threshold-200",
+        "camera2.mp4",
+        ("--downsample", "0.25", "--threshold", "200"),
+    ),
+    GoldenCase(
+        "camera2-detector-both-min-areas",
+        "camera2.mp4",
+        (
+            "--detector",
+            "both",
+            "--hog-min-box-area",
+            "4000",
+            "--bg-diff-area-threshold",
+            "600",
+        ),
+    ),
+    GoldenCase(
+        "camera2-detector-person-no-bg-diff",
+        "camera2.mp4",
+        ("--detector", "person", "--no-bg-diff"),
+    ),
+    GoldenCase(
+        "camera2-detector-person-no-bg-diff-hog-tuned",
+        "camera2.mp4",
+        (
+            "--detector",
+            "person",
+            "--no-bg-diff",
+            "--hog-min-confidence",
+            "0.8",
+            "--hog-scale",
+            "1.1",
+        ),
+    ),
 )
 
 CASES_BY_ID: dict[str, GoldenCase] = {case.case_id: case for case in CASES}

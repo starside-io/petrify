@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import cv2
@@ -99,6 +100,15 @@ def test_read_frame_and_iteration_after_it(clip: Path) -> None:
     assert frames[0].index == 0
     assert len(frames) == N_FRAMES
     np.testing.assert_array_equal(frame0, frames[0].image)
+
+
+def test_iteration_stops_at_reported_frame_count(clip: Path) -> None:
+    assert len(_plain_read(clip)) == N_FRAMES
+    with FileSource(clip) as src:
+        src.info = dataclasses.replace(src.info, frame_count=N_FRAMES - 4)
+        frames = list(src)
+    assert len(frames) == N_FRAMES - 4
+    assert [f.index for f in frames] == list(range(N_FRAMES - 4))
 
 
 def test_read_frame_out_of_range_returns_none(clip: Path) -> None:

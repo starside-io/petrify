@@ -59,7 +59,11 @@ class FileSink:
         logger.info("Compositing frames -> %s", temp_path)
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(temp_path, fourcc, info.fps, (info.width, info.height))
+        try:
+            writer = cv2.VideoWriter(temp_path, fourcc, info.fps, (info.width, info.height))
+        except BaseException:
+            os.unlink(temp_path)
+            raise
         if not writer.isOpened():
             os.unlink(temp_path)
             raise OSError("cv2.VideoWriter failed to open the intermediate file.")
