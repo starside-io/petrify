@@ -9,6 +9,27 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Single-pass streaming engine (`petrify/core/engine.py`). Per frame it runs the detectors lazily and in order (MOG2 always runs because it is stateful; the others stop once a subject is found), delays output by `--gap-fill` frames in a lookahead buffer to apply the gap fill, applies the cold-start freeze of the first 50 frames, renders the erase mode (locked background when a subject is present, live frame otherwise), pastes the live timestamp ROI, and writes to the file sink
+- Package layout under `petrify/`: `core/` (frame, detections, config, plugin protocols, engine), `sources/file.py`, `detectors/` (`motion.py`, `bgdiff.py`, `person_hog.py`), `background/locked.py`, `modes/erase.py`, `stages/roi_overlay.py`, `sinks/file.py`
+- Golden parity tests (`pytest -m golden`) that compare the old pipeline, the engine, and the CLI against fixtures committed in `tests/golden/fixtures/`. They need the demo clips `data/camera.mp4` and `data/camera2.mp4` (not in the repository) and are skipped without them. `python -m tests.golden.regenerate` records fixtures
+
+### Changed
+- `petrify INPUT OUTPUT` now runs through the streaming engine (`petrify.pipeline.run_file`) instead of the two-pass pipeline. Output for the same input and flags is unchanged, verified frame for frame against recorded fixtures. Background selection and timestamp ROI auto-detection still pre-scan the file before the processing pass
+- The modules `petrify.motion`, `petrify.person`, `petrify.bgdiff`, and `petrify.compositor` moved to `petrify.detectors.motion`, `petrify.detectors.person_hog`, `petrify.detectors.bgdiff`, and `petrify.stages.roi_overlay`; the old module paths no longer exist. `petrify.Compositor`, `petrify.MotionDetector`, and `petrify.run` are still exported. `petrify.run` is still the old two-pass function, kept as the reference implementation for the golden tests; the CLI no longer calls it
+- Log output: one progress bar and an `Engine done: frozen=... pass-through=...` summary replace the "Pass 1" and "Pass 2" blocks
+- HOG downsampling never shrinks a frame below the 64x128 detection window and keeps the aspect ratio
+- If a detector, the mode, or a stage fails on a frame, that frame is written as a black frame and counted (fail closed), a warning is logged, and the run continues
+
+### Removed
+- MOG2 pre-warmup: it never had an effect, because its model was reset before use
+- `--adaptive-background` flag: it was parsed but never read
+
+### Fixed
+- Frames smaller than the HOG detection window (64x128) now produce a clear error instead of crashing the process
+- A negative `--gap-fill` is rejected
+- A failed run never leaves an encoded output from partial frames
+
 ---
 
 ## [0.1.0] — 2026-04-10

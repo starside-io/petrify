@@ -1,6 +1,6 @@
 # petrify refactor plan: real-time core + plugin modes
 
-Status: planning. Nothing in this document is implemented yet.
+Status: phases 0 and 1 are done. Phases 2 to 6 are planned and not implemented yet.
 
 ## Goals
 
@@ -15,7 +15,7 @@ Status: planning. Nothing in this document is implemented yet.
 
 ## What blocks real time today
 
-The current pipeline assumes a complete, seekable file in several places:
+This table describes the pre-refactor two-pass pipeline (still kept as `petrify.run`, no longer used by the CLI), which assumes a complete, seekable file in several places:
 
 | Location | Problem |
 |---|---|
@@ -162,8 +162,8 @@ Profiles are presets of defaults, not code forks. Every value can be overridden.
 
 | # | Phase | Done when |
 |---|---|---|
-| 0 | Golden tests | Per-frame classification of the current pipeline on the demo clips is captured as test fixtures. |
-| 1 | Core engine refactor | `petrify in.mp4 out.mp4` matches the golden output through the new engine. |
+| 0 | Golden tests (done) | Per-frame classification of the current pipeline on the demo clips is captured as test fixtures. |
+| 1 | Core engine refactor (done) | `petrify in.mp4 out.mp4` matches the golden output through the new engine. |
 | 2 | Live sources + sinks | Webcam, RTSP, image folder, and push API inputs; preview, ffmpeg pipe, and virtual cam outputs. Erase mode runs live. |
 | 3 | Webapp | Live feed visible in the browser; erase config tweakable live. |
 | 4 | Plugin API + new detectors | YuNet, segmentation, DNN person detector, tracker. Entry-point loading works. |
@@ -172,9 +172,9 @@ Profiles are presets of defaults, not code forks. Every value can be overridden.
 
 ## Open decisions
 
-1. **Plugin packaging.** Recommended: separate package in the same repo (`plugins/petrify-shadow`). Alternative: optional extra inside core (`petrify[shadow]`).
-2. **Preview transport.** Recommended: MJPEG first (simple, roughly 100 to 200 ms latency). Move to WebRTC later only if latency becomes a problem.
-3. **Virtual camera on macOS.** `pyvirtualcam` requires OBS 30+ installed for its camera extension. Confirm this dependency is acceptable.
+1. **Plugin packaging.** Decided: a separate package in the same repo at `plugins/petrify-shadow`, loaded through the `petrify.modes` entry point.
+2. **Preview transport.** Decided: MJPEG first. No WebRTC.
+3. **Virtual camera on macOS.** Decided: `pyvirtualcam`. Requiring OBS 30+ on macOS is acceptable, as a dependency of the virtual camera sink only.
 
 ## Compliance notes (not legal advice)
 
