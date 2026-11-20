@@ -22,18 +22,27 @@ import argparse
 import logging
 import os
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
 from tqdm import tqdm
 
+from petrify.background.locked import locked_background
+from petrify.core.config import PetrifyConfig
+from petrify.core.engine import Engine, EngineStats, FrameTrace
+from petrify.core.plugin import Detector
 from petrify.detectors.bgdiff import BackgroundDiffer
 from petrify.detectors.motion import MotionDetector
 from petrify.detectors.person_hog import PersonDetector
 from petrify.encoder import ffmpeg_encode
+from petrify.modes.erase import EraseMode
 from petrify.roi_detect import auto_detect_roi
-from petrify.stages.roi_overlay import Compositor
+from petrify.sinks.file import FileSink
+from petrify.sources.file import FileSource
+from petrify.stages.roi_overlay import Compositor, RoiOverlay
 
 logger = logging.getLogger(__name__)
 
@@ -444,3 +453,119 @@ def run(args: argparse.Namespace) -> None:
             logger.warning("Could not remove temp file %s: %s", temp_path, exc)
 
     logger.info("Done. Output written to: %s", output_path)
+
+
+# ---------------------------------------------------------------------------
+# Streaming engine file runner
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RunReport:
+    """Outcome of :func:`run_file`."""
+
+    stats: EngineStats
+    background_index: int
+    roi: tuple[int, int, int, int] | None
+
+
+def _resolve_roi(source: FileSource, config: PetrifyConfig) -> tuple[int, int, int, int] | None:
+    """Return the manual ROI, None when disabled, or the auto-detected one."""
+    roi_cfg = config.roi
+    if roi_cfg.mode == "manual":
+        assert roi_cfg.box is not None
+        logger.info("ROI: manual  x=%d y=%d w=%d h=%d", *roi_cfg.box)
+        return roi_cfg.box
+    if roi_cfg.mode == "disabled":
+        logger.info("ROI: disabled (--no-roi)")
+        return None
+    info = source.info
+    roi = auto_detect_roi(
+        source.capture,
+        info.frame_count or 0,
+        info.fps,
+        n_samples=roi_cfg.scan_samples,
+        min_freq=roi_cfg.scan_min_freq,
+        margin=roi_cfg.scan_margin,
+        max_area_frac=roi_cfg.scan_max_area_frac,
+        edge_threshold=roi_cfg.scan_edge_threshold,
+        edge_gap_tolerance=roi_cfg.scan_edge_gap_tolerance,
+        n_edge_samples=roi_cfg.scan_edge_samples,
+    )
+    if roi is None:
+        logger.warning(
+            "ROI auto-detection found nothing, running without timestamp overlay. "
+            "Use --roi X Y W H to set it manually, or --no-roi to silence this warning."
+        )
+    return roi
+
+
+def run_file(
+    input_path: str | Path,
+    output_path: str | Path,
+    config: PetrifyConfig,
+    observer: Callable[[FrameTrace], None] | None = None,
+) -> RunReport:
+    """Run the streaming engine on a video file: one pass, then FFmpeg re-encode.
+
+    Builds the same components as :func:`run` in the same order (source, detectors,
+    ROI, locked background, background differ) and drives them with :class:`Engine`.
+    """
+    source = FileSource(input_path)
+    try:
+        detectors: list[Detector] = []
+        if config.detector in ("motion", "both"):
+            detectors.append(MotionDetector.from_config(config.motion))
+        if config.detector in ("person", "both"):
+            detectors.append(PersonDetector.from_config(config.person))
+        logger.info("Detector mode: %s", config.detector)
+
+        roi = _resolve_roi(source, config)
+        background, bg_idx = locked_background(
+            source, config.background, config.background_scan_person_config()
+        )
+        if config.background_diff is not None:
+            bg_differ = BackgroundDiffer.from_config(background, config.background_diff)
+            detectors.append(bg_differ)
+            logger.info(
+                "BackgroundDiffer enabled: pixel_threshold=%d area_threshold=%d",
+                bg_differ.pixel_threshold,
+                bg_differ.area_threshold,
+            )
+
+        with tqdm(
+            total=source.info.frame_count or None,
+            desc="Petrify",
+            unit="fr",
+            dynamic_ncols=True,
+        ) as progress:
+
+            def on_frame(trace: FrameTrace) -> None:
+                progress.update(1)
+                if observer is not None:
+                    observer(trace)
+
+            engine = Engine(
+                source,
+                detectors,
+                EraseMode(background),
+                [RoiOverlay(roi)],
+                [FileSink(output_path, input_path, config.encode)],
+                config.engine,
+                on_frame,
+            )
+            stats = engine.run()
+    finally:
+        source.close()
+
+    if stats.frames > 0:
+        logger.info(
+            "Engine done: frozen=%d (%.1f%%)  pass-through=%d (%.1f%%)",
+            stats.frozen, 100.0 * stats.frozen / stats.frames,
+            stats.passed_through, 100.0 * stats.passed_through / stats.frames,
+        )
+    if stats.failed_closed > 0:
+        logger.warning(
+            "%d frame(s) failed closed and were written as black frames",
+            stats.failed_closed,
+        )
+    return RunReport(stats=stats, background_index=bg_idx, roi=roi)

@@ -14,13 +14,24 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-"""Streaming engine primitives; for now only the lookahead buffer used for gap fill."""
+"""Streaming engine: lazy detectors, lookahead buffer, mode, stages and sinks in one pass."""
 
 from __future__ import annotations
 
+import logging
 from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Generic, TypeVar
+
+import numpy as np
+
+from petrify.core.config import EngineConfig
+from petrify.core.detections import Detections
+from petrify.core.frame import Frame
+from petrify.core.plugin import Detector, Mode, Sink, Source, Stage
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -107,3 +118,210 @@ class LookaheadBuffer(Generic[T]):
         filled = self._last_true is not None and self._last_true >= index - self._lookahead
         final = filled or index < self._cold_start
         return Decision(item=item, index=index, raw=raw, filled=filled, final=final)
+
+
+_MAX_LOGGED_FAILURES = 5
+
+
+@dataclass(frozen=True)
+class FrameTrace:
+    """What the engine decided for one emitted frame."""
+
+    index: int
+    raw: bool
+    """``subject_present`` from the detectors (True when detection failed closed)."""
+    filled: bool
+    """After lookahead gap fill."""
+    final: bool
+    """After cold start; the value the mode received."""
+    failed_closed: bool
+    """True when the frame was replaced by a black image."""
+
+
+@dataclass
+class EngineStats:
+    """Counts for one engine run.
+
+    ``frozen`` and ``passed_through`` count frames that rendered normally, so
+    ``frozen + passed_through + failed_closed == frames``.
+    """
+
+    frames: int = 0
+    frozen: int = 0
+    passed_through: int = 0
+    failed_closed: int = 0
+
+
+@dataclass(frozen=True)
+class _Pending:
+    """One frame waiting in the lookahead buffer."""
+
+    frame: Frame
+    detections: Detections
+    detect_failed: bool
+
+
+class Engine:
+    """Single-threaded, single-pass streaming engine.
+
+    Per frame: run the detectors the mode requires (lazily), push the result into a
+    :class:`LookaheadBuffer`, and for every frame the buffer releases render it with
+    the mode, apply the stages in order, write it to every sink, and report a
+    :class:`FrameTrace` to the observer. A detector, mode, or stage error replaces
+    that frame with a black image (fail closed); source and sink errors abort the run.
+    """
+
+    def __init__(
+        self,
+        source: Source,
+        detectors: Sequence[Detector],
+        mode: Mode,
+        stages: Sequence[Stage],
+        sinks: Sequence[Sink],
+        config: EngineConfig,
+        observer: Callable[[FrameTrace], None] | None = None,
+    ) -> None:
+        self._source = source
+        self._detectors = tuple(d for d in detectors if d.provides & mode.requires)
+        self._mode = mode
+        self._stages = tuple(stages)
+        self._sinks = tuple(sinks)
+        self._config = config
+        self._observer = observer
+        self._stats = EngineStats()
+        self._failures_seen = 0
+
+    @property
+    def detectors(self) -> tuple[Detector, ...]:
+        """The detectors this engine runs, in order (only those the mode requires)."""
+        return self._detectors
+
+    def run(self) -> EngineStats:
+        """Process the whole source and return the run's counts.
+
+        Every sink is opened with ``source.info``. On success every sink is closed;
+        on any exception (``KeyboardInterrupt`` included) every opened sink is
+        aborted and the exception propagates. The source is not closed.
+        """
+        self._stats = EngineStats()
+        self._failures_seen = 0
+        buffer: LookaheadBuffer[_Pending] = LookaheadBuffer(
+            self._config.lookahead, self._config.cold_start_frames
+        )
+        for detector in self._detectors:
+            detector.reset()
+
+        opened: list[Sink] = []
+        try:
+            for sink in self._sinks:
+                sink.open(self._source.info)
+                opened.append(sink)
+            for frame in self._source:
+                pending = self._detect(frame)
+                raw = pending.detect_failed or pending.detections.subject_present
+                for decision in buffer.push(pending, raw):
+                    self._emit(decision)
+            for decision in buffer.flush():
+                self._emit(decision)
+        except BaseException:
+            _abort_all(opened)
+            raise
+
+        _close_all(opened)
+
+        if self._failures_seen > _MAX_LOGGED_FAILURES:
+            logger.warning(
+                "%d further fail-closed failures were not logged individually",
+                self._failures_seen - _MAX_LOGGED_FAILURES,
+            )
+        return self._stats
+
+    def _detect(self, frame: Frame) -> _Pending:
+        """Run the detectors lazily: stateful ones always, others until a subject is found.
+
+        After a detector raises, the remaining stateful detectors still see the frame
+        so their models stay in step with the stream; their results are discarded.
+        """
+        detections = Detections()
+        failed = False
+        for detector in self._detectors:
+            if not detector.stateful and (failed or detections.subject_present):
+                continue
+            try:
+                result = detector.detect(frame)
+            except Exception as exc:
+                if not failed:
+                    self._log_failure(frame.index, f"detector {type(detector).__name__}", exc)
+                failed = True
+                continue
+            if not failed:
+                detections = detections.merged(result)
+        return _Pending(frame=frame, detections=detections, detect_failed=failed)
+
+    def _emit(self, decision: Decision[_Pending]) -> None:
+        """Render one released frame, write it to every sink, and report it."""
+        pending = decision.item
+        frame = pending.frame
+        failed = pending.detect_failed
+        image: np.ndarray | None = None
+        if not failed:
+            where = f"mode {self._mode.name}"
+            try:
+                image = self._mode.render(frame, pending.detections, decision.final)
+                for stage in self._stages:
+                    where = f"stage {type(stage).__name__}"
+                    image = stage.apply(frame, image)
+            except Exception as exc:
+                self._log_failure(frame.index, where, exc)
+                failed = True
+        if failed or image is None:
+            failed = True
+            image = np.zeros_like(frame.image)
+
+        for sink in self._sinks:
+            sink.write(frame, image)
+
+        stats = self._stats
+        stats.frames += 1
+        if failed:
+            stats.failed_closed += 1
+        elif decision.final:
+            stats.frozen += 1
+        else:
+            stats.passed_through += 1
+
+        if self._observer is not None:
+            self._observer(
+                FrameTrace(
+                    index=decision.index,
+                    raw=decision.raw,
+                    filled=decision.filled,
+                    final=decision.final,
+                    failed_closed=failed,
+                )
+            )
+
+    def _log_failure(self, index: int, where: str, exc: Exception) -> None:
+        """Log the first few fail-closed failures; later ones are only counted."""
+        self._failures_seen += 1
+        if self._failures_seen <= _MAX_LOGGED_FAILURES:
+            logger.warning("Frame %d failed closed (%s): %r", index, where, exc)
+
+
+def _close_all(sinks: Sequence[Sink]) -> None:
+    """Close every sink in order; if one raises, abort the rest and re-raise."""
+    for i, sink in enumerate(sinks):
+        try:
+            sink.close()
+        except BaseException:
+            _abort_all(sinks[i + 1 :])
+            raise
+
+
+def _abort_all(sinks: Sequence[Sink]) -> None:
+    """Abort every sink, logging (not raising) any error so the original one propagates."""
+    for sink in sinks:
+        try:
+            sink.abort()
+        except Exception:
+            logger.exception("Sink %s failed to abort", type(sink).__name__)

@@ -1,6 +1,9 @@
-"""Parity test: re-run the legacy pipeline and compare it against committed golden fixtures."""
+"""Parity tests: re-run the legacy pipeline and the streaming engine against committed golden fixtures."""
 
 from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from pathlib import Path
 
 import pytest
 
@@ -12,12 +15,13 @@ from tests.golden.cases import (
     file_sha256,
     load_fixture,
 )
-from tests.golden.harness import capture_legacy
+from tests.golden.harness import GoldenRecord, capture_engine, capture_legacy
+
+Producer = Callable[[Path, Sequence[str]], GoldenRecord]
 
 
-@pytest.mark.golden
-@pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
-def test_legacy_matches_golden(case: GoldenCase) -> None:
+def _check_case(case: GoldenCase, producer: Producer) -> None:
+    """Fail on a missing or mismatched fixture, skip without the clip, then compare."""
     if not case.fixture_path.exists():
         pytest.fail(
             f"Golden fixture missing for case {case.case_id!r}: {case.fixture_path}. "
@@ -41,7 +45,19 @@ def test_legacy_matches_golden(case: GoldenCase) -> None:
             f"{expected.clip_sha256}"
         )
 
-    actual = capture_legacy(case.clip_path, case.argv)
+    actual = producer(case.clip_path, case.argv)
     diffs = compare_records(actual, expected)
     if diffs:
         pytest.fail(describe_failure(case.case_id, diffs, actual, expected), pytrace=False)
+
+
+@pytest.mark.golden
+@pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
+def test_legacy_matches_golden(case: GoldenCase) -> None:
+    _check_case(case, capture_legacy)
+
+
+@pytest.mark.golden
+@pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
+def test_engine_matches_golden(case: GoldenCase) -> None:
+    _check_case(case, capture_engine)

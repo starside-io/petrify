@@ -13,8 +13,17 @@ import numpy as np
 import pytest
 
 import petrify.cli
+import petrify.sinks.file
 from petrify.stages.roi_overlay import Compositor
-from tests.golden.harness import SCHEMA_VERSION, GoldenRecord, capture_legacy, from_json, to_json
+from tests.golden.cases import compare_records
+from tests.golden.harness import (
+    SCHEMA_VERSION,
+    GoldenRecord,
+    capture_engine,
+    capture_legacy,
+    from_json,
+    to_json,
+)
 
 # Height must stay >= 256 so the default HOG downsample (0.5) keeps frames at least as
 # large as the 64x128 HOG window; smaller frames crash the native detector.
@@ -181,6 +190,31 @@ def test_encode_defaults_match_cli(default_record: GoldenRecord) -> None:
         "audio_from_input": True,
         "output_is_requested_path": True,
     }
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["--detector", "both"],
+        ["--no-roi", "--background-frame", "0"],
+        ["--gap-fill", "0"],
+        ["--no-bg-diff"],
+    ],
+    ids=["defaults", "detector-both", "no-roi-bg-0", "gap-fill-0", "no-bg-diff"],
+)
+def test_engine_matches_legacy(clip: Path, argv: list[str]) -> None:
+    engine = capture_engine(clip, argv)
+    assert compare_records(engine, capture_legacy(clip, argv)) == []
+    assert engine.total_frames == len(engine.raw) == len(engine.frame_digests) == _N
+
+
+def test_engine_capture_restores_patches(clip: Path) -> None:
+    real_writer = cv2.VideoWriter
+    real_encode = petrify.sinks.file.ffmpeg_encode
+    capture_engine(clip, ["--no-roi", "--background-frame", "0"])
+    assert cv2.VideoWriter is real_writer
+    assert petrify.sinks.file.ffmpeg_encode is real_encode
 
 
 def test_encode_options_recorded(clip: Path) -> None:
