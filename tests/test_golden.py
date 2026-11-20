@@ -24,6 +24,13 @@ def test_legacy_matches_golden(case: GoldenCase) -> None:
             "Generate it with: python -m tests.golden.regenerate --case " + case.case_id
         )
     expected = load_fixture(case.case_id)
+    if expected.argv != list(case.argv) or expected.clip != case.clip:
+        pytest.fail(
+            f"Golden fixture for case {case.case_id!r} was captured with clip "
+            f"{expected.clip!r} and argv {expected.argv!r}, but the case declares clip "
+            f"{case.clip!r} and argv {list(case.argv)!r}.",
+            pytrace=False,
+        )
 
     if not case.clip_path.exists():
         pytest.skip(f"demo clip not available: {case.clip_path}")

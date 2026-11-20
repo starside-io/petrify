@@ -20,7 +20,7 @@ FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 FRAME_FIELDS = ("raw", "filled", "final")
 DIGEST_FIELD = "frame_digests"
-SCALAR_FIELDS = ("background_index", "roi", "total_frames", "width", "height", "fps")
+SCALAR_FIELDS = ("background_index", "roi", "total_frames", "width", "height", "fps", "output")
 
 _MAX_LISTED_INDICES = 10
 
@@ -49,6 +49,10 @@ CASES: tuple[GoldenCase, ...] = (
     GoldenCase("camera2-no-bg-diff", "camera2.mp4", ("--no-bg-diff",)),
     GoldenCase("camera2-gap-fill-0", "camera2.mp4", ("--gap-fill", "0")),
     GoldenCase("camera2-background-frame-0", "camera2.mp4", ("--background-frame", "0")),
+    GoldenCase(
+        "camera2-no-bg-diff-gap-fill-0", "camera2.mp4", ("--no-bg-diff", "--gap-fill", "0")
+    ),
+    GoldenCase("camera2-detect-shadows", "camera2.mp4", ("--detect-shadows",)),
 )
 
 CASES_BY_ID: dict[str, GoldenCase] = {case.case_id: case for case in CASES}
@@ -96,8 +100,8 @@ def compare_records(actual: GoldenRecord, expected: GoldenRecord) -> list[str]:
     """Return human-readable differences between two records, empty when they match.
 
     Compared: the per-frame fields (raw, filled, final), the per-frame output digests
-    (frame_digests), background_index, roi, total_frames, width, height, fps. Exact
-    equality, no tolerance.
+    (frame_digests), background_index, roi, total_frames, width, height, fps, and the
+    output stage request (output). Exact equality, no tolerance.
     ``opencv_version`` is deliberately not compared (see ``describe_failure``).
     """
     diffs: list[str] = []

@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import hashlib
+import inspect
 import json
 import tempfile
 from collections.abc import Callable, Iterator, Sequence
@@ -20,11 +21,14 @@ from unittest import mock
 import cv2
 
 import petrify.cli
+import petrify.encoder
 import petrify.pipeline
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _FRAME_FIELDS = ("raw", "filled", "final")
+
+_WRITER_PARAMS = ("filename", "fourcc", "fps", "frameSize")
 
 
 @dataclasses.dataclass
@@ -44,6 +48,9 @@ class GoldenRecord:
     filled: list[bool]
     final: list[bool]
     frame_digests: list[str]
+    # Output stage request: {"fps", "width", "height", "encode": {"codec", "crf",
+    # "preset", "hwaccel", "audio_from_input", "output_is_requested_path"}}.
+    output: dict[str, Any]
 
 
 def _sha256(path: Path) -> str:
@@ -95,12 +102,27 @@ def _frame_digest(frame: Any) -> str:
 
 
 @contextlib.contextmanager
-def _record_written_frames(digests: list[str]) -> Iterator[None]:
-    """Replace ``cv2.VideoWriter`` with a stand-in that records a digest of each written frame."""
+def _record_written_frames(
+    digests: list[str], writers: list[dict[str, Any]]
+) -> Iterator[None]:
+    """Replace ``cv2.VideoWriter`` with a stand-in that records a digest of each written frame.
+
+    Each construction appends the requested ``fps``, ``width`` and ``height`` to *writers*.
+    """
 
     class _DigestWriter:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
+            if len(args) > len(_WRITER_PARAMS) + 1:
+                raise RuntimeError(f"Unsupported video writer signature: {len(args)} args.")
+            params = dict(zip(_WRITER_PARAMS, args))
+            params.update(kwargs)
+            missing = [p for p in ("fps", "frameSize") if p not in params]
+            if missing:
+                raise RuntimeError(f"Video writer constructed without {', '.join(missing)}.")
+            frame_w, frame_h = params["frameSize"]
+            writers.append(
+                {"fps": float(params["fps"]), "width": int(frame_w), "height": int(frame_h)}
+            )
 
         def isOpened(self) -> bool:
             return True
@@ -113,6 +135,24 @@ def _record_written_frames(digests: list[str]) -> Iterator[None]:
 
     with mock.patch.object(cv2, "VideoWriter", new=_DigestWriter):
         yield
+
+
+@contextlib.contextmanager
+def _record_encode_requests(requests: list[inspect.BoundArguments]) -> Iterator[None]:
+    """Replace the pipeline's encode step with a no-op that records its bound arguments."""
+    signature = inspect.signature(petrify.encoder.ffmpeg_encode)
+
+    def recorder(*args: Any, **kwargs: Any) -> None:
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        requests.append(bound)
+
+    with mock.patch.object(petrify.pipeline, "ffmpeg_encode", new=recorder):
+        yield
+
+
+def _same_path(a: Any, b: Path) -> bool:
+    return Path(a).resolve() == b.resolve()
 
 
 def _single(results: dict[str, list[Any]], name: str) -> Any:
@@ -137,6 +177,8 @@ def capture_legacy(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> Gol
     )
     results: dict[str, list[Any]] = {}
     frame_digests: list[str] = []
+    writers: list[dict[str, Any]] = []
+    encodes: list[inspect.BoundArguments] = []
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_out = Path(tmp_dir) / "out.mp4"
@@ -144,11 +186,30 @@ def capture_legacy(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> Gol
         with contextlib.ExitStack() as stack:
             for name in spied:
                 stack.enter_context(_spy(name, results))
-            stack.enter_context(
-                mock.patch.object(petrify.pipeline, "ffmpeg_encode", new=lambda **_: None)
-            )
-            stack.enter_context(_record_written_frames(frame_digests))
+            stack.enter_context(_record_encode_requests(encodes))
+            stack.enter_context(_record_written_frames(frame_digests, writers))
             petrify.pipeline.run(args)
+
+        if len(writers) != 1:
+            raise RuntimeError(
+                f"Expected the output video writer to be opened exactly once, got {len(writers)}."
+            )
+        if len(encodes) != 1:
+            raise RuntimeError(
+                f"Expected the encode step to be requested exactly once, got {len(encodes)}."
+            )
+        encode = encodes[0].arguments
+        output: dict[str, Any] = {
+            **writers[0],
+            "encode": {
+                "codec": encode["codec"],
+                "crf": int(encode["crf"]),
+                "preset": encode["preset"],
+                "hwaccel": encode["hwaccel"],
+                "audio_from_input": _same_path(encode["original_audio_source"], clip),
+                "output_is_requested_path": _same_path(encode["output_path"], tmp_out),
+            },
+        }
 
     if not frame_digests:
         raise RuntimeError("Expected at least one composited frame to be written, got none.")
@@ -189,6 +250,7 @@ def capture_legacy(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> Gol
         filled=[bool(v) for v in filled],
         final=[bool(v) for v in final],
         frame_digests=frame_digests,
+        output=output,
     )
 
 
