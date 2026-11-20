@@ -159,7 +159,13 @@ class PersonDetector:
             return frame
         h, w = frame.shape[:2]
         win_w, win_h = self._hog.winSize
-        # Never shrink below the HOG window, but never upscale past the source.
-        new_w = max(min(w, win_w), int(w * self.downsample))
-        new_h = max(min(h, win_h), int(h * self.downsample))
+        # One scale for both axes (keeps aspect ratio), raised just enough that
+        # neither axis goes under the HOG window, and never above 1.0.
+        scale = max(self.downsample, win_w / w, win_h / h)
+        if scale >= 1.0:
+            return frame
+        # scale < 1.0 implies w > win_w and h > win_h, so these max() calls
+        # only undo float rounding and never upscale past the source.
+        new_w = max(win_w, int(w * scale))
+        new_h = max(win_h, int(h * scale))
         return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
