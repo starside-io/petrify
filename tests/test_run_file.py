@@ -17,6 +17,7 @@ from petrify.core import (
     BackgroundConfig,
     EncodeConfig,
     FrameTrace,
+    PersonHogConfig,
     PetrifyConfig,
     RoiConfig,
 )
@@ -110,6 +111,24 @@ def test_run_file_manual_roi_reported(clip: Path, tmp_path: Path) -> None:
     with mock.patch.object(sink_mod, "ffmpeg_encode", new=_EncoderSpy()):
         report = run_file(clip, tmp_path / "out.mp4", config)
     assert report.roi == (0, 0, 40, 20)
+
+
+def test_run_file_background_scan_uses_scan_person_config(clip: Path, tmp_path: Path) -> None:
+    config = _config(detector="motion", person=PersonHogConfig(min_box_area=4000))
+    expected = config.background_scan_person_config()
+    assert expected != config.person
+    background = np.zeros((_H, _W, 3), dtype=np.uint8)
+    selector = mock.Mock(return_value=(background, 3))
+    with (
+        mock.patch.object(sink_mod, "ffmpeg_encode", new=_EncoderSpy()),
+        mock.patch("petrify.pipeline.locked_background", new=selector),
+    ):
+        report = run_file(clip, tmp_path / "out.mp4", config)
+    selector.assert_called_once()
+    args = selector.call_args.args
+    assert args[1] == config.background
+    assert args[2] == expected
+    assert report.background_index == 3
 
 
 def test_run_file_failure_skips_encode_and_removes_temp(clip: Path, tmp_path: Path) -> None:

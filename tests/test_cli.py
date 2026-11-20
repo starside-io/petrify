@@ -134,6 +134,16 @@ def test_invalid_downsample_exits_through_parser_error(
     run_file.assert_not_called()
 
 
+def test_negative_gap_fill_exits_through_parser_error(
+    run_file: mock.MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main([IN, OUT, "--gap-fill", "-3"])
+    assert excinfo.value.code == 2
+    assert "--gap-fill must be >= 0, got -3" in capsys.readouterr().err
+    run_file.assert_not_called()
+
+
 def test_version(run_file: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as excinfo:
         main(["--version"])

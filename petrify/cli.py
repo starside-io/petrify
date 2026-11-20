@@ -443,6 +443,8 @@ def main(argv: list[str] | None = None) -> int:
     # Validate --downsample range here (argparse doesn't support float ranges).
     if not (0.0 < args.downsample <= 1.0):
         parser.error(f"--downsample must be in (0, 1], got {args.downsample}")
+    if args.gap_fill < 0:
+        parser.error(f"--gap-fill must be >= 0, got {args.gap_fill}")
 
     # Import here to keep startup fast when --version / --help is used.
     from petrify.core.config import PetrifyConfig  # noqa: PLC0415

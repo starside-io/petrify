@@ -181,3 +181,25 @@ def test_close_and_abort_without_open(tmp_path: Path, monkeypatch: pytest.Monkey
 
 def test_satisfies_sink_protocol(tmp_path: Path) -> None:
     assert isinstance(_sink(tmp_path), Sink)
+
+
+def test_writer_constructor_error_removes_temp_and_reraises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created: list[str] = []
+
+    def _raising_writer(path: str, *args: Any) -> None:
+        created.append(path)
+        raise cv2.error("writer constructor broke")
+
+    monkeypatch.setattr(cv2, "VideoWriter", _raising_writer)
+    spy = _EncoderSpy()
+    monkeypatch.setattr(sink_mod, "ffmpeg_encode", spy)
+    sink = _sink(tmp_path)
+    with pytest.raises(cv2.error, match="writer constructor broke"):
+        sink.open(INFO)
+    assert len(created) == 1
+    assert not os.path.exists(created[0])
+    sink.close()
+    sink.abort()
+    assert spy.calls == []

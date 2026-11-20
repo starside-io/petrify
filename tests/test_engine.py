@@ -427,3 +427,42 @@ def test_failures_logged_at_most_five_times(caplog: pytest.LogCaptureFixture) ->
     assert "Frame 0" in per_frame[0].getMessage()
     assert any("3 further" in r.getMessage() for r in caplog.records)
     assert stats.failed_closed == 8
+
+
+# ---------------------------------------------------------------------------
+# Close and abort ordering
+# ---------------------------------------------------------------------------
+
+
+def test_close_error_aborts_remaining_sinks_and_propagates() -> None:
+    class BadClose(FakeSink):
+        def close(self) -> None:
+            self.events.append("close")
+            raise OSError("cannot close")
+
+    first, second = BadClose(), FakeSink()
+    with pytest.raises(OSError, match="cannot close"):
+        _run(3, [FakeDetector()], sinks=[first, second])
+    assert first.events == ["open", "close"]
+    assert second.events == ["open", "abort"]
+
+
+def test_abort_interrupt_still_aborts_every_sink_then_reraises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class InterruptAbort(FakeSink):
+        def abort(self) -> None:
+            self.events.append("abort")
+            raise KeyboardInterrupt
+
+    class ErrorAbort(FakeSink):
+        def abort(self) -> None:
+            self.events.append("abort")
+            raise OSError("abort broke")
+
+    sinks = [InterruptAbort(), ErrorAbort(), FakeSink(fail_write_at=1)]
+    with caplog.at_level(logging.ERROR), pytest.raises(KeyboardInterrupt):
+        _run(3, [FakeDetector()], sinks=sinks)
+    for sink in sinks:
+        assert sink.events == ["open", "abort"]
+    assert any("failed to abort" in r.getMessage() for r in caplog.records)
