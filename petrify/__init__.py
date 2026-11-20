@@ -20,8 +20,8 @@ __version__ = "0.1.0"
 __author__ = "petrify contributors"
 __license__ = "Apache-2.0"
 
-from petrify.compositor import Compositor
-from petrify.motion import MotionDetector
+from petrify.detectors.motion import MotionDetector
 from petrify.pipeline import run
+from petrify.stages.roi_overlay import Compositor
 
 __all__ = ["Compositor", "MotionDetector", "run", "__version__"]

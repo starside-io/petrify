@@ -25,7 +25,7 @@ import numpy as np
 from tqdm import tqdm
 
 from petrify.core.config import BackgroundConfig, PersonHogConfig
-from petrify.person import PersonDetector
+from petrify.detectors.person_hog import PersonDetector
 from petrify.sources.file import FileSource
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,8 @@ def find_clean_background(
     """Return the latest scanned frame with no person detected, and its index.
 
     Visits every ``scan_step``-th frame. Falls back to frame 0 (index 0) when
-    every sampled frame contains a person.
+    every sampled frame contains a person, and raises ``ValueError`` when frame 0
+    cannot be read either.
     """
     logger.info("Auto-background scan: checking every %d frames for a clean frame...", scan_step)
 
@@ -71,8 +72,9 @@ def find_clean_background(
             "Background scan found no person-free frame, falling back to frame 0. "
             "Consider specifying --background-frame manually."
         )
-        # Like pipeline.run(), this may be None if frame 0 itself cannot be read.
-        best_frame = source.read_frame(0)  # type: ignore[assignment]
+        best_frame = source.read_frame(0)
+        if best_frame is None:
+            raise ValueError("Cannot read any frame for the background reference.")
         best_idx = 0
     else:
         logger.info(
@@ -81,7 +83,7 @@ def find_clean_background(
             best_idx / source.info.fps,
         )
 
-    return best_frame, best_idx  # type: ignore[return-value]
+    return best_frame, best_idx
 
 
 def locked_background(
@@ -105,11 +107,5 @@ def locked_background(
         logger.info("Background reference: frame %d (manual)", bg_idx)
         return frame, bg_idx
 
-    detector = PersonDetector(
-        downsample=scan_person_config.downsample,
-        win_stride=scan_person_config.win_stride,
-        scale=scan_person_config.scale,
-        min_confidence=scan_person_config.min_confidence,
-        min_box_area=scan_person_config.min_box_area,
-    )
+    detector = PersonDetector.from_config(scan_person_config)
     return find_clean_background(source, detector, config.scan_step)

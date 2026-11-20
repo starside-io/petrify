@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from petrify.bgdiff import BackgroundDiffer
+from petrify.detectors.bgdiff import BackgroundDiffer
 
 
 def _solid(h: int, w: int, value: int = 128) -> np.ndarray:

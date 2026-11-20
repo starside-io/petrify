@@ -22,6 +22,8 @@ import logging
 
 import numpy as np
 
+from petrify.core.frame import Frame
+
 logger = logging.getLogger(__name__)
 
 
@@ -151,3 +153,22 @@ class Compositor:
             "compose: pasted roi patch shape=%s at (%d,%d)", src.shape, x1, y1
         )
         return output
+
+
+class RoiOverlay:
+    """Stage that pastes the live ROI from the real frame over the mode's output.
+
+    Parameters
+    ----------
+    roi:
+        ``(x, y, w, h)`` of the region to keep live, or ``None`` to return the
+        image unchanged.
+    """
+
+    def __init__(self, roi: tuple[int, int, int, int] | None) -> None:
+        self.roi = roi
+        self._compositor = Compositor(roi)
+
+    def apply(self, frame: Frame, image: np.ndarray) -> np.ndarray:
+        """Return *image* with the ROI region taken from ``frame.image``."""
+        return self._compositor.compose(image, self._compositor.extract_roi(frame.image))

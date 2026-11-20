@@ -38,9 +38,14 @@ incoming frame.  Because the reference never changes:
 from __future__ import annotations
 
 import logging
+from typing import ClassVar
 
 import cv2
 import numpy as np
+
+from petrify.core.config import BackgroundDiffConfig
+from petrify.core.detections import DetectionKind, Detections
+from petrify.core.frame import Frame
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +71,9 @@ class BackgroundDiffer:
         differencing.  Matches the MOG2 downsample so comparisons are apples-
         to-apples.
     """
+
+    provides: ClassVar[frozenset[DetectionKind]] = frozenset({DetectionKind.BACKGROUND_DIFF})
+    stateful: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -95,9 +103,26 @@ class BackgroundDiffer:
             pixel_threshold, area_threshold, downsample, new_w, new_h,
         )
 
+    @classmethod
+    def from_config(cls, reference: np.ndarray, cfg: BackgroundDiffConfig) -> BackgroundDiffer:
+        """Build a differ against *reference* from a :class:`BackgroundDiffConfig`."""
+        return cls(
+            reference=reference,
+            pixel_threshold=cfg.pixel_threshold,
+            area_threshold=cfg.area_threshold,
+            downsample=cfg.downsample,
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def detect(self, frame: Frame) -> Detections:
+        """Return detections with only ``background_diff`` set (see :meth:`is_different`)."""
+        return Detections(background_diff=self.is_different(frame.image))
+
+    def reset(self) -> None:
+        """No-op: the differ keeps no per-frame state."""
 
     def is_different(self, frame: np.ndarray) -> bool:
         """Return True if *frame* differs significantly from the locked reference.
