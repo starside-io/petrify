@@ -87,9 +87,21 @@ pytest --cov=petrify --cov-report=term-missing
 
 # Run a single test file
 pytest tests/test_motion.py -v
+
+# Fast tests only (skips the golden parity tests)
+pytest -m "not golden"
+
+# Golden parity tests only
+pytest -m golden
 ```
 
-Tests live in the `tests/` directory. Each module in `petrify/` should have a corresponding `tests/test_<module>.py` file. If you add a new feature, please add tests.
+Tests live in the `tests/` directory, one file per module (for example `tests/test_engine.py` covers `petrify/core/engine.py`). If you add a new feature, please add tests.
+
+### Golden tests
+
+The golden tests compare the old two-pass pipeline (`petrify.run`), the streaming engine, and the CLI against the fixtures committed in `tests/golden/fixtures/`. They need the demo clips `data/camera.mp4` and `data/camera2.mp4`, which are not in the repository. Without them (or when a clip's checksum does not match the fixture) the golden tests are skipped. A missing fixture is a failure, not a skip.
+
+To record fixtures from the old pipeline, run `python -m tests.golden.regenerate` from the repository root (all cases, or one with `--case <id>`). Existing fixtures are only replaced with `--overwrite`.
 
 ---
 

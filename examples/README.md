@@ -10,8 +10,10 @@ Freeze the background whenever motion exceeds 500 px² of foreground area
 (the default threshold):
 
 ```bash
-petrify input.mp4 output.mp4
+petrify input.mp4 output.mp4 --no-roi
 ```
+
+Without `--no-roi`, petrify auto-detects the timestamp region and keeps it live.
 
 ---
 
@@ -117,16 +119,18 @@ petrify input.mp4 output.mp4 --hwaccel qsv --codec h264_qsv
 
 ## Debugging
 
-Enable verbose logging to see per-frame motion decisions:
+Enable verbose logging to see per-frame detector decisions:
 
 ```bash
 petrify input.mp4 output.mp4 --verbose 2>petrify.log
 ```
 
 The log will show:
-- `Frame: MOTION  -> using frozen still_frame` — background was frozen
-- `Frame: STILL   -> updated still_frame` — new clean frame captured
-- FFmpeg command line and exit status
+- `is_motion: total_contour_area=... threshold=... -> True` (MOG2 decision for a frame)
+- `BackgroundDiffer: area=... threshold=... -> True` (static background differ decision)
+- `PersonDetector: person detected box=(...) confidence=... area=...` or `PersonDetector: no detections` (HOG)
+- `Engine done: frozen=... pass-through=...` at the end of the run
+- The FFmpeg command line, and FFmpeg's own output (its exit code is logged if it fails)
 
 ---
 

@@ -29,7 +29,7 @@ It uses [OpenCV's MOG2](https://docs.opencv.org/4.x/d7/d7b/classcv_1_1Background
 
 ---
 
-When a security camera records someone entering a building, does the output need to show *who* was there? **petrify** answers that question with a two-pass pipeline. The first pass builds the clean background. The second composites every frame so only the timestamp survives.
+When a security camera records someone entering a building, does the output need to show *who* was there? **petrify** answers that question with a short pre-scan and a single processing pass. The pre-scan picks the clean background. The processing pass composites every frame so only the timestamp survives.
 
 ---
 
@@ -137,6 +137,8 @@ petrify input.mp4 output.mp4 --verbose
 
 ### Example output
 
+`petrify camera2.mp4 output.mp4` on the 640x480, 6 fps corridor clip:
+
 ```
 ██████╗ ███████╗████████╗██████╗ ██╗███████╗██╗   ██╗
 ██╔══██╗██╔════╝╚══██╔══╝██╔══██╗██║██╔════╝╚██╗ ██╔╝
@@ -145,28 +147,24 @@ petrify input.mp4 output.mp4 --verbose
 ██║     ███████╗   ██║   ██║  ██║██║██║        ██║
 ╚═╝     ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝╚═╝        ╚═╝
 
-  Made with ❤️  by starside.io
+  Freeze the world. Keep the clock ticking.
+  Made with ❤️  by starside.io  ·  https://starside.io
 
-Input  : front_door.mp4  (1920×1080 @ 25 fps · 1169 frames)
-Output : output.mp4
-
-Auto ROI scan ── 60 frame pairs ──────────────────────────────────
-  Detected ROI  x=0 y=0 w=642 h=129
-  → To skip next time: --roi 0 0 642 129
-
-Background scan ── searching for clean frame ──────────────────────
-  Auto background: frame 1165  (46.6 s into video)
-
-Pass 1 ── classifying 1169 frames ─────────────────────────────────
-  MOG2 · HOG · BackgroundDiffer
-  subject detected in 1015 / 1169 frames (86.8%)
-  gap-fill +15 frames · cold-start freeze 0–49
-
-Pass 2 ── compositing ─────────────────────────────────────────────
-  frozen=1151 (98.5%)  pass-through=18 (1.5%)
-
-Re-encoding → output.mp4  (libx264 crf=23 medium)
-Done.
+16:55:00 [INFO] petrify.sources.file: Input: camera2.mp4  |  640x480 @ 6.00 fps  |  ~655 frames
+16:55:00 [INFO] petrify.pipeline: Detector mode: motion
+16:55:00 [INFO] petrify.roi_detect: Auto ROI scan: diffing 60 frame pairs (gap=6 fr) across 655 frames...
+16:55:01 [INFO] petrify.roi_detect: Pass 1 anchor: x=151 y=0 w=8 h=13  freq=0.41  cx_rel=0.24 cy_rel=0.01
+16:55:01 [INFO] petrify.roi_detect: Auto ROI detected: x=0 y=0 w=440 h=29
+16:55:01 [INFO] petrify.roi_detect:   → To skip auto-detection next time: --roi 0 0 440 29
+16:55:01 [INFO] petrify.background.locked: Auto-background scan: checking every 5 frames for a clean frame...
+16:55:02 [INFO] petrify.background.locked: Auto background: frame 650  (108.3s into video)
+16:55:02 [INFO] petrify.pipeline: BackgroundDiffer enabled: pixel_threshold=25 area_threshold=200
+16:55:02 [INFO] petrify.sinks.file: Compositing frames -> /tmp/tmpj6z7l5hi.mp4
+16:55:04 [INFO] petrify.sinks.file: Re-encoding with FFmpeg -> output.mp4
+16:55:04 [INFO] petrify.encoder: FFmpeg command: /opt/homebrew/bin/ffmpeg -y -i /tmp/tmpj6z7l5hi.mp4 -i camera2.mp4 -map 0:v:0 -map 1:a? -c:v libx264 -crf 23 -preset medium -c:a copy output.mp4
+16:55:04 [INFO] petrify.sinks.file: Done. Output written to: output.mp4
+Petrify: 100%|██████████| 655/655 [00:02<00:00, 308.86fr/s]
+16:55:04 [INFO] petrify.pipeline: Engine done: frozen=494 (75.4%)  pass-through=161 (24.6%)
 ```
 
 ---
@@ -178,34 +176,34 @@ petrify uses three complementary signals that together cover every failure mode:
 ```
 input video
     │
-    ├── Pass 0: Auto ROI detection (frame-diff + Laplacian edges)
+    ├── Pre-scan: Auto ROI detection (frame-diff + Laplacian edges)
     │          Finds the burned-in timestamp region automatically.
     │
-    ├── Pass 0: Auto background selection (HOG scan → latest clean frame)
+    ├── Pre-scan: Auto background selection (HOG scan → latest clean frame)
     │          Locks the reference background before any processing.
     │
-    ├── Pass 1: Frame classification
-    │    │
-    │    ├── MOG2 (motion)        catches moving subjects
-    │    ├── HOG  (person)        catches stopped subjects MOG2 adapted away
-    │    └── BackgroundDiffer     catches tiny / partial / edge subjects
-    │              ↓                both detectors miss
-    │         has_subject[N] = True / False
-    │              ↓
-    │         gap-fill ±15 frames  (bridges missed detections mid-sequence)
-    │         cold-start freeze    (MOG2 warmup window)
-    │
-    └── Pass 2: Compositing
+    └── Single streaming pass, frame by frame
          │
-         ├── Track A: frozen background (locked clean frame)
-         │            used when has_subject[N] = True
+         ├── Detectors (in order; MOG2 always runs, the others stop at the first hit)
+         │    ├── MOG2 (motion)        catches moving subjects
+         │    ├── HOG  (person)        catches stopped subjects MOG2 adapted away
+         │    │                        (only with --detector person or both)
+         │    └── BackgroundDiffer     catches tiny / partial / edge subjects
+         │              ↓                both detectors miss
+         │         subject present = True / False
          │
-         ├── Track B: live ROI extract from real frame (always)
+         ├── Lookahead buffer: output delayed by --gap-fill frames
+         │         gap-fill ±10 frames  (bridges missed detections mid-sequence)
+         │         cold-start freeze    (first 50 frames, MOG2 warmup window)
+         │
+         ├── Erase: locked clean frame when a subject is present, live frame otherwise
+         │
+         ├── ROI overlay: live timestamp pasted from the real frame (always)
          │            timestamp keeps ticking regardless of freeze state
          │
-         └── Compositor → paste ROI → VideoWriter → FFmpeg re-encode + audio mux
-                                                            ↓
-                                                       output.mp4
+         └── File sink → intermediate file → FFmpeg re-encode + audio mux
+                                                     ↓
+                                                output.mp4
 ```
 
 ### Why three detectors?
@@ -262,7 +260,7 @@ usage: petrify [options] INPUT OUTPUT
 | `--no-roi` | off | Disable timestamp overlay and skip auto-detection entirely. |
 | `--roi-scan-samples N` | 60 | Frame pairs to diff during auto ROI detection. |
 | `--roi-scan-min-freq F` | 0.6 | Min change-frequency for a pixel to be part of the anchor. |
-| `--roi-scan-edge-threshold F` | 80 | Laplacian column energy threshold for Pass 2 (text vs. background). |
+| `--roi-scan-edge-threshold F` | 80 | Laplacian column energy threshold for the ROI edge pass (text vs. background). |
 | `--roi-scan-edge-gap-tolerance PX` | 30 | Max inter-character gap before the edge scan stops. |
 
 ### Background / Reference
@@ -271,14 +269,14 @@ usage: petrify [options] INPUT OUTPUT
 |---|---|---|
 | `--background-frame N` | auto | Frame index to use as the locked reference. Auto-scanned if omitted. |
 | `--no-bg-diff` | off | Disable the static background differ (reduces recall). |
-| `--bg-diff-pixel-threshold INT` | 25 | Per-pixel ΔE above which a pixel is counted as changed. |
+| `--bg-diff-pixel-threshold INT` | 25 | Per-pixel grayscale difference (0 to 255) above which a pixel is counted as changed. |
 | `--bg-diff-area-threshold PX` | 200 | Changed-pixel area (px² in downsampled space) to fire the differ. |
 
 ### Detector mode
 
 | Flag | Default | Description |
 |---|---|---|
-| `--detector {motion,person,both}` | both | Active detectors for Pass 1. |
+| `--detector {motion,person,both}` | motion | Freeze trigger: MOG2 (`motion`), HOG (`person`), or either (`both`). The background differ runs in every mode unless `--no-bg-diff` is set. |
 | `--hog-min-confidence F` | 0.3 | HOG detection confidence floor. Raise to 1.2 if false positives on architectural structures. |
 | `--hog-min-box-area PX` | 1500 | Minimum HOG detection bounding-box area. |
 
@@ -288,7 +286,7 @@ usage: petrify [options] INPUT OUTPUT
 |---|---|---|
 | `--threshold PX` | 500 | Foreground contour area (downsampled px²) to classify a frame as motion. Lower = more sensitive. |
 | `--history N` | 200 | MOG2 background model window (frames). |
-| `--gap-fill N` | 15 | Expand every detected region ±N frames to bridge gaps. |
+| `--gap-fill N` | 10 | Expand every detected region ±N frames to bridge gaps. Output is delayed by N frames. Must be 0 or more. |
 | `--downsample F` | 0.5 | Resize factor before detection. 0.5 = 4× speedup. |
 
 ### Encoding
@@ -307,13 +305,13 @@ usage: petrify [options] INPUT OUTPUT
 
 | Dependency | Minimum version | Notes |
 |---|---|---|
-| Python | 3.10 | Required for `match` syntax and type union hints |
+| Python | 3.10 | Minimum supported version (`requires-python >= 3.10`) |
 | opencv-python-headless | 4.8 | MOG2, HOG, Laplacian edge detection |
 | numpy | 1.24 | Frame array operations |
 | tqdm | 4.65 | Progress bars |
 | FFmpeg | Any recent | System binary. `brew install ffmpeg` / `apt install ffmpeg` |
 | RAM | 2 GB | 4 GB recommended for 1080p |
-| Storage | Source file size × 2 | Temporary uncompressed frame buffer during Pass 2 |
+| Storage | Source file size × 2 | Temporary intermediate video file written before the FFmpeg re-encode |
 
 No GPU required. All detection runs on CPU via OpenCV.
 
@@ -342,7 +340,7 @@ Speed scales with resolution and source frame rate. Low-FPS cameras (6fps) proce
 | 4K | Needs GPU | Recommended | Recommended |
 
 - Use `--downsample 0.25` for 4K to reduce MOG2 cost.
-- The bottleneck for large resolutions is OpenCV's `VideoWriter` (uncompressed frame I/O). Use a fast SSD or a RAM-backed `/tmp`.
+- The bottleneck for large resolutions is OpenCV's `VideoWriter` (intermediate file I/O). Use a fast SSD or a RAM-backed `/tmp`.
 
 ---
 
