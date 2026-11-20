@@ -22,7 +22,7 @@ import cv2
 import petrify.cli
 import petrify.pipeline
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _FRAME_FIELDS = ("raw", "filled", "final")
 
@@ -43,6 +43,7 @@ class GoldenRecord:
     raw: list[bool]
     filled: list[bool]
     final: list[bool]
+    frame_digests: list[str]
 
 
 def _sha256(path: Path) -> str:
@@ -84,6 +85,36 @@ def _spy(name: str, results: dict[str, list[Any]]) -> Iterator[None]:
         yield
 
 
+def _frame_digest(frame: Any) -> str:
+    """Hash a frame's shape, dtype, and raw C-order bytes into 16 hex characters."""
+    digest = hashlib.blake2b(digest_size=8)
+    digest.update(repr(tuple(int(d) for d in frame.shape)).encode("ascii"))
+    digest.update(frame.dtype.str.encode("ascii"))
+    digest.update(frame.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+@contextlib.contextmanager
+def _record_written_frames(digests: list[str]) -> Iterator[None]:
+    """Replace ``cv2.VideoWriter`` with a stand-in that records a digest of each written frame."""
+
+    class _DigestWriter:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def isOpened(self) -> bool:
+            return True
+
+        def write(self, frame: Any) -> None:
+            digests.append(_frame_digest(frame))
+
+        def release(self) -> None:
+            pass
+
+    with mock.patch.object(cv2, "VideoWriter", new=_DigestWriter):
+        yield
+
+
 def _single(results: dict[str, list[Any]], name: str) -> Any:
     calls = results[name]
     if len(calls) != 1:
@@ -94,7 +125,7 @@ def _single(results: dict[str, list[Any]], name: str) -> Any:
 
 
 def capture_legacy(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> GoldenRecord:
-    """Run the legacy pipeline on *clip_path* and return its per-frame classification."""
+    """Run the legacy pipeline on *clip_path* and return its per-frame record."""
     clip = Path(clip_path)
     argv = [str(a) for a in extra_argv]
     spied = (
@@ -105,6 +136,7 @@ def capture_legacy(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> Gol
         "auto_detect_roi",
     )
     results: dict[str, list[Any]] = {}
+    frame_digests: list[str] = []
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_out = Path(tmp_dir) / "out.mp4"
@@ -115,7 +147,11 @@ def capture_legacy(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> Gol
             stack.enter_context(
                 mock.patch.object(petrify.pipeline, "ffmpeg_encode", new=lambda **_: None)
             )
+            stack.enter_context(_record_written_frames(frame_digests))
             petrify.pipeline.run(args)
+
+    if not frame_digests:
+        raise RuntimeError("Expected at least one composited frame to be written, got none.")
 
     raw = _single(results, "_classify_frames")
     filled = _single(results, "_fill_gaps")
@@ -152,6 +188,7 @@ def capture_legacy(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> Gol
         raw=[bool(v) for v in raw],
         filled=[bool(v) for v in filled],
         final=[bool(v) for v in final],
+        frame_digests=frame_digests,
     )
 
 

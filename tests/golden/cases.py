@@ -19,6 +19,7 @@ DATA_DIR = REPO_ROOT / "data"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 FRAME_FIELDS = ("raw", "filled", "final")
+DIGEST_FIELD = "frame_digests"
 SCALAR_FIELDS = ("background_index", "roi", "total_frames", "width", "height", "fps")
 
 _MAX_LISTED_INDICES = 10
@@ -76,7 +77,7 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _compare_frames(field: str, actual: Sequence[bool], expected: Sequence[bool]) -> list[str]:
+def _compare_frames(field: str, actual: Sequence[object], expected: Sequence[object]) -> list[str]:
     diffs: list[str] = []
     if len(actual) != len(expected):
         diffs.append(f"{field}: length differs (actual {len(actual)}, expected {len(expected)})")
@@ -94,8 +95,9 @@ def _compare_frames(field: str, actual: Sequence[bool], expected: Sequence[bool]
 def compare_records(actual: GoldenRecord, expected: GoldenRecord) -> list[str]:
     """Return human-readable differences between two records, empty when they match.
 
-    Compared: the per-frame fields (raw, filled, final), background_index, roi,
-    total_frames, width, height, fps. Exact equality, no tolerance.
+    Compared: the per-frame fields (raw, filled, final), the per-frame output digests
+    (frame_digests), background_index, roi, total_frames, width, height, fps. Exact
+    equality, no tolerance.
     ``opencv_version`` is deliberately not compared (see ``describe_failure``).
     """
     diffs: list[str] = []
@@ -106,6 +108,9 @@ def compare_records(actual: GoldenRecord, expected: GoldenRecord) -> list[str]:
             diffs.append(f"{field}: actual {a!r}, expected {e!r}")
     for field in FRAME_FIELDS:
         diffs.extend(_compare_frames(field, getattr(actual, field), getattr(expected, field)))
+    diffs.extend(
+        _compare_frames(DIGEST_FIELD, getattr(actual, DIGEST_FIELD), getattr(expected, DIGEST_FIELD))
+    )
     return diffs
 
 

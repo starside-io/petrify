@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import cv2
 import numpy as np
 import pytest
 
-from tests.golden.harness import GoldenRecord, capture_legacy, from_json, to_json
+from petrify.compositor import Compositor
+from tests.golden.harness import SCHEMA_VERSION, GoldenRecord, capture_legacy, from_json, to_json
 
 # Height must stay >= 256 so the default HOG downsample (0.5) keeps frames at least as
 # large as the 64x128 HOG window; smaller frames crash the native detector.
@@ -62,7 +65,7 @@ def test_cold_start_frozen(default_record: GoldenRecord) -> None:
 
 
 def test_metadata(default_record: GoldenRecord, clip: Path) -> None:
-    assert default_record.schema_version == 1
+    assert default_record.schema_version == 2
     assert default_record.clip == clip.name
     assert default_record.argv == []
     assert (default_record.width, default_record.height) == (_W, _H)
@@ -112,3 +115,50 @@ def test_real_ffmpeg_not_invoked(clip: Path) -> None:
         capture_legacy(clip, ["--no-roi", "--background-frame", "0"])
     run_mock.assert_not_called()
     which_mock.assert_not_called()
+
+
+def test_digests_cover_every_written_frame(clip: Path) -> None:
+    real_compose = Compositor.compose
+    composed: list[int] = []
+
+    def counting_compose(self: Compositor, *args: Any, **kwargs: Any) -> Any:
+        composed.append(1)
+        return real_compose(self, *args, **kwargs)
+
+    with mock.patch.object(Compositor, "compose", new=counting_compose):
+        record = capture_legacy(clip, ["--no-roi", "--background-frame", "0"])
+    assert len(record.frame_digests) == len(composed)
+    assert len(record.frame_digests) == record.total_frames == _N
+
+
+def test_digests_are_hex(default_record: GoldenRecord) -> None:
+    assert default_record.frame_digests
+    assert all(re.fullmatch(r"[0-9a-f]{16}", d) for d in default_record.frame_digests)
+
+
+def test_digests_are_deterministic(clip: Path) -> None:
+    assert capture_legacy(clip).frame_digests == capture_legacy(clip).frame_digests
+
+
+def test_roi_changes_digests(clip: Path) -> None:
+    # The ROI covers the band the bright square crosses, so pasting it live over the
+    # frozen background must change those frames.
+    argv = ["--background-frame", "0"]
+    no_roi = capture_legacy(clip, [*argv, "--no-roi"]).frame_digests
+    manual = capture_legacy(clip, [*argv, "--roi", "0", "100", "320", "60"]).frame_digests
+    assert len(no_roi) == len(manual)
+    assert no_roi != manual
+
+
+def test_real_video_writer_restored(clip: Path) -> None:
+    real = cv2.VideoWriter
+    capture_legacy(clip, ["--no-roi", "--background-frame", "0"])
+    assert cv2.VideoWriter is real
+
+
+def test_from_json_rejects_schema_version_1(default_record: GoldenRecord) -> None:
+    data = json.loads(to_json(default_record))
+    data["schema_version"] = 1
+    with pytest.raises(ValueError, match="schema_version"):
+        from_json(json.dumps(data))
+    assert SCHEMA_VERSION == 2
