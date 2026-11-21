@@ -66,6 +66,12 @@ class ThreadedSink:
     is handed over to the worker, which runs it as soon as that call returns;
     ``abort`` then logs a warning and returns, and ``close`` raises ``TimeoutError``.
 
+    If ``close`` fails before the wrapped ``close`` completed (a stored worker
+    error, the wrapped ``close`` raising, or an interruption such as
+    ``KeyboardInterrupt``), the wrapped sink is aborted exactly once (handed over
+    to the worker if it is still running) and the original error propagates; a
+    later ``abort`` does nothing.
+
     After a completed ``close`` or ``abort`` the sink may be opened again, with a
     fresh queue, worker and counters. ``open`` while open raises ``RuntimeError``.
     """
@@ -190,10 +196,14 @@ class ThreadedSink:
             self._state = _CLOSING
             self._stopping = True
             self._cond.notify_all()
-            exited = self._wait_for_worker()
-            error = self._error
+        # Set once the wrapped sink was closed, or its abort was run or handed over.
+        settled = False
         try:
+            with self._cond:
+                exited = self._wait_for_worker()
+                error = self._error
             if not exited:
+                settled = True  # _wait_for_worker handed the abort to the worker.
                 self._warn_handoff()
                 raise TimeoutError(
                     f"ThreadedSink worker did not finish within {self._join_timeout} s; "
@@ -201,9 +211,13 @@ class ThreadedSink:
                 )
             self._join_thread()
             if error is not None:
-                self._sink.abort()
                 raise error
             self._sink.close()
+            settled = True
+        except BaseException:
+            if not settled:
+                self._abort_after_failed_close()
+            raise
         finally:
             with self._cond:
                 self._state = _DONE
@@ -231,6 +245,28 @@ class ThreadedSink:
         finally:
             with self._cond:
                 self._state = _DONE
+
+    def _abort_after_failed_close(self) -> None:
+        """Abort the wrapped sink once after ``close`` failed before closing it.
+
+        If the worker is still running (the wait was interrupted), the abort is
+        handed over to it, so two wrapped calls never overlap. An ``Exception``
+        from the wrapped abort is logged; the caller propagates the original error.
+        """
+        with self._cond:
+            if self._handoff_abort:
+                return  # Already handed over before the interruption.
+            if not self._worker_exited:
+                self._aborting = True
+                self._queue.clear()
+                self._handoff_abort = True
+                self._cond.notify_all()
+                return
+        self._join_thread()
+        try:
+            self._sink.abort()
+        except Exception:
+            logger.exception("Sink %s failed to abort", type(self._sink).__name__)
 
     def _wait_for_worker(self) -> bool:
         """With the lock held: wait for the worker to exit, or hand it the abort.

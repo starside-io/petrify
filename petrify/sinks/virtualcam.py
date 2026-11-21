@@ -47,8 +47,9 @@ class VirtualCamSink:
     otherwise the camera's default RGB format is used and each frame is converted.
 
     ``critical`` defaults to True: in a video call the virtual camera is the output
-    that matters. ``close`` and ``abort`` close the camera once, are idempotent,
-    and are safe before ``open``.
+    that matters. ``close`` and ``abort`` send one black frame (so the consumer does
+    not keep showing the last processed one), close the camera once, are
+    idempotent, and are safe before ``open``.
     """
 
     def __init__(
@@ -108,21 +109,36 @@ class VirtualCamSink:
         cam.send(np.ascontiguousarray(frame))
 
     def close(self) -> None:
-        """Close the camera. Idempotent."""
+        """Send one black frame, then close the camera. Idempotent."""
         cam, self._cam = self._cam, None
-        self._shape = None
+        shape, self._shape = self._shape, None
         if cam is not None:
+            _send_black(cam, shape)
             cam.close()
 
     def abort(self) -> None:
-        """Close the camera without raising. Idempotent and safe before ``open``."""
+        """Send one black frame, then close the camera without raising.
+
+        Idempotent and safe before ``open``.
+        """
         cam, self._cam = self._cam, None
-        self._shape = None
+        shape, self._shape = self._shape, None
         if cam is not None:
+            _send_black(cam, shape)
             try:
                 cam.close()
             except Exception as exc:
                 logger.warning("Could not close the virtual camera: %r", exc)
+
+
+def _send_black(cam: Any, shape: tuple[int, int, int] | None) -> None:
+    """Best effort: replace the last frame the consumer may keep showing with black."""
+    if shape is None:
+        return
+    try:
+        cam.send(np.zeros(shape, dtype=np.uint8))
+    except Exception as exc:
+        logger.debug("Could not send the final black frame to the virtual camera: %r", exc)
 
 
 def _load_camera_class() -> Any:

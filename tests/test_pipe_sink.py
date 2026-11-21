@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
+import sys
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -215,6 +220,7 @@ def test_command_wallclock(tmp_path: Path) -> None:
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "8x6", "-framerate", "25", "-i", "pipe:0",
         "-map", "0:v:0",
         "-c:v", "libx264", "-crf", "23", "-preset", "medium", "-pix_fmt", "yuv420p",
+        "-vsync", "passthrough", "-enc_time_base", "1:1000000",
         str(tmp_path / "out.partial.mp4"),
     ]  # fmt: skip
 
@@ -572,3 +578,318 @@ def test_real_ffmpeg_failure_reports_stderr(tmp_path: Path) -> None:
     assert "exit code" in str(info.value)
     assert output.read_bytes() == b"old"
     assert not sink.partial_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-9b)
+# ---------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parents[1]
+SIGINT_HELPER = Path(__file__).with_name("_helper_pipe_sink_sigint.py")
+WAIT_S = 60.0  # Generous bound for subprocess waits; only reached if something is broken.
+SW, SH = 64, 48
+SMALL_INFO = SourceInfo(fps=25.0, width=SW, height=SH, frame_count=None, seekable=False, live=True)
+
+
+def _small(i: int) -> np.ndarray:
+    return np.full((SH, SW, 3), (i * 9) % 256, dtype=np.uint8)
+
+
+def _read_frames(path: Path) -> list[tuple[float, np.ndarray]]:
+    """Every decodable frame of ``path`` with its timestamp in milliseconds."""
+    cap = cv2.VideoCapture(str(path))
+    try:
+        assert cap.isOpened()
+        frames = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append((cap.get(cv2.CAP_PROP_POS_MSEC), frame))
+    finally:
+        cap.release()
+    return frames
+
+
+@pytest.fixture
+def tracked_popen() -> Iterator[Callable[..., Any]]:
+    """A real Popen that remembers its processes; none may outlive the test."""
+    procs: list[subprocess.Popen[bytes]] = []
+
+    def popen(cmd: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        proc = subprocess.Popen(cmd, **kwargs)
+        procs.append(proc)
+        return proc
+
+    yield popen
+    survivors = [p for p in procs if p.poll() is None]
+    for proc in survivors:
+        proc.kill()
+        proc.wait(timeout=WAIT_S)
+    assert survivors == [], "FFmpeg was still running after the test"
+
+
+def test_f1_ffmpeg_runs_outside_the_terminal_process_group(tmp_path: Path) -> None:
+    popen = FakePopen()
+    sink = _sink(tmp_path, popen)
+    sink.open(INFO)
+    kwargs = popen.kwargs[0]
+    if sys.platform == "win32":
+        assert kwargs["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        assert kwargs["start_new_session"] is True
+    sink.abort()
+
+
+def test_f5_pipe_is_unbuffered_and_partial_writes_complete_the_frame(tmp_path: Path) -> None:
+    popen = FakePopen()
+    sink = _sink(tmp_path, popen)
+    sink.open(INFO)
+    assert popen.kwargs[0]["bufsize"] == 0  # A buffered pipe would hold back frame tails.
+    stdin = popen.proc.stdin
+    accepted: list[bytes] = []
+
+    def short_write(data: Any) -> int:
+        chunk = bytes(data)[:50]  # The pipe takes at most 50 bytes per call.
+        accepted.append(chunk)
+        return len(chunk)
+
+    stdin.write = short_write  # type: ignore[method-assign]
+    sink.write(_image(7), _meta(0))
+    assert b"".join(accepted) == _image(7).tobytes()
+    assert len(accepted) == -(-_image(7).nbytes // 50)
+    sink.abort()
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_f2_interrupted_close_stops_ffmpeg_and_removes_partial(
+    tmp_path: Path, interrupt: type[BaseException]
+) -> None:
+    output = tmp_path / "out.mp4"
+    output.write_bytes(b"keep me")
+    popen = FakePopen()
+    sink = _sink(tmp_path, popen)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    proc = popen.proc
+    original_wait = proc.wait
+
+    def interrupted_wait(timeout: float | None = None) -> int:
+        if not proc.terminated and not proc.killed:
+            raise interrupt()  # Ctrl-C while waiting for FFmpeg to finish the tail.
+        return original_wait(timeout)
+
+    proc.wait = interrupted_wait  # type: ignore[method-assign]
+    with pytest.raises(interrupt):
+        sink.close()
+    assert proc.terminated == 1
+    assert proc.returncode is not None  # FFmpeg was stopped, not left running.
+    assert not sink.partial_path.exists()
+    assert output.read_bytes() == b"keep me"
+    sink.abort()  # Nothing left to clean: a no-op.
+    sink.close()
+    assert proc.terminated == 1
+    assert proc.killed == 0
+
+
+@pytest.mark.parametrize("error", [OSError("cross-device link"), KeyboardInterrupt()])
+def test_f2_failed_replace_removes_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    output = tmp_path / "out.mp4"
+    output.write_bytes(b"keep me")
+    popen = FakePopen()
+    sink = _sink(tmp_path, popen)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+
+    def failing_replace(src: Any, dst: Any) -> None:
+        raise error
+
+    monkeypatch.setattr("petrify.sinks.file.os.replace", failing_replace)
+    with pytest.raises(type(error)):
+        sink.close()
+    assert not sink.partial_path.exists()
+    assert output.read_bytes() == b"keep me"
+    sink.abort()
+    assert popen.proc.terminated == 0  # FFmpeg had already exited.
+
+
+def test_f3_close_without_frames_raises_and_installs_nothing(tmp_path: Path) -> None:
+    output = tmp_path / "out.mp4"
+    output.write_bytes(b"precious earlier recording")
+    popen = FakePopen()
+    sink = _sink(tmp_path, popen)
+    sink.open(INFO)
+    with pytest.raises(OSError, match="No frames were written"):
+        sink.close()
+    proc = popen.proc
+    assert proc.returncode is not None
+    assert not sink.partial_path.exists()
+    assert output.read_bytes() == b"precious earlier recording"
+    sink.abort()
+    sink.close()
+    assert proc.terminated == 1
+
+
+def test_f3_frame_count_restarts_on_reopen(tmp_path: Path) -> None:
+    popen = FakePopen()
+    sink = _sink(tmp_path, popen)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    sink.close()
+    sink.open(INFO)
+    with pytest.raises(OSError, match="No frames were written"):
+        sink.close()
+    assert (tmp_path / "out.mp4").read_bytes() == _image(0).tobytes()
+
+
+def test_f4_dash_paths_are_not_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    popen = FakePopen()
+    sink = FfmpegPipeSink("-y.mp4", EncodeConfig(), audio_source="-a.mov", popen=popen)
+    sink.open(INFO)
+    cmd = popen.proc.cmd
+    assert cmd[cmd.index("pipe:0") + 2] == os.path.join(".", "-a.mov")
+    assert cmd[-1] == os.path.join(".", "-y.partial.mp4")
+    sink.write(_image(0), _meta(0))
+    sink.close()
+    assert (tmp_path / "-y.mp4").read_bytes() == _image(0).tobytes()
+    assert not (tmp_path / "-y.partial.mp4").exists()
+
+
+def test_f4_absolute_paths_are_passed_unchanged(tmp_path: Path) -> None:
+    audio = tmp_path / "-a.mov"
+    cmd = _cmd(tmp_path, audio_source=audio)
+    assert cmd[cmd.index("pipe:0") + 2] == str(audio)
+    assert cmd[-1] == str(tmp_path / "out.partial.mp4")
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "out/", "sub/dir/", f"out{os.sep}"])
+def test_f4_output_without_file_name_rejected(name: str) -> None:
+    with pytest.raises(ValueError, match="has no file name"):
+        FfmpegPipeSink(name, EncodeConfig(), popen=FakePopen())
+
+
+def test_f4_output_that_is_a_directory_rejected(tmp_path: Path) -> None:
+    (tmp_path / "clip.mp4").mkdir()
+    with pytest.raises(ValueError, match="existing directory"):
+        FfmpegPipeSink(tmp_path / "clip.mp4", EncodeConfig(), popen=FakePopen())
+    with pytest.raises(ValueError, match="existing directory"):
+        FfmpegPipeSink(tmp_path, EncodeConfig(), popen=FakePopen())
+
+
+@real_ffmpeg
+@pytest.mark.skipif(os.name != "posix", reason="process groups and SIGINT are POSIX")
+def test_real_ffmpeg_f1_sigint_to_the_process_group_keeps_the_recording(tmp_path: Path) -> None:
+    output = tmp_path / "live.mp4"
+    log, err_log = tmp_path / "helper.out", tmp_path / "helper.err"
+    before, after = 10, 5
+    with log.open("wb") as out, err_log.open("wb") as err:
+        helper = subprocess.Popen(
+            [sys.executable, str(SIGINT_HELPER), str(output), str(before), str(after)],
+            stdout=out,
+            stderr=err,
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONPATH": str(ROOT)},
+            start_new_session=True,  # Its own process group: the only one this test signals.
+        )
+
+    def report() -> str:
+        return f"stdout: {log.read_text()!r}\nstderr: {err_log.read_text()}"
+
+    ffmpeg_pid: int | None = None
+    try:
+        deadline = time.monotonic() + WAIT_S
+        while not (log.read_text().startswith("ready ") and log.read_text().endswith("\n")):
+            assert helper.poll() is None, report()
+            assert time.monotonic() < deadline, "helper did not get ready"
+            time.sleep(0.01)
+        ffmpeg_pid = int(log.read_text().split()[1])
+        group = os.getpgid(helper.pid)
+        assert group == helper.pid and group != os.getpgrp()
+        os.killpg(group, signal.SIGINT)  # What a terminal does on Ctrl-C.
+        code = helper.wait(timeout=WAIT_S)
+        assert code == 0, report()
+        assert log.read_text().splitlines()[-1] == "closed"
+    finally:
+        if helper.poll() is None:
+            os.killpg(helper.pid, signal.SIGKILL)
+            helper.wait(timeout=WAIT_S)
+    # Existence check only (signal 0 sends nothing): close waited for FFmpeg.
+    with pytest.raises(ProcessLookupError):
+        os.kill(ffmpeg_pid, 0)
+    assert output.is_file()
+    assert not (tmp_path / "live.partial.mp4").exists()
+    assert len(_read_frames(output)) == before + after
+
+
+@real_ffmpeg
+def test_real_ffmpeg_f3_zero_frames_keeps_existing_output(
+    tmp_path: Path, tracked_popen: Callable[..., Any]
+) -> None:
+    output = tmp_path / "out.mp4"
+    output.write_bytes(b"old")
+    sink = FfmpegPipeSink(output, EncodeConfig(preset="ultrafast"), popen=tracked_popen)
+    sink.open(SMALL_INFO)
+    proc = sink._proc
+    with pytest.raises(OSError, match="No frames were written"):
+        sink.close()
+    assert proc.poll() is not None
+    assert output.read_bytes() == b"old"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.mp4"]
+
+
+@real_ffmpeg
+def test_real_ffmpeg_f4_output_named_like_an_option(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tracked_popen: Callable[..., Any]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    sink = FfmpegPipeSink("-y.mp4", EncodeConfig(preset="ultrafast"), popen=tracked_popen)
+    sink.open(SMALL_INFO)
+    try:
+        for i in range(5):
+            sink.write(_small(i), _meta(i, SMALL_INFO))
+        sink.close()
+    finally:
+        sink.abort()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["-y.mp4"]
+    assert len(_read_frames(tmp_path / "-y.mp4")) == 5
+
+
+@real_ffmpeg
+def test_real_ffmpeg_f5_wallclock_keeps_every_frame_of_a_burst(
+    tmp_path: Path, tracked_popen: Callable[..., Any]
+) -> None:
+    output = tmp_path / "live.mp4"
+    sink = FfmpegPipeSink(
+        output, EncodeConfig(preset="ultrafast"), wallclock_timestamps=True, popen=tracked_popen
+    )
+    sink.open(SMALL_INFO)
+    bursts, size, pause_s = 5, 8, 0.4
+    written = 0
+    first = last = 0.0
+    try:
+        for burst in range(bursts):
+            for _ in range(size):  # Back to back: far faster than the nominal 25 fps.
+                sink.write(_small(written), _meta(written, SMALL_INFO))
+                last = time.monotonic()
+                first = first or last
+                written += 1
+            if burst < bursts - 1:
+                time.sleep(pause_s)
+        sink.close()
+    finally:
+        sink.abort()
+    frames = _read_frames(output)
+    assert len(frames) == written == bursts * size
+    stamps = [ms / 1000 for ms, _ in frames]
+    # Real time is kept (loosely: FFmpeg stamps a frame when it reads it from the pipe).
+    span_s, real_s = stamps[-1] - stamps[0], last - first
+    assert 0.5 * real_s < span_s < 1.5 * real_s + 0.2, (span_s, real_s)
+    # Each burst is stamped together, before the pause that follows it: no frame is
+    # held back (in a buffered pipe) until the next write.
+    for b in range(bursts - 1):
+        within = stamps[b * size + size - 1] - stamps[b * size]
+        gap = stamps[(b + 1) * size] - stamps[b * size + size - 1]
+        assert within < gap, (b, within, gap, stamps)

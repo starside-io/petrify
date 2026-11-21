@@ -661,3 +661,142 @@ def test_t6_engine_drops_non_critical_sink_on_worker_base_exception() -> None:
     assert recording.events == ["open", "close"]
     assert inner.events == ["open", "abort"]
     assert stats.sink_failures == 1
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-9b)
+# ---------------------------------------------------------------------------
+
+
+class _InterruptingSink(ThreadedSink):
+    """Raises ``KeyboardInterrupt`` from one internal step of ``close`` once armed.
+
+    ``step`` names the method that stands in for the interrupted code: the wait for
+    the worker, or the join of the worker thread.
+    """
+
+    def __init__(self, sink: Sink, step: str, **kwargs: object) -> None:
+        super().__init__(sink, **kwargs)  # type: ignore[arg-type]
+        self.step = step
+        self.armed = False
+
+    def _interrupt(self, step: str) -> None:
+        if self.armed and self.step == step:
+            self.armed = False
+            raise KeyboardInterrupt
+
+    def _wait_for_worker(self) -> bool:
+        self._interrupt("wait")
+        return super()._wait_for_worker()
+
+    def _join_thread(self) -> None:
+        self._interrupt("join")
+        super()._join_thread()
+
+
+class _CloseFailsSink(OverlapSink):
+    def __init__(self, error: BaseException, abort_error: Exception | None = None) -> None:
+        super().__init__(critical=True)
+        self.release.set()
+        self.error = error
+        self.abort_error = abort_error
+
+    def close(self) -> None:
+        super().close()
+        raise self.error
+
+    def abort(self) -> None:
+        super().abort()
+        if self.abort_error is not None:
+            raise self.abort_error
+
+
+def test_p2_9b_t1_interrupt_while_waiting_hands_abort_to_worker() -> None:
+    inner = OverlapSink(critical=True)
+    sink = _InterruptingSink(inner, "wait", max_queue=4)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    sink.write(_image(1), _meta(1))
+    assert inner.entered.wait(WAIT)  # The worker is inside the wrapped write.
+    sink.armed = True
+    with pytest.raises(KeyboardInterrupt):
+        sink.close()
+    assert "abort" not in inner.calls  # Never concurrently with the in-flight write.
+    sink.abort()  # No-op: the abort is already handed to the worker.
+    inner.release.set()
+    _join_worker(sink)
+    sink.abort()
+    sink.close()
+    assert inner.calls == ["open", "write", "abort"]  # Frame 1 discarded, not written.
+    assert not inner.overlap
+
+
+def test_p2_9b_t1_interrupt_after_worker_exit_aborts_on_caller() -> None:
+    inner = OverlapSink(critical=True)
+    inner.release.set()
+    sink = _InterruptingSink(inner, "join", max_queue=4)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    sink.armed = True
+    with pytest.raises(KeyboardInterrupt):
+        sink.close()
+    assert inner.calls == ["open", "write", "abort"]
+    assert sink._thread is not None and not sink._thread.is_alive()
+    sink.abort()
+    sink.close()
+    assert inner.calls == ["open", "write", "abort"]
+    assert not inner.overlap
+
+
+def test_p2_9b_t1_interrupt_inside_wrapped_close_aborts_once() -> None:
+    inner = _CloseFailsSink(KeyboardInterrupt())
+    sink = ThreadedSink(inner, max_queue=4)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    with pytest.raises(KeyboardInterrupt):
+        sink.close()
+    sink.abort()
+    sink.close()
+    assert inner.calls == ["open", "write", "close", "abort"]
+    assert not inner.overlap
+
+
+def test_p2_9b_t2_wrapped_close_error_aborts_once_then_propagates() -> None:
+    inner = _CloseFailsSink(OSError("disk full"))
+    sink = ThreadedSink(inner, max_queue=4)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    with pytest.raises(OSError, match="disk full"):
+        sink.close()
+    sink.abort()
+    sink.close()
+    assert inner.calls == ["open", "write", "close", "abort"]
+
+
+def test_p2_9b_t2_failing_abort_does_not_hide_the_close_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    inner = _CloseFailsSink(OSError("disk full"), abort_error=RuntimeError("abort broke"))
+    sink = ThreadedSink(inner, max_queue=4)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    with caplog.at_level(logging.ERROR, logger="petrify.sinks.threaded"):
+        with pytest.raises(OSError, match="disk full"):
+            sink.close()
+    assert inner.calls == ["open", "write", "close", "abort"]
+    assert any("failed to abort" in r.getMessage() for r in caplog.records)
+
+
+def test_p2_9b_t2_engine_drops_sink_whose_close_fails_and_it_is_aborted_once() -> None:
+    recording = GatedSink(critical=True)
+    inner = _CloseFailsSink(OSError("preview gone"))
+    inner.critical = False
+    preview = ThreadedSink(inner, max_queue=64)
+    engine = _black_engine([recording, preview])
+    engine.open(INFO)
+    for i in range(3):
+        engine.step(_frame(i))
+    stats = engine.close()
+    assert stats.sink_failures == 1
+    assert recording.events == ["open", "close"]
+    assert inner.calls == ["open", "write", "write", "write", "close", "abort"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -205,6 +206,65 @@ def test_camera_closed_once(calls: list[str]) -> None:
     for name in calls:
         getattr(sink, name)()
     assert factory.cam.closes == 1
+
+
+@pytest.mark.parametrize("bgr", [True, False])
+@pytest.mark.parametrize("calls", [["close"], ["abort"], ["close", "abort", "close"], ["abort", "close"]])
+def test_v1_one_black_frame_before_the_camera_closes(bgr: bool, calls: list[str]) -> None:
+    factory = Factory(bgr=bgr)
+    sink = VirtualCamSink(camera_factory=factory)
+    sink.open(INFO)
+    sink.write(_image(3), _meta(0))
+    cam = factory.cam
+    order: list[str] = []
+    send, close = cam.send, cam.close
+
+    def recording_send(frame: np.ndarray) -> None:
+        order.append("send")
+        send(frame)
+
+    def recording_close() -> None:
+        order.append("close")
+        close()
+
+    cam.send = recording_send  # type: ignore[method-assign]
+    cam.close = recording_close  # type: ignore[method-assign]
+    for name in calls:
+        getattr(sink, name)()
+    assert order == ["send", "close"]
+    assert len(cam.sent) == 2
+    black = cam.sent[-1]
+    assert black.shape == (H, W, 3) and black.dtype == np.uint8
+    assert not black.any()
+
+
+@pytest.mark.parametrize("method", ["close", "abort"])
+def test_v1_black_frame_failure_is_logged_and_ignored(
+    method: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    factory = Factory()
+    sink = VirtualCamSink(camera_factory=factory)
+    sink.open(INFO)
+
+    def broken_send(frame: np.ndarray) -> None:
+        raise OSError("consumer gone")
+
+    factory.cam.send = broken_send  # type: ignore[method-assign]
+    with caplog.at_level(logging.DEBUG, logger="petrify.sinks.virtualcam"):
+        getattr(sink, method)()
+    assert factory.cam.closes == 1
+    records = [r for r in caplog.records if "black frame" in r.getMessage()]
+    assert [r.levelno for r in records] == [logging.DEBUG]
+
+
+def test_v1_no_black_frame_without_an_open_camera() -> None:
+    factory = Factory(fail=RuntimeError("device busy"))
+    sink = VirtualCamSink(camera_factory=factory)
+    with pytest.raises(RuntimeError):
+        sink.open(INFO)
+    sink.close()
+    sink.abort()
+    assert factory.cameras == []
 
 
 def test_abort_before_open_and_after_failed_open() -> None:

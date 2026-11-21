@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from fractions import Fraction
@@ -161,14 +162,26 @@ class FfmpegPipeSink:
     it. Use it for live sources: a stream that drops frames then keeps real time
     instead of being compressed to a constant frame rate. Leave it off for files,
     where every frame is delivered and the source frame rate is the right clock
-    (wallclock stamps would follow processing speed instead).
+    (wallclock stamps would follow processing speed instead). The live variant
+    passes the stamps through unchanged (``-vsync passthrough``, with a microsecond
+    encoder time base), so frames that arrive in a burst are all kept instead of
+    being dropped to fit the nominal rate.
+
+    FFmpeg runs in its own session (its own process group on Windows), so a Ctrl-C
+    in the terminal reaches petrify only; FFmpeg ends when ``close`` closes its
+    stdin, or when ``abort`` terminates it.
 
     FFmpeg's stderr goes to a temporary file, never to an undrained pipe, so it
     cannot block the pipeline; its tail is quoted in error messages. The command
-    line, including the output path, is logged.
+    line, including the output path, is logged. Paths are passed to FFmpeg as
+    absolute paths or prefixed with ``./``, so a name such as ``-y.mp4`` is never
+    read as an option.
 
-    ``close`` and ``abort`` are idempotent; ``abort`` is safe before ``open`` and
-    after a failed ``open``.
+    ``close`` raises ``OSError`` and installs nothing when no frame was written. If
+    ``close`` fails in any way (``KeyboardInterrupt`` included), FFmpeg is stopped
+    and the partial file removed before it returns, and a later ``abort`` does
+    nothing. ``close`` and ``abort`` are idempotent; ``abort`` is safe before
+    ``open`` and after a failed ``open``.
     """
 
     critical = True
@@ -182,7 +195,7 @@ class FfmpegPipeSink:
         wallclock_timestamps: bool = False,
         popen: Callable[..., Any] = subprocess.Popen,
     ) -> None:
-        self._output_path = Path(output_path)
+        self._output_path = _validate_output_path(output_path)
         self._partial_path = self._output_path.with_name(
             f"{self._output_path.stem}.partial{self._output_path.suffix}"
         )
@@ -193,6 +206,7 @@ class FfmpegPipeSink:
         self._proc: Any = None
         self._stderr: IO[bytes] | None = None
         self._shape: tuple[int, int, int] | None = None
+        self._frames = 0
 
     @property
     def partial_path(self) -> Path:
@@ -218,7 +232,7 @@ class FfmpegPipeSink:
             "-i", "pipe:0",
         ]
         if self._audio_source is not None:
-            cmd += ["-i", str(self._audio_source)]
+            cmd += ["-i", _ffmpeg_path(self._audio_source)]
         cmd += ["-map", "0:v:0"]
         if self._audio_source is not None:
             cmd += ["-map", "1:a?"]
@@ -228,9 +242,17 @@ class FfmpegPipeSink:
             "-preset", self._encode.preset,
             "-pix_fmt", "yuv420p",
         ]
+        if self._wallclock:
+            # Keep every frame with its wallclock stamp. The default rate handling
+            # rounds the stamps to the nominal rate and drops frames that land on the
+            # same tick, which loses frames delivered in a burst. "-vsync" (deprecated
+            # in favour of "-fps_mode" since FFmpeg 5.1, still accepted) is the
+            # spelling older releases understand too; the microsecond encoder time
+            # base keeps stamps a few milliseconds apart distinct.
+            cmd += ["-vsync", "passthrough", "-enc_time_base", "1:1000000"]
         if self._audio_source is not None:
             cmd += ["-c:a", "copy"]
-        cmd.append(str(self._partial_path))
+        cmd.append(_ffmpeg_path(self._partial_path))
         return cmd
 
     def open(self, info: SourceInfo) -> None:
@@ -249,6 +271,10 @@ class FfmpegPipeSink:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr,
+                # Unbuffered: a buffered pipe holds back the tail of each frame until
+                # the next write, so FFmpeg would stamp it late in wallclock mode.
+                bufsize=0,
+                **_detached_kwargs(),
             )
         except BaseException:
             stderr.close()
@@ -256,6 +282,7 @@ class FfmpegPipeSink:
         self._proc = proc
         self._stderr = stderr
         self._shape = (info.height, info.width, 3)
+        self._frames = 0
 
     def write(self, image: np.ndarray, meta: FrameMeta) -> None:
         """Send one BGR uint8 image to FFmpeg."""
@@ -270,17 +297,29 @@ class FfmpegPipeSink:
         if proc.poll() is not None:
             raise OSError(self._failure("FFmpeg exited while frames were still being written"))
         try:
-            proc.stdin.write(np.ascontiguousarray(image).data)
+            # An unbuffered pipe may accept part of the frame; write the rest.
+            view = memoryview(np.ascontiguousarray(image)).cast("B")
+            while view:
+                view = view[proc.stdin.write(view) :]
         except (OSError, ValueError) as exc:  # BrokenPipeError is an OSError.
             self._wait_quietly(_STOP_TIMEOUT_S)
             raise OSError(self._failure("Writing a frame to FFmpeg failed")) from exc
+        self._frames += 1
 
     def close(self) -> None:
-        """Finish the encode; on success move the partial file onto ``output_path``."""
+        """Finish the encode; on success move the partial file onto ``output_path``.
+
+        On any failure, FFmpeg is stopped and the partial file removed before the
+        error propagates; the existing ``output_path``, if any, is left untouched.
+        """
         proc = self._proc
         if proc is None:
             return
         try:
+            if self._frames == 0:
+                raise OSError(
+                    f"No frames were written; nothing was saved to {self._output_path}"
+                )
             with contextlib.suppress(OSError, ValueError):
                 proc.stdin.close()
             try:
@@ -288,14 +327,16 @@ class FfmpegPipeSink:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 self._wait_quietly(_STOP_TIMEOUT_S)
-                _remove_quietly(self._partial_path)
                 raise OSError(
                     self._failure(f"FFmpeg did not exit within {_CLOSE_TIMEOUT_S:g} s and was killed")
                 ) from None
             if proc.returncode != 0:
-                _remove_quietly(self._partial_path)
                 raise OSError(self._failure("FFmpeg failed"))
             os.replace(self._partial_path, self._output_path)
+        except BaseException:
+            # Clean up before the handle is released, so nothing is left for abort.
+            self._discard(proc)
+            raise
         finally:
             self._release()
         logger.info("Done. Output written to: %s", self._output_path)
@@ -305,6 +346,13 @@ class FfmpegPipeSink:
         proc = self._proc
         if proc is None:
             return
+        try:
+            self._discard(proc)
+        finally:
+            self._release()
+
+    def _discard(self, proc: Any) -> None:
+        """Stop FFmpeg (terminate, then kill if needed) and remove the partial file."""
         try:
             with contextlib.suppress(OSError, ValueError):
                 proc.stdin.close()
@@ -318,9 +366,13 @@ class FfmpegPipeSink:
                         proc.wait(timeout=_STOP_TIMEOUT_S)
             except Exception as exc:
                 logger.warning("Could not stop FFmpeg cleanly: %r", exc)
-            _remove_quietly(self._partial_path)
+            except BaseException:
+                # Interrupted while stopping it: do not leave FFmpeg running.
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                raise
         finally:
-            self._release()
+            _remove_quietly(self._partial_path)
 
     def _failure(self, what: str) -> str:
         """Build an error message with FFmpeg's exit code and stderr tail."""
@@ -362,6 +414,30 @@ def _format_fps(fps: float) -> str:
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError(f"Frame rate must be a positive number, got {fps!r}")
     return str(Fraction(fps).limit_denominator(1001))
+
+
+def _validate_output_path(output_path: str | Path) -> Path:
+    """Return ``output_path`` as a Path; reject paths that name no file."""
+    raw = os.fspath(output_path)
+    path = Path(raw)
+    separators = tuple(s for s in (os.sep, os.altsep, "/") if s)
+    if path.name in ("", ".", "..") or raw.endswith(separators):
+        raise ValueError(f"Output path {raw!r} has no file name")
+    if path.is_dir():
+        raise ValueError(f"Output path {raw!r} is an existing directory")
+    return path
+
+
+def _ffmpeg_path(path: Path) -> str:
+    """Spell ``path`` so FFmpeg cannot read it as an option or a protocol."""
+    return str(path) if path.is_absolute() else os.path.join(os.curdir, path)
+
+
+def _detached_kwargs() -> dict[str, Any]:
+    """Popen arguments that keep a terminal's Ctrl-C (SIGINT to the group) off FFmpeg."""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
 
 
 def _remove_quietly(path: Path) -> None:
