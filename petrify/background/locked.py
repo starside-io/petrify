@@ -25,6 +25,7 @@ import numpy as np
 from tqdm import tqdm
 
 from petrify.core.config import BackgroundConfig, PersonHogConfig
+from petrify.core.frame import Frame
 from petrify.detectors.person_hog import PersonDetector
 from petrify.sources.file import FileSource
 
@@ -109,3 +110,22 @@ def locked_background(
 
     detector = PersonDetector.from_config(scan_person_config)
     return find_clean_background(source, detector, config.scan_step)
+
+
+class LockedBackground:
+    """A fixed background image exposed as a ``BackgroundModel``.
+
+    ``current`` always returns the image, ``update`` does nothing, and ``version``
+    stays 0. The caller must not mutate the image after handing it over.
+    """
+
+    def __init__(self, image: np.ndarray) -> None:
+        self._image = image
+        self.version = 0
+
+    def current(self) -> np.ndarray:
+        """Return the locked image."""
+        return self._image
+
+    def update(self, frame: Frame, subject_present: bool) -> None:
+        """No-op: the locked background never changes."""

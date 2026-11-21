@@ -83,11 +83,44 @@ class RoiConfig:
 
 @dataclass(frozen=True)
 class BackgroundConfig:
-    """Locked background reference selection."""
+    """Background reference strategy and its settings.
 
-    strategy: Literal["locked"] = "locked"
+    ``locked`` pre-scans a file source for one clean frame. ``running`` keeps a
+    rolling median of recent frames classified as clean. ``calibrate`` builds the
+    background from the first ``calibrate_seconds`` while the user is out of frame.
+    """
+
+    strategy: Literal["locked", "running", "calibrate"] = "locked"
     frame_index: int | None = None  # None means pre-scan for the latest clean frame.
     scan_step: int = 5
+    running_window: int = 30
+    running_interval: int = 5
+    running_min_samples: int = 5
+    calibrate_seconds: float = 3.0
+
+    def __post_init__(self) -> None:
+        if self.strategy not in ("locked", "running", "calibrate"):
+            raise ValueError(
+                "BackgroundConfig.strategy must be locked, running or calibrate, "
+                f"got {self.strategy!r}"
+            )
+        if self.running_window < 1:
+            raise ValueError(
+                f"BackgroundConfig.running_window must be >= 1, got {self.running_window}"
+            )
+        if self.running_interval < 1:
+            raise ValueError(
+                f"BackgroundConfig.running_interval must be >= 1, got {self.running_interval}"
+            )
+        if not 1 <= self.running_min_samples <= self.running_window:
+            raise ValueError(
+                "BackgroundConfig.running_min_samples must be in [1, running_window], "
+                f"got {self.running_min_samples} with running_window {self.running_window}"
+            )
+        if not self.calibrate_seconds > 0:
+            raise ValueError(
+                f"BackgroundConfig.calibrate_seconds must be > 0, got {self.calibrate_seconds}"
+            )
 
 
 @dataclass(frozen=True)

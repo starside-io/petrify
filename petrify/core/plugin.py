@@ -27,6 +27,30 @@ from petrify.core.detections import DetectionKind, Detections
 from petrify.core.frame import Frame, FrameMeta, SourceInfo
 
 
+class BackgroundNotReady(RuntimeError):
+    """Raised when a background model has no image yet; the engine fails the frame closed."""
+
+
+@runtime_checkable
+class BackgroundModel(Protocol):
+    """An online estimate of the clean background.
+
+    ``current`` returns an array the caller must not mutate. The model never mutates
+    an array it has already returned: it replaces it and increases ``version``.
+    """
+
+    # Increases every time current() would return a different image.
+    version: int
+
+    def current(self) -> np.ndarray | None:
+        """Return the current background image, or None when not ready yet."""
+        ...
+
+    def update(self, frame: Frame, subject_present: bool) -> None:
+        """Feed one released frame and the engine's final decision for it."""
+        ...
+
+
 @runtime_checkable
 class Detector(Protocol):
     """Produces part of a frame's detections."""

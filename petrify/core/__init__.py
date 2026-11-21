@@ -31,11 +31,21 @@ from petrify.core.config import (
 from petrify.core.detections import Box, DetectionKind, Detections, Face
 from petrify.core.engine import Engine, EngineStats, FrameTrace, Output
 from petrify.core.frame import Frame, FrameMeta, SourceInfo
-from petrify.core.plugin import Detector, Mode, Sink, Source, Stage
+from petrify.core.plugin import (
+    BackgroundModel,
+    BackgroundNotReady,
+    Detector,
+    Mode,
+    Sink,
+    Source,
+    Stage,
+)
 
 __all__ = [
     "BackgroundConfig",
     "BackgroundDiffConfig",
+    "BackgroundModel",
+    "BackgroundNotReady",
     "Box",
     "DetectionKind",
     "Detections",

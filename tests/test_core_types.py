@@ -26,6 +26,7 @@ import pytest
 
 from petrify.cli import _build_parser
 from petrify.core import (
+    BackgroundConfig,
     BackgroundDiffConfig,
     Box,
     DetectionKind,
@@ -334,6 +335,37 @@ def test_frame_budget_defaults_to_disabled() -> None:
 def test_non_positive_frame_budget_rejected(budget: float) -> None:
     with pytest.raises(ValueError, match="frame_budget_ms"):
         EngineConfig(frame_budget_ms=budget)
+
+
+def test_background_config_strategy_defaults() -> None:
+    cfg = BackgroundConfig()
+    assert cfg.strategy == "locked"
+    assert (cfg.running_window, cfg.running_interval, cfg.calibrate_seconds) == (30, 5, 3.0)
+    assert cfg.running_min_samples == 5
+    small = BackgroundConfig(running_window=1, running_min_samples=1)
+    assert (small.running_window, small.running_min_samples) == (1, 1)
+    assert _config().background.strategy == "locked"
+    for strategy in ("locked", "running", "calibrate"):
+        assert BackgroundConfig(strategy=strategy).strategy == strategy  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"strategy": "rolling"},
+        {"running_window": 0},
+        {"running_interval": 0},
+        {"running_min_samples": 0},
+        {"running_window": 4},
+        {"running_window": 10, "running_min_samples": 11},
+        {"calibrate_seconds": 0.0},
+        {"calibrate_seconds": -1.0},
+        {"calibrate_seconds": float("nan")},
+    ],
+)
+def test_background_config_rejects_bad_values(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="BackgroundConfig"):
+        BackgroundConfig(**kwargs)  # type: ignore[arg-type]
 
 
 def test_config_frozen() -> None:
