@@ -29,9 +29,9 @@ from typing import Generic, TypeVar
 import numpy as np
 
 from petrify.core.config import EngineConfig
-from petrify.core.detections import Detections
+from petrify.core.detections import DetectionKind, Detections, check_detections
 from petrify.core.frame import Frame, FrameMeta, SourceInfo
-from petrify.core.plugin import Detector, Mode, Sink, Source, Stage
+from petrify.core.plugin import Detector, DetectPolicy, Mode, Refiner, Sink, Source, Stage
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +216,7 @@ class StageTiming:
 class EngineTimings:
     """Snapshot of the engine's rolling per-frame timings, from :attr:`Engine.timings`.
 
-    ``detect`` is the detector time of each emitted frame, ``render`` the mode plus
+    ``detect`` is the detector and refiner time of each emitted frame, ``render`` the mode plus
     stages (only frames that were rendered: a frame whose detection failed or went
     over budget is not rendered), ``write`` the time spent writing to every sink.
     ``frames_per_second`` is the inverse of the moving average of the interval
@@ -258,6 +258,8 @@ class _Pending:
 
     frame: Frame
     detections: Detections
+    subject_present: bool
+    """``detections.subject_present``, computed while detection could still fail closed."""
     detect_failed: bool
     over_budget: bool
     detect_seconds: float
@@ -270,21 +272,34 @@ class Engine:
     (optional, returns the tail outputs) and :meth:`close`; or :meth:`abort` at
     any point. :meth:`run` is that loop over a :class:`Source`.
 
-    Per frame: run the detectors the mode requires (lazily), push the result into a
-    :class:`LookaheadBuffer`, and for every frame the buffer releases render it with
-    the mode, apply the stages in order, write the output image and the frame's
-    :class:`FrameMeta` to every active sink, and report a :class:`FrameTrace` to the
-    observer. Sinks never receive the input frame.
+    Per frame: run the detectors the mode requires (lazily under the mode's
+    ``"first_hit"`` detection policy, all of them under ``"all"``), then the active
+    refiners in order, push the result into a :class:`LookaheadBuffer`, and for
+    every frame the buffer releases render it with the mode, apply the stages in
+    order, write the output image and the frame's :class:`FrameMeta` to every
+    active sink, and report a :class:`FrameTrace` to the observer. Sinks never
+    receive the input frame. Every detector and refiner result is validated and
+    normalized with :func:`~petrify.core.detections.check_detections` (boxes
+    clipped to the frame, a read-only copy of the mask) before it is merged, so
+    the mode sees new objects, never the detector's own.
 
-    Fail closed: a detector, mode, or stage error replaces that frame with a black
-    image, and so does exceeding ``config.frame_budget_ms`` (detection plus render
-    time, measured with ``clock``). The budget is checked after the fact: a running
+    Fail closed: a detector, refiner, mode, or stage error replaces that frame with
+    a black image, and so do a malformed detector or refiner result, a mode or
+    stage image that is not a ``numpy.ndarray`` with the input frame's shape and
+    dtype, and exceeding ``config.frame_budget_ms`` (detection plus render time,
+    measured with ``clock``). The budget is checked after the fact: a running
     detector or mode is never interrupted. A detection overrun is known before the
     frame enters the lookahead buffer, so it counts as a subject and freezes its
     neighbors. A frame that goes over budget only during render is blacked without
-    freezing its neighbors: its raw decision was already pushed. Construction
-    raises ``ValueError`` when the mode requires detections and no detector
-    provides any of them, since every frame would otherwise pass through.
+    freezing its neighbors: its raw decision was already pushed.
+
+    Construction raises ``ValueError`` when the mode requires detections and no
+    detector or refiner provides any of them (every frame would otherwise pass
+    through), when the mode's ``detect_policy`` is not a :data:`DetectPolicy`,
+    when a kind in the mode's ``mandatory`` has no active detector or refiner,
+    when a refiner is active under the ``"first_hit"`` policy, and when an active
+    refiner consumes a kind no active detector or earlier active refiner
+    provides.
 
     A failure of a critical sink, of the observer, or any ``BaseException`` aborts
     the engine (every active sink aborted, pending frames discarded) and propagates.
@@ -297,8 +312,8 @@ class Engine:
     therefore not modify or reuse an image array after yielding it (the built-in
     sources and ``PushSession`` already copy). The engine does not copy.
 
-    Reconfiguration: :meth:`reconfigure` swaps detectors, mode, stages, or config
-    between two :meth:`step` calls, that is at a frame boundary. :attr:`timings`
+    Reconfiguration: :meth:`reconfigure` swaps detectors, refiners, mode, stages, or
+    config between two :meth:`step` calls, that is at a frame boundary. :attr:`timings`
     reports rolling detect, render and write times and the output frame rate.
 
     Threading: the engine is single-threaded and not thread-safe; drive it from one
@@ -319,9 +334,14 @@ class Engine:
         config: EngineConfig,
         observer: Callable[[FrameTrace], None] | None = None,
         clock: Callable[[], float] = time.perf_counter,
+        *,
+        refiners: Sequence[Refiner] = (),
     ) -> None:
         self._all_detectors = tuple(detectors)
-        self._detectors = _active_detectors(self._all_detectors, mode)
+        self._all_refiners = tuple(refiners)
+        self._detectors, self._refiners, self._first_hit = _resolve(
+            self._all_detectors, self._all_refiners, mode
+        )
         self._mode = mode
         self._stages = tuple(stages)
         self._sinks = tuple(sinks)
@@ -347,6 +367,11 @@ class Engine:
     def detectors(self) -> tuple[Detector, ...]:
         """The detectors this engine runs, in order (only those the mode requires)."""
         return self._detectors
+
+    @property
+    def refiners(self) -> tuple[Refiner, ...]:
+        """The refiners this engine runs, in order (only those whose output the mode requires)."""
+        return self._refiners
 
     @property
     def mode(self) -> Mode:
@@ -383,7 +408,7 @@ class Engine:
     # ------------------------------------------------------------------
 
     def open(self, info: SourceInfo) -> None:
-        """Reset the detectors, create the lookahead buffer, and open every sink.
+        """Reset the detectors and refiners, create the lookahead buffer, and open every sink.
 
         Raises ``RuntimeError`` if the engine is already open. On failure every
         opened sink, and a critical sink that failed to open, is aborted once, the
@@ -403,6 +428,8 @@ class Engine:
         )
         for detector in self._detectors:
             detector.reset()
+        for refiner in self._refiners:
+            refiner.reset()
         self._buffer = buffer
         self._flushed = False
         self._active = []
@@ -439,11 +466,7 @@ class Engine:
         try:
             pending = self._detect(frame)
             self._check_not_aborted()
-            raw = (
-                pending.detect_failed
-                or pending.over_budget
-                or pending.detections.subject_present
-            )
+            raw = pending.detect_failed or pending.over_budget or pending.subject_present
             return [self._emit(decision) for decision in buffer.push(pending, raw)]
         except BaseException:
             self.abort()
@@ -474,19 +497,22 @@ class Engine:
         mode: Mode | None = None,
         stages: Sequence[Stage] | None = None,
         config: EngineConfig | None = None,
+        refiners: Sequence[Refiner] | None = None,
     ) -> list[Output]:
         """Swap components at a frame boundary; return the outputs of the flushed tail.
 
         Call it between two :meth:`step` calls while the engine is open and not
         flushed. An argument left as None keeps the current component; ``detectors``
-        replaces the whole list given to the constructor, and the mode in effect
-        then picks the ones it requires, exactly as at construction. Build a changed
-        config with ``dataclasses.replace(engine.config, lookahead=3)``. Sinks and
-        the observer are not changed, and stats keep accumulating.
+        (and likewise ``refiners``) replaces the whole list given to the
+        constructor, and the mode in effect then picks the ones it requires,
+        exactly as at construction. Build a changed config with
+        ``dataclasses.replace(engine.config, lookahead=3)``. Sinks and the observer
+        are not changed, and stats keep accumulating.
 
-        Validation runs first, with the constructor's rules: when the mode requires
-        detections and no detector provides any of them, ``ValueError`` is raised,
-        nothing changes, and the engine stays usable.
+        Validation runs first, with the constructor's rules (required kinds,
+        detection policy, mandatory kinds, refiner policy and ``consumes``): on a
+        violation ``ValueError`` is raised, nothing changes, and the engine stays
+        usable.
 
         Every reconfiguration freezes the frames around the switch: the buffered
         tail and at least one lookahead window after it, because the lookahead
@@ -503,17 +529,21 @@ class Engine:
            forced to ``final=True`` (``raw`` and ``filled`` keep their values).
         2. The new components are installed. Detectors that became active
            (``detectors`` given, or a new mode that activates a detector the old
-           mode did not run) are ``reset()``. A new lookahead buffer continues the
+           mode did not run) are ``reset()``, and so are refiners that became
+           active by the same rule (``refiners`` given, or newly activated by the
+           mode). Installing a refiner counts as installing a detector for the
+           cold start below. A new lookahead buffer continues the
            stream's frame numbering, so indices stay contiguous for sinks and the
            observer.
         3. The frames after the switch are forced to ``final=True`` for the
            longest of: ``max(old lookahead, new lookahead)``; the full
-           ``cold_start_frames`` of the new config when detectors became active or
-           the config changes ``lookahead`` or ``cold_start_frames``; the rest of a
-           cold-start window already in progress.
+           ``cold_start_frames`` of the new config when detectors or refiners became
+           active or the config changes ``lookahead`` or ``cold_start_frames``; the
+           rest of a cold-start window already in progress.
 
         If writing the tail fails in a way that aborts the engine (critical sink,
-        observer, or abort from a callback), or a detector's ``reset()`` raises,
+        observer, or abort from a callback), or a detector's or refiner's
+        ``reset()`` raises,
         the engine is aborted, the error propagates, and the new components are not
         installed.
 
@@ -523,7 +553,7 @@ class Engine:
         has no locking.
         """
         with self._call("reconfigure"):
-            return self._reconfigure(detectors, mode, stages, config)
+            return self._reconfigure(detectors, mode, stages, config, refiners)
 
     def _reconfigure(
         self,
@@ -531,17 +561,23 @@ class Engine:
         mode: Mode | None,
         stages: Sequence[Stage] | None,
         config: EngineConfig | None,
+        refiners: Sequence[Refiner] | None,
     ) -> list[Output]:
         buffer = self._require_streaming("reconfigure")
         new_all = self._all_detectors if detectors is None else tuple(detectors)
+        new_all_refiners = self._all_refiners if refiners is None else tuple(refiners)
         new_mode = self._mode if mode is None else mode
         new_stages = self._stages if stages is None else tuple(stages)
         new_config = self._config if config is None else config
-        new_detectors = _active_detectors(new_all, new_mode)  # Raises before any change.
+        # Raises before any change.
+        new_detectors, new_refiners, new_first_hit = _resolve(
+            new_all, new_all_refiners, new_mode
+        )
 
         old_config = self._config
         if (
             detectors is None
+            and refiners is None
             and mode is None
             and stages is None
             and replace(new_config, frame_budget_ms=old_config.frame_budget_ms) == old_config
@@ -557,7 +593,12 @@ class Engine:
             installed = new_detectors
         else:
             installed = tuple(d for d in new_detectors if id(d) not in old_ids)
-        cold = bool(installed) or (
+        old_refiner_ids = {id(r) for r in self._refiners}
+        if refiners is not None:
+            installed_refiners = new_refiners
+        else:
+            installed_refiners = tuple(r for r in new_refiners if id(r) not in old_refiner_ids)
+        cold = bool(installed) or bool(installed_refiners) or (
             new_config.lookahead != old_config.lookahead
             or new_config.cold_start_frames != old_config.cold_start_frames
         )
@@ -573,12 +614,17 @@ class Engine:
             outputs = [self._emit(decision) for decision in decisions]
             for detector in installed:
                 detector.reset()
+            for refiner in installed_refiners:
+                refiner.reset()
         except BaseException:
             self.abort()
             raise
 
         self._all_detectors = new_all
         self._detectors = new_detectors
+        self._all_refiners = new_all_refiners
+        self._refiners = new_refiners
+        self._first_hit = new_first_hit
         self._mode = new_mode
         self._stages = new_stages
         self._config = new_config
@@ -729,27 +775,46 @@ class Engine:
         _abort_all([sink])
 
     def _detect(self, frame: Frame) -> _Pending:
-        """Run the detectors lazily: stateful ones always, others until a subject is found.
+        """Run the detectors, then the refiners, and merge their checked results.
 
-        After a detector raises, the remaining stateful detectors still see the frame
-        so their models stay in step with the stream; their results are discarded.
+        Stateful detectors always run. Under the "first_hit" policy a stateless
+        detector is skipped once a subject was found on the frame; under "all" every
+        detector runs. After a detector raises or returns a malformed result, the
+        remaining stateful detectors still see the frame so their models stay in
+        step with the stream; their results are discarded, and refiners do not run.
         """
         budget = self._budget_s
         start = self._clock()
+        shape = frame.image.shape
+        first_hit = self._first_hit
         detections = Detections()
+        present = False
         failed = False
         for detector in self._detectors:
-            if not detector.stateful and (failed or detections.subject_present):
+            if not detector.stateful and (failed or (first_hit and present)):
                 continue
             try:
                 result = detector.detect(frame)
+                if not failed:
+                    merged = detections.merged(check_detections(result, detector.provides, shape))
+                    present = merged.subject_present
+                    detections = merged
             except Exception as exc:
                 if not failed:
                     self._log_failure(frame.index, f"detector {type(detector).__name__}", exc)
                 failed = True
-                continue
-            if not failed:
-                detections = detections.merged(result)
+
+        if not failed:
+            for refiner in self._refiners:
+                try:
+                    result = refiner.refine(frame, detections)
+                    merged = detections.merged(check_detections(result, refiner.provides, shape))
+                    present = merged.subject_present
+                    detections = merged
+                except Exception as exc:
+                    self._log_failure(frame.index, f"refiner {type(refiner).__name__}", exc)
+                    failed = True
+                    break
 
         elapsed = self._clock() - start
         over = False
@@ -759,6 +824,7 @@ class Engine:
         return _Pending(
             frame=frame,
             detections=detections,
+            subject_present=present,
             detect_failed=failed,
             over_budget=over,
             detect_seconds=elapsed,
@@ -779,9 +845,11 @@ class Engine:
             where = f"mode {self._mode.name}"
             try:
                 image = self._mode.render(frame, pending.detections, decision.final)
+                _check_image(image, frame.image)
                 for stage in self._stages:
                     where = f"stage {type(stage).__name__}"
                     image = stage.apply(frame, image)
+                    _check_image(image, frame.image)
             except Exception as exc:
                 self._log_failure(frame.index, where, exc)
                 failed = True
@@ -868,16 +936,84 @@ class Engine:
             )
 
 
-def _active_detectors(detectors: Sequence[Detector], mode: Mode) -> tuple[Detector, ...]:
-    """Return the detectors ``mode`` requires, in order; raise when it needs one and gets none."""
-    active = tuple(d for d in detectors if d.provides & mode.requires)
-    if mode.requires and not active:
-        required = ", ".join(sorted(kind.value for kind in mode.requires))
+_POLICIES: tuple[DetectPolicy, ...] = ("first_hit", "all")
+
+
+def _kind_names(kinds: frozenset[DetectionKind]) -> str:
+    return ", ".join(sorted(kind.value for kind in kinds))
+
+
+def _resolve(
+    detectors: Sequence[Detector], refiners: Sequence[Refiner], mode: Mode
+) -> tuple[tuple[Detector, ...], tuple[Refiner, ...], bool]:
+    """Return the active detectors, the active refiners, and whether the policy is first_hit.
+
+    Raises ``ValueError`` for every configuration the engine rejects (see
+    :class:`Engine`); nothing is mutated, so callers can validate before a change.
+    """
+    requires = mode.requires
+    active = tuple(d for d in detectors if d.provides & requires)
+    active_refiners = tuple(r for r in refiners if r.provides & requires)
+    if requires and not active and not active_refiners:
         raise ValueError(
-            f"Mode {mode.name!r} requires {required} but no detector provides any of "
-            "them; every frame would pass through unprocessed"
+            f"Mode {mode.name!r} requires {_kind_names(requires)} but no detector or "
+            "refiner provides any of them; every frame would pass through unprocessed"
         )
-    return active
+
+    policy = getattr(mode, "detect_policy", "first_hit")
+    if not isinstance(policy, str) or policy not in _POLICIES:
+        raise ValueError(
+            f"Mode {mode.name!r} has detect_policy {policy!r}; expected one of "
+            + ", ".join(repr(p) for p in _POLICIES)
+        )
+    first_hit = policy == "first_hit"
+
+    available: set[DetectionKind] = set()
+    for detector in active:
+        available.update(detector.provides)
+    for refiner in active_refiners:
+        name = type(refiner).__name__
+        if first_hit:
+            raise ValueError(
+                f"Refiner {name} is active but mode {mode.name!r} uses the 'first_hit' "
+                "detection policy, which skips detectors; refiners need 'all'"
+            )
+        missing = frozenset(refiner.consumes) - available
+        if missing:
+            raise ValueError(
+                f"Refiner {name} consumes {_kind_names(missing)} but no active detector "
+                "or earlier refiner provides it"
+            )
+        available.update(refiner.provides)
+
+    mandatory = getattr(mode, "mandatory", frozenset())
+    try:
+        kinds = frozenset(mandatory)
+    except TypeError as exc:
+        raise ValueError(
+            f"Mode {mode.name!r} mandatory must be a set of DetectionKind: {exc}"
+        ) from exc
+    for kind in kinds:
+        if not isinstance(kind, DetectionKind):
+            raise ValueError(f"Mode {mode.name!r} mandatory holds an unknown kind {kind!r}")
+    uncovered = kinds - available
+    if uncovered:
+        raise ValueError(
+            f"Mode {mode.name!r} requires {_kind_names(uncovered)} as mandatory but no "
+            "active detector or refiner provides it"
+        )
+    return active, active_refiners, first_hit
+
+
+def _check_image(image: object, like: np.ndarray) -> None:
+    """Raise ``ValueError`` unless ``image`` is an ndarray with ``like``'s shape and dtype."""
+    if type(image) is not np.ndarray:
+        raise ValueError(f"output image must be a numpy.ndarray, got {type(image).__name__}")
+    if image.shape != like.shape or image.dtype != like.dtype:
+        raise ValueError(
+            f"output image has shape {image.shape} and dtype {image.dtype}; "
+            f"the input frame has shape {like.shape} and dtype {like.dtype}"
+        )
 
 
 def _budget_seconds(config: EngineConfig) -> float | None:

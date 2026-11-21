@@ -19,12 +19,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 import numpy as np
 
 from petrify.core.detections import DetectionKind, Detections
 from petrify.core.frame import Frame, FrameMeta, SourceInfo
+
+DetectPolicy = Literal["first_hit", "all"]
+"""How the engine runs a mode's stateless detectors on each frame (see :class:`Mode`)."""
 
 
 class BackgroundNotReady(RuntimeError):
@@ -70,8 +73,47 @@ class Detector(Protocol):
 
 
 @runtime_checkable
+class Refiner(Protocol):
+    """Derives further detections from a frame and the detections found so far.
+
+    A refiner (for example a tracker that holds a box for a few frames after a
+    miss) runs after every active detector, in the order given to the engine, and
+    receives the union of the detectors' results and of earlier refiners' results.
+    It is active when ``provides`` intersects the mode's ``requires``. Every kind
+    in ``consumes`` must be provided by an active detector or an earlier active
+    refiner, and refiners require the "all" detection policy, so they see the
+    output of every detector on every frame that did not fail.
+    """
+
+    consumes: frozenset[DetectionKind]
+    provides: frozenset[DetectionKind]
+
+    def refine(self, frame: Frame, detections: Detections) -> Detections:
+        """Return ADDITIONAL detections for this frame; the engine unions them in."""
+        ...
+
+    def reset(self) -> None:
+        """Drop any internal state."""
+        ...
+
+
+@runtime_checkable
 class Mode(Protocol):
-    """Turns a frame and its detections into the output image."""
+    """Turns a frame and its detections into the output image.
+
+    A mode may also carry two optional attributes. They are not protocol members,
+    so a mode without them still satisfies ``isinstance(obj, Mode)``:
+
+    - ``detect_policy`` (:data:`DetectPolicy`, default ``"first_hit"``): with
+      ``"first_hit"`` the engine stops running stateless detectors on a frame once
+      one of them has found a subject (stateful detectors still run on every
+      frame). That suits a mode that only needs a yes or no. With ``"all"`` every
+      active detector runs on every frame, so a mode that draws on boxes, faces,
+      or a mask receives every region. Refiners require ``"all"``.
+    - ``mandatory`` (``frozenset[DetectionKind]``, default empty): every kind in
+      it must be provided by an active detector or refiner, or the engine raises
+      ``ValueError`` at construction and in ``reconfigure``.
+    """
 
     name: str
     requires: frozenset[DetectionKind]

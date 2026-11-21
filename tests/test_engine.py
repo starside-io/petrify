@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from petrify.core import (
+    Box,
     DetectionKind,
     Detections,
     Detector,
@@ -22,6 +23,7 @@ from petrify.core import (
     FrameTrace,
     Mode,
     Output,
+    Refiner,
     Sink,
     Source,
     SourceInfo,
@@ -1894,3 +1896,604 @@ def test_timings_do_not_change_budget_decisions() -> None:
     stats, traces = plain
     assert [t.index for t in traces if t.failed_closed] == [2, 5, 7]
     assert stats.over_budget == 3
+
+
+# ---------------------------------------------------------------------------
+# Detection policy, result checks, refiners, output checks (Phase 4 T2)
+# ---------------------------------------------------------------------------
+
+M, P, BD, MASK, FACES = (
+    DetectionKind.MOTION,
+    DetectionKind.PERSONS,
+    DetectionKind.BACKGROUND_DIFF,
+    DetectionKind.MASK,
+    DetectionKind.FACES,
+)
+
+
+class RegionMode:
+    """Records the detections it renders with; frozen frames become the background.
+
+    ``detect_policy`` and ``mandatory`` are set only when given, so the engine's
+    defaults for an absent attribute can be tested.
+    """
+
+    name = "region"
+
+    def __init__(
+        self,
+        requires: Iterable[DetectionKind],
+        policy: object = None,
+        mandatory: Iterable[DetectionKind] | None = None,
+        output: Callable[[Frame], object] | None = None,
+    ) -> None:
+        self.requires = frozenset(requires)
+        if policy is not None:
+            self.detect_policy = policy
+        if mandatory is not None:
+            self.mandatory = frozenset(mandatory)
+        self.output = output
+        self.seen: list[tuple[int, Detections, bool]] = []
+        self.mask_sums: list[int] = []
+
+    def render(self, frame: Frame, detections: Detections, subject_present: bool) -> np.ndarray:
+        self.seen.append((frame.index, detections, subject_present))
+        if detections.mask is not None:
+            self.mask_sums.append(int(detections.mask.sum()))
+        if self.output is not None:
+            return self.output(frame)  # type: ignore[return-value]
+        if subject_present:
+            return np.full_like(frame.image, BACKGROUND_VALUE)
+        return frame.image
+
+    def persons(self) -> list[tuple[Box, ...] | None]:
+        return [d.persons for _, d, _ in self.seen]
+
+
+class ResultDetector:
+    """Returns ``result(frame)`` as is; records the frames it saw."""
+
+    def __init__(
+        self,
+        provides: Iterable[object],
+        result: Callable[[Frame], object],
+        *,
+        stateful: bool = False,
+    ) -> None:
+        self.provides = frozenset(provides)
+        self.stateful = stateful
+        self.result = result
+        self.seen: list[int] = []
+        self.resets = 0
+
+    def detect(self, frame: Frame) -> Detections:
+        self.seen.append(frame.index)
+        return self.result(frame)  # type: ignore[return-value]
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+def _box_detector(box: Box, *, stateful: bool = False) -> ResultDetector:
+    """A persons detector that finds ``box`` on every frame."""
+    return ResultDetector({P}, lambda f: Detections(persons=(box,)), stateful=stateful)
+
+
+class FakeRefiner:
+    """Returns ``result(frame, detections)``; records calls and resets."""
+
+    def __init__(
+        self,
+        consumes: Iterable[DetectionKind],
+        provides: Iterable[DetectionKind],
+        result: Callable[[Frame, Detections], object] | None = None,
+    ) -> None:
+        self.consumes = frozenset(consumes)
+        self.provides = frozenset(provides)
+        self.result = result or (lambda f, d: Detections())
+        self.calls: list[tuple[int, Detections]] = []
+        self.resets = 0
+
+    def refine(self, frame: Frame, detections: Detections) -> Detections:
+        self.calls.append((frame.index, detections))
+        return self.result(frame, detections)  # type: ignore[return-value]
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+def _p_engine(
+    detectors: Sequence[Detector],
+    mode: Mode,
+    *,
+    refiners: Sequence[Refiner] = (),
+    stages: Sequence[Stage] = (),
+    sinks: Sequence[Sink] | None = None,
+    lookahead: int = 0,
+    cold_start: int = 0,
+    traces: list[FrameTrace] | None = None,
+) -> Engine:
+    return Engine(
+        detectors,
+        mode,
+        stages,
+        list(sinks) if sinks is not None else [FakeSink()],
+        EngineConfig(lookahead=lookahead, cold_start_frames=cold_start),
+        None if traces is None else traces.append,
+        refiners=refiners,
+    )
+
+
+def _p_run(
+    n: int,
+    detectors: Sequence[Detector],
+    mode: Mode,
+    **kwargs: object,
+) -> tuple[EngineStats, list[FrameTrace], FakeSink]:
+    traces: list[FrameTrace] = []
+    sink = FakeSink()
+    engine = _p_engine(detectors, mode, sinks=[sink], traces=traces, **kwargs)  # type: ignore[arg-type]
+    stats = engine.run(FakeSource(n))
+    return stats, traces, sink
+
+
+BOX_A = Box(x=0, y=0, w=1, h=1)
+BOX_B = Box(x=1, y=1, w=2, h=2)
+
+
+def test_new_fakes_satisfy_protocols() -> None:
+    assert isinstance(FakeRefiner({M}, {P}), Refiner)
+    assert isinstance(RegionMode({M}), Mode)
+    assert isinstance(RegionMode({M}, policy="all", mandatory={M}), Mode)
+
+
+def test_all_policy_runs_every_stateless_detector_after_a_hit() -> None:
+    a, b = _box_detector(BOX_A), _box_detector(BOX_B)
+    mode = RegionMode({P}, policy="all")
+    _p_run(3, [a, b], mode)
+    assert a.seen == [0, 1, 2]
+    assert b.seen == [0, 1, 2]
+    assert mode.persons() == [(BOX_A, BOX_B)] * 3
+
+
+def test_first_hit_policy_still_short_circuits() -> None:
+    a, b = _box_detector(BOX_A), _box_detector(BOX_B)
+    stateful = _box_detector(BOX_B, stateful=True)
+    mode = RegionMode({P}, policy="first_hit")
+    _p_run(3, [a, b, stateful], mode)
+    assert a.seen == [0, 1, 2]
+    assert b.seen == []
+    assert stateful.seen == [0, 1, 2]
+    assert mode.persons() == [(BOX_A, BOX_B)] * 3  # a, then the stateful one.
+
+
+def test_absent_detect_policy_defaults_to_first_hit() -> None:
+    a, b = _box_detector(BOX_A), _box_detector(BOX_B)
+    mode = RegionMode({P})
+    assert not hasattr(mode, "detect_policy")
+    _p_run(3, [a, b], mode)
+    assert b.seen == []
+    assert mode.persons() == [(BOX_A,)] * 3
+
+
+@pytest.mark.parametrize("policy", ["sometimes", "ALL", 1, ("all",)], ids=repr)
+def test_invalid_detect_policy_rejected(policy: object) -> None:
+    with pytest.raises(ValueError, match="detect_policy"):
+        _p_engine([_box_detector(BOX_A)], RegionMode({P}, policy=policy))
+    engine = _p_engine([_box_detector(BOX_A)], RegionMode({P}))
+    engine.open(INFO)
+    with pytest.raises(ValueError, match="detect_policy"):
+        engine.reconfigure(mode=RegionMode({P}, policy=policy))
+    assert engine.is_open
+    engine.close()
+
+
+def test_mandatory_kind_uncovered_at_construction_rejected() -> None:
+    motion = FakeDetector()
+    with pytest.raises(ValueError, match="mask"):
+        _p_engine([motion], RegionMode({M, MASK}, mandatory={MASK}))
+    # Without mandatory the same set-up is accepted: MOTION is still provided.
+    assert _p_engine([motion], RegionMode({M, MASK})).detectors == (motion,)
+    masker = ResultDetector({MASK}, lambda f: Detections(mask=np.zeros((H, W), dtype=bool)))
+    engine = _p_engine([motion, masker], RegionMode({M, MASK}, mandatory={MASK}))
+    assert engine.detectors == (motion, masker)
+
+
+def test_mandatory_kind_covered_by_a_refiner_is_accepted() -> None:
+    refiner = FakeRefiner({M}, {MASK})
+    mode = RegionMode({M, MASK}, policy="all", mandatory={MASK})
+    assert _p_engine([FakeDetector()], mode, refiners=[refiner]).refiners == (refiner,)
+
+
+def test_mandatory_kind_uncovered_at_reconfigure_changes_nothing() -> None:
+    motion = FakeDetector(hits=[3])
+    masker = ResultDetector({MASK}, lambda f: Detections(mask=np.zeros((H, W), dtype=bool)))
+    mode = RegionMode({M, MASK}, mandatory={MASK})
+    sink = FakeSink()
+    traces: list[FrameTrace] = []
+    engine = _p_engine([motion, masker], mode, sinks=[sink], lookahead=2, traces=traces)
+    config = engine.config
+    engine.open(INFO)
+    _stream(engine, range(4))
+    written = len(sink.written)
+    with pytest.raises(ValueError, match="mandatory"):
+        engine.reconfigure(detectors=[motion], stages=[FakeStage()])
+    with pytest.raises(ValueError, match="mandatory"):
+        engine.reconfigure(mode=RegionMode({M, MASK, P}, mandatory={P}))
+    assert engine.is_open
+    assert len(sink.written) == written
+    assert engine.detectors == (motion, masker)
+    assert engine.mode is mode and engine.stages == () and engine.config is config
+    _stream(engine, range(4, 8))
+    stats = engine.close()
+    assert [i for i, _ in sink.written] == list(range(8))
+    assert masker.seen == [0, 1, 2, 4, 5, 6, 7]  # first_hit: skipped after the hit at 3.
+    assert _finals(traces) == [1, 2, 3, 4, 5]
+    assert stats.reconfigurations == 0
+
+
+MALFORMED: dict[str, tuple[frozenset[object], object]] = {
+    "not_detections": (frozenset({M}), {"motion": True}),
+    "field_outside_provides": (frozenset({M}), Detections(persons=())),
+    "wrong_shape_mask": (frozenset({MASK}), Detections(mask=np.zeros((H + 1, W), dtype=bool))),
+}
+
+
+@pytest.mark.parametrize("case", sorted(MALFORMED))
+def test_malformed_detector_result_fails_the_frame_closed(
+    case: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    provides, bad = MALFORMED[case]
+
+    def result(frame: Frame) -> object:
+        return bad if frame.index == 2 else Detections()
+
+    detector = ResultDetector(provides, result)
+    mode = RegionMode({M, MASK}, policy="all")
+    engine_detectors: list[Detector] = [FakeDetector(), detector]
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, traces, sink = _p_run(6, engine_detectors, mode, lookahead=1)
+    assert detector.seen == list(range(6))
+    images = dict(sink.written)
+    assert sorted(images) == list(range(6))
+    assert _is_black(images[2], _image(2))
+    assert [t.index for t in traces if t.failed_closed] == [2]
+    assert traces[2].raw
+    assert _finals(traces) == [1, 2, 3]  # Neighbors frozen.
+    assert 2 not in [i for i, _, _ in mode.seen]
+    assert stats.failed_closed == 1 and stats.frames == 6
+    assert stats.frozen + stats.passed_through + stats.failed_closed == stats.frames
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Frame 2 failed closed (detector ResultDetector)" in m for m in messages)
+
+
+def test_detector_with_bad_provides_fails_every_frame_closed() -> None:
+    # A plain string equals the str-valued enum, so the engine activates it, but
+    # check_detections rejects it as an unknown kind on every frame.
+    detector = ResultDetector({"motion"}, lambda f: Detections(motion=False))
+    stats, traces, sink = _p_run(3, [detector], RegionMode({M}, "all"))
+    assert detector.seen == [0, 1, 2]
+    assert all(t.failed_closed for t in traces)
+    assert all(_is_black(img, _image(i)) for i, img in sink.written)
+    assert stats.failed_closed == 3 and sink.events == ["open", "close"]
+
+
+def test_stateful_detector_still_sees_frame_after_malformed_result() -> None:
+    for policy in ("first_hit", "all"):
+        broken = ResultDetector(
+            {M}, lambda f: "junk" if f.index == 1 else Detections(motion=False)
+        )
+        stateful = FakeDetector(stateful=True)
+        stateless = FakeDetector(kind=DetectionKind.BACKGROUND_DIFF)
+        _, traces, _ = _p_run(3, [broken, stateful, stateless], RegionMode({M, BD}, policy))
+        assert stateful.seen == [0, 1, 2], policy
+        assert stateless.seen == [0, 2], policy
+        assert [t.failed_closed for t in traces] == [False, True, False], policy
+
+
+def test_reused_mask_buffer_cannot_change_a_buffered_frame() -> None:
+    buffer = np.zeros((H, W), dtype=bool)
+
+    def fill(frame: Frame) -> Detections:
+        buffer[:] = False
+        buffer.flat[: frame.index + 1] = True  # Frame i has i + 1 mask pixels.
+        return Detections(mask=buffer)
+
+    mode = RegionMode({MASK}, policy="all")
+    _p_run(6, [ResultDetector({MASK}, fill, stateful=True)], mode, lookahead=3)
+    assert mode.mask_sums == [1, 2, 3, 4, 5, 6]
+
+
+def test_detector_boxes_are_clipped_before_the_mode_sees_them() -> None:
+    wide = Box(x=-2, y=1, w=20, h=2)
+    mode = RegionMode({P})
+    _p_run(1, [_box_detector(wide)], mode)
+    assert mode.persons() == [(Box(x=0, y=1, w=W, h=2),)]
+
+
+# Refiners ---------------------------------------------------------------------
+
+
+def test_refiner_adds_detections_the_mode_sees_and_lookahead_uses() -> None:
+    def track(frame: Frame, detections: Detections) -> Detections:
+        return Detections(persons=(BOX_A,) if frame.index == 4 else ())
+
+    refiner = FakeRefiner({M}, {P}, track)
+    mode = RegionMode({M, P}, policy="all")
+    _, traces, sink = _p_run(8, [FakeDetector()], mode, refiners=[refiner], lookahead=1)
+    assert [i for i, _ in refiner.calls] == list(range(8))
+    assert all(d.motion is False for _, d in refiner.calls)  # Sees the detectors' output.
+    assert mode.persons()[4] == (BOX_A,)
+    assert [t.index for t in traces if t.raw] == [4]
+    assert _finals(traces) == [3, 4, 5]
+    images = dict(sink.written)
+    for i in (3, 4, 5):
+        assert np.all(images[i] == BACKGROUND_VALUE)
+
+
+def test_refiner_cannot_remove_detections() -> None:
+    seen_by_refiner: list[tuple[Box, ...] | None] = []
+
+    def drop_all(frame: Frame, detections: Detections) -> Detections:
+        seen_by_refiner.append(detections.persons)
+        return Detections(persons=())
+
+    mode = RegionMode({P}, policy="all")
+    refiner = FakeRefiner({P}, {P}, drop_all)
+    _, traces, _ = _p_run(3, [_box_detector(BOX_A)], mode, refiners=[refiner])
+    assert seen_by_refiner == [(BOX_A,)] * 3
+    assert mode.persons() == [(BOX_A,)] * 3
+    assert all(t.raw for t in traces)
+
+
+def test_later_refiner_sees_earlier_refiner_output() -> None:
+    first = FakeRefiner({M}, {P}, lambda f, d: Detections(persons=(BOX_A,)))
+    second = FakeRefiner({P}, {FACES})
+    mode = RegionMode({M, P, FACES}, policy="all")
+    _p_run(2, [FakeDetector()], mode, refiners=[first, second])
+    assert [d.persons for _, d in second.calls] == [(BOX_A,)] * 2
+
+
+def _raise(frame: Frame, detections: Detections) -> object:
+    raise RuntimeError("tracker broke")
+
+
+REFINER_FAILURES: dict[str, Callable[[Frame, Detections], object]] = {
+    "raises": _raise,
+    "not_detections": lambda f, d: [BOX_A],
+    "field_outside_provides": lambda f, d: Detections(motion=True),
+    "wrong_shape_mask": lambda f, d: Detections(mask=np.zeros((H, W + 1), dtype=bool)),
+}
+
+
+@pytest.mark.parametrize("case", sorted(REFINER_FAILURES))
+def test_refiner_failure_fails_the_frame_closed(
+    case: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    bad = REFINER_FAILURES[case]
+
+    def result(frame: Frame, detections: Detections) -> object:
+        return bad(frame, detections) if frame.index == 3 else Detections()
+
+    broken = FakeRefiner({M}, {P, MASK}, result)
+    later = FakeRefiner({M}, {P})
+    mode = RegionMode({M, P, MASK}, policy="all")
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, traces, sink = _p_run(
+            6, [FakeDetector()], mode, refiners=[broken, later], lookahead=1
+        )
+    assert _is_black(dict(sink.written)[3], _image(3))
+    assert [t.index for t in traces if t.failed_closed] == [3]
+    assert traces[3].raw
+    assert _finals(traces) == [2, 3, 4]
+    assert [i for i, _ in later.calls] == [0, 1, 2, 4, 5]  # Skipped on the failed frame.
+    assert 3 not in [i for i, _, _ in mode.seen]
+    assert stats.failed_closed == 1 and stats.frames == 6
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Frame 3 failed closed (refiner FakeRefiner)" in m for m in messages)
+
+
+def test_refiners_do_not_run_on_a_frame_whose_detection_failed() -> None:
+    refiner = FakeRefiner({M}, {P})
+    _p_run(4, [FakeDetector(fail=[2])], RegionMode({M, P}, "all"), refiners=[refiner])
+    assert [i for i, _ in refiner.calls] == [0, 1, 3]
+
+
+@pytest.mark.parametrize("policy", ["first_hit", None], ids=["explicit", "absent"])
+def test_refiner_rejected_under_first_hit(policy: str | None) -> None:
+    with pytest.raises(ValueError, match="first_hit"):
+        _p_engine(
+            [FakeDetector()], RegionMode({M, P}, policy), refiners=[FakeRefiner({M}, {P})]
+        )
+
+
+def test_refiner_with_uncovered_consumes_rejected() -> None:
+    with pytest.raises(ValueError, match="consumes mask"):
+        _p_engine(
+            [FakeDetector()], RegionMode({M, P}, "all"), refiners=[FakeRefiner({MASK}, {P})]
+        )
+    # A kind provided only by an inactive detector does not count.
+    persons = FakeDetector(kind=DetectionKind.PERSONS)
+    with pytest.raises(ValueError, match="consumes persons"):
+        _p_engine(
+            [FakeDetector(), persons],
+            RegionMode({M, FACES}, "all"),
+            refiners=[FakeRefiner({P}, {FACES})],
+        )
+    # A refiner may consume what an earlier refiner provides, not a later one.
+    first = FakeRefiner({M}, {P})
+    second = FakeRefiner({P}, {FACES})
+    mode = RegionMode({M, P, FACES}, "all")
+    assert _p_engine([FakeDetector()], mode, refiners=[first, second]).refiners == (first, second)
+    with pytest.raises(ValueError, match="consumes persons"):
+        _p_engine([FakeDetector()], mode, refiners=[second, first])
+
+
+def test_refiner_inactive_when_mode_does_not_require_its_kinds() -> None:
+    refiner = FakeRefiner({MASK}, {FACES})  # Uncovered consumes: ignored while inactive.
+    mode = RegionMode({M})  # first_hit is fine while the refiner is inactive.
+    engine = _p_engine([FakeDetector()], mode, refiners=[refiner])
+    assert engine.refiners == ()
+    engine.run(FakeSource(3))
+    assert refiner.calls == [] and refiner.resets == 0
+
+
+def test_refiner_only_provider_satisfies_requires() -> None:
+    refiner = FakeRefiner(set(), {P}, lambda f, d: Detections(persons=(BOX_A,)))
+    mode = RegionMode({P}, "all")
+    stats, _, _ = _p_run(2, [], mode, refiners=[refiner])
+    assert mode.persons() == [(BOX_A,)] * 2
+    assert stats.frozen == 2
+
+
+def test_refiner_reset_on_the_same_events_as_detectors() -> None:
+    detector = FakeDetector(stateful=True)
+    refiner = FakeRefiner({M}, {P})
+    other = FakeRefiner({M}, {FACES})
+    mode = RegionMode({M, P}, "all")
+    engine = _p_engine([detector], mode, refiners=[refiner, other], lookahead=1)
+    assert engine.refiners == (refiner,)
+    assert (detector.resets, refiner.resets, other.resets) == (0, 0, 0)
+    engine.open(INFO)
+    assert (detector.resets, refiner.resets, other.resets) == (1, 1, 0)
+    _stream(engine, range(3))
+    engine.reconfigure(stages=[FakeStage()])  # Nothing new installed.
+    engine.reconfigure(config=EngineConfig(lookahead=2))
+    assert (detector.resets, refiner.resets, other.resets) == (1, 1, 0)
+    engine.reconfigure(detectors=[detector])  # Given: reset even if unchanged.
+    assert (detector.resets, refiner.resets) == (2, 1)
+    engine.reconfigure(refiners=[refiner, other])  # Given: reset even if unchanged.
+    assert (detector.resets, refiner.resets, other.resets) == (2, 2, 0)
+    engine.reconfigure(mode=RegionMode({M, P, FACES}, "all"))  # Activates other only.
+    assert engine.refiners == (refiner, other)
+    assert (detector.resets, refiner.resets, other.resets) == (2, 2, 1)
+    engine.close()
+    engine.open(INFO)
+    assert (detector.resets, refiner.resets, other.resets) == (3, 3, 2)
+    engine.close()
+
+
+def test_reconfigure_installs_refiners_with_a_cold_start() -> None:
+    refiner = FakeRefiner({M}, {P})
+    mode = RegionMode({M, P}, "all")
+    traces: list[FrameTrace] = []
+    engine = _p_engine([FakeDetector()], mode, lookahead=1, cold_start=2, traces=traces)
+    assert engine.refiners == ()
+    engine.open(INFO)
+    _stream(engine, range(6))
+    tail = engine.reconfigure(refiners=[refiner])
+    assert engine.refiners == (refiner,)
+    assert refiner.resets == 1
+    _stream(engine, range(6, 12))
+    engine.close()
+    assert [o.trace.index for o in tail] == [5]
+    assert [i for i, _ in refiner.calls] == list(range(6, 12))
+    assert _finals(traces) == [0, 1, 5, 6, 7]  # Same as a detector swap.
+
+
+def test_reconfigure_removing_refiners() -> None:
+    refiner = FakeRefiner({M}, {P})
+    engine = _p_engine([FakeDetector()], RegionMode({M, P}, "all"), refiners=[refiner])
+    engine.open(INFO)
+    _stream(engine, range(2))
+    engine.reconfigure(refiners=[])
+    _stream(engine, range(2, 4))
+    engine.close()
+    assert engine.refiners == ()
+    assert [i for i, _ in refiner.calls] == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "swap",
+    [
+        lambda: {"refiners": [FakeRefiner({MASK}, {P})]},
+        lambda: {"mode": RegionMode({M, P})},
+        lambda: {"refiners": [], "mode": RegionMode({M, P}, "all", mandatory={P})},
+    ],
+    ids=["consumes", "first_hit", "mandatory"],
+)
+def test_invalid_refiner_reconfigure_changes_nothing(
+    swap: Callable[[], dict[str, object]],
+) -> None:
+    refiner = FakeRefiner({M}, {P})
+    mode = RegionMode({M, P}, "all")
+    sink = FakeSink()
+    engine = _p_engine([FakeDetector()], mode, refiners=[refiner], sinks=[sink], lookahead=2)
+    engine.open(INFO)
+    _stream(engine, range(4))
+    written = len(sink.written)
+    with pytest.raises(ValueError):
+        engine.reconfigure(**swap())  # type: ignore[arg-type]
+    assert len(sink.written) == written
+    assert engine.refiners == (refiner,) and engine.mode is mode
+    assert refiner.resets == 1
+    _stream(engine, range(4, 6))
+    stats = engine.close()
+    assert [i for i, _ in refiner.calls] == list(range(6))
+    assert stats.reconfigurations == 0
+
+
+# Output image checks ----------------------------------------------------------
+
+BAD_OUTPUTS: dict[str, Callable[[Frame], object]] = {
+    "wrong_shape": lambda f: np.zeros((H, W + 1, 3), dtype=np.uint8),
+    "wrong_channels": lambda f: np.zeros((H, W), dtype=np.uint8),
+    "wrong_dtype": lambda f: f.image.astype(np.float32),
+    "not_an_array": lambda f: f.image.tolist(),
+    "none": lambda f: None,
+    "array_subclass": lambda f: np.ma.masked_array(f.image),
+}
+
+
+@pytest.mark.parametrize("case", sorted(BAD_OUTPUTS))
+def test_mode_returning_a_bad_image_fails_closed(
+    case: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    bad = BAD_OUTPUTS[case]
+    mode = RegionMode({M}, output=lambda f: bad(f) if f.index == 1 else f.image)
+    stage = FakeStage()
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, traces, sink = _p_run(3, [FakeDetector()], mode, stages=[stage])
+    images = dict(sink.written)
+    assert _is_black(images[1], _image(1))
+    assert type(sink.received[1]) is np.ndarray
+    assert np.array_equal(images[0], _image(0) + 1)
+    assert [t.failed_closed for t in traces] == [False, True, False]
+    assert stage.applied == [0, 2]
+    assert stats.failed_closed == 1 and stats.frames == 3
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Frame 1 failed closed (mode region)" in m for m in messages)
+
+
+@pytest.mark.parametrize("case", ["wrong_shape", "wrong_dtype", "not_an_array"])
+def test_stage_returning_a_bad_image_fails_closed(
+    case: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    bad = BAD_OUTPUTS[case]
+
+    class BadStage:
+        def apply(self, frame: Frame, image: np.ndarray) -> np.ndarray:
+            return bad(frame) if frame.index == 2 else image  # type: ignore[return-value]
+
+    later = FakeStage()
+    stages: list[Stage] = [BadStage(), later]
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, traces, sink = _p_run(4, [FakeDetector()], RegionMode({M}), stages=stages)
+    assert _is_black(dict(sink.written)[2], _image(2))
+    assert [t.failed_closed for t in traces] == [False, False, True, False]
+    assert later.applied == [0, 1, 3]
+    assert stats.failed_closed == 1
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Frame 2 failed closed (stage BadStage)" in m for m in messages)
+
+
+def test_stage_cannot_repair_a_bad_mode_image() -> None:
+    """The mode's image is checked before the stages run, not only the final image."""
+
+    class Cast:
+        def apply(self, frame: Frame, image: np.ndarray) -> np.ndarray:
+            return np.asarray(image, dtype=np.uint8)
+
+    mode = RegionMode({M}, output=lambda f: f.image.astype(np.float32))
+    stats, _, _ = _p_run(2, [FakeDetector()], mode, stages=[Cast()])
+    assert stats.failed_closed == 2

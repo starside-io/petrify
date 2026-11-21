@@ -25,7 +25,7 @@ import numpy as np
 from petrify.background.locked import LockedBackground
 from petrify.core.detections import DetectionKind, Detections
 from petrify.core.frame import Frame
-from petrify.core.plugin import BackgroundModel, BackgroundNotReady
+from petrify.core.plugin import BackgroundModel, BackgroundNotReady, DetectPolicy
 
 
 class EraseMode:
@@ -52,6 +52,7 @@ class EraseMode:
     requires: ClassVar[frozenset[DetectionKind]] = frozenset(
         {DetectionKind.MOTION, DetectionKind.PERSONS, DetectionKind.BACKGROUND_DIFF}
     )
+    detect_policy: ClassVar[DetectPolicy] = "first_hit"
 
     def __init__(
         self,
