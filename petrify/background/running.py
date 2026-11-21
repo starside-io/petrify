@@ -18,13 +18,20 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 
 import numpy as np
 
 from petrify.core.frame import Frame
+
+logger = logging.getLogger(__name__)
+
+SampleFilter = Callable[[np.ndarray], bool]
+"""Called with a candidate sample image; False (or an exception) rejects it."""
 
 
 def median_image(samples: np.ndarray) -> np.ndarray:
@@ -41,6 +48,40 @@ def median_image(samples: np.ndarray) -> np.ndarray:
 def _check_positive(name: str, value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{name} must be a positive int, got {value!r}")
+
+
+class _SampleVetting:
+    """Apply an optional sample filter, count rejections, warn once on a filter error.
+
+    Not thread-safe: the owning model calls :meth:`accepts` from one thread at a time.
+    """
+
+    def __init__(self, sample_filter: SampleFilter | None, owner: str) -> None:
+        self._filter = sample_filter
+        self._owner = owner
+        self.rejected = 0
+        self._warned_error = False
+
+    def accepts(self, image: np.ndarray) -> bool:
+        """Return True when there is no filter or the filter accepts ``image``."""
+        if self._filter is None:
+            return True
+        try:
+            ok = bool(self._filter(image))
+        except Exception as exc:
+            if not self._warned_error:
+                self._warned_error = True
+                logger.warning(
+                    "%s: sample filter raised %s: %s; the sample is rejected "
+                    "(further filter errors are rejected without a warning)",
+                    self._owner,
+                    type(exc).__name__,
+                    exc,
+                )
+            ok = False
+        if not ok:
+            self.rejected += 1
+        return ok
 
 
 class RunningBackground:
@@ -63,10 +104,24 @@ class RunningBackground:
     :meth:`wait_idle` to wait for pending recomputes. :meth:`update` itself must be
     called from one thread at a time.
 
-    Known limitation: a subject who stands still long enough to be classified as
-    absent by the detectors enters the samples. The median resists this until such
-    frames are the majority of the window, after which the subject becomes part of
-    the background.
+    ``sample_filter``, when given, is called with the candidate image of every
+    sample that would otherwise be stored (every ``interval``-th clean frame, not
+    every frame), on the thread that calls :meth:`update`. A False result rejects
+    the sample: it is not stored and triggers no recompute. An exception raised by
+    the filter also rejects the sample; the first one is logged as a warning and
+    none propagates. ``rejected`` counts rejected samples. While every sample is
+    rejected the model stays not ready, which the erase mode turns into black
+    frames.
+
+    Known limitations: the model only knows what the engine's detectors and the
+    filter tell it. A person who is in view while the model is being built (for
+    example from the very first frame, which the motion detector learns as
+    background) is classified as absent and can be absorbed into the background,
+    and is then shown on frozen frames after they leave, unless ``sample_filter``
+    rejects those frames. With no filter nothing checks the samples. Likewise a
+    subject who stands still long enough to be classified as absent enters the
+    samples: the median resists this until such frames are the majority of the
+    window, after which the subject becomes part of the background.
     """
 
     def __init__(
@@ -76,6 +131,7 @@ class RunningBackground:
         min_samples: int = 5,
         *,
         recompute_in_background: bool = False,
+        sample_filter: SampleFilter | None = None,
     ) -> None:
         _check_positive("window", window)
         _check_positive("interval", interval)
@@ -86,6 +142,7 @@ class RunningBackground:
         self.interval = interval
         self.min_samples = min_samples
         self.recompute_in_background = recompute_in_background
+        self._vetting = _SampleVetting(sample_filter, "RunningBackground")
         self._lock = threading.Lock()
         self._idle = threading.Condition(self._lock)
         # Each stored sample is a private copy that is never mutated afterwards, so
@@ -112,6 +169,11 @@ class RunningBackground:
         with self._lock:
             return len(self._samples)
 
+    @property
+    def rejected(self) -> int:
+        """Number of samples the sample filter rejected (including filter errors)."""
+        return self._vetting.rejected
+
     def current(self) -> np.ndarray | None:
         """Return the latest published median, or None before the first one exists."""
         with self._lock:
@@ -136,6 +198,8 @@ class RunningBackground:
         take = self._candidates % self.interval == 0
         self._candidates += 1
         if not take:
+            return
+        if not self._vetting.accepts(image):
             return
         sample = image.copy()
         if self._shape is None:

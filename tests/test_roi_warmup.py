@@ -194,6 +194,77 @@ def test_rejects_invalid_parameters(kwargs: dict) -> None:
         WarmupRoiDetector(**kwargs)
 
 
+@pytest.mark.parametrize("frac", [0.0, -0.1, 1.01, 2.0])
+def test_rejects_invalid_max_roi_area_frac(frac: float) -> None:
+    with pytest.raises(ValueError, match="max_roi_area_frac"):
+        WarmupRoiDetector(FPS, 3.0, max_roi_area_frac=frac)
+
+
+# ---------------------------------------------------------------------------
+# Final-ROI area cap
+# ---------------------------------------------------------------------------
+
+# A textured "head" that bobs up and down during warmup, in a scene with no
+# timestamp (a webcam). It qualifies as the changing anchor, and snapping and edge
+# extension then grow it into a large box.
+_HEAD = np.random.default_rng(5).integers(0, 256, (80, 64)).astype(np.uint8)
+
+
+def _head_scene(i: int) -> np.ndarray:
+    gray = _BACKGROUND.copy()
+    y = 10 + (i % 3) * 6
+    gray[y : y + 80, 20:84] = _HEAD
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def _run_head(det: WarmupRoiDetector) -> None:
+    for i in range(det.warmup_frames):
+        det.update(_head_scene(i))
+    assert det.done
+
+
+def test_large_roi_is_rejected_by_the_default_cap(caplog: pytest.LogCaptureFixture) -> None:
+    uncapped = WarmupRoiDetector(FPS, 3.0, max_roi_area_frac=1.0)
+    _run_head(uncapped)
+    assert uncapped.roi is not None
+    x, y, w, h = uncapped.roi
+    share = w * h / (W * H)
+    assert share > 0.15  # Without the cap the box is accepted.
+
+    det = WarmupRoiDetector(FPS, 3.0)
+    with caplog.at_level(logging.WARNING, logger="petrify.roi_detect"):
+        _run_head(det)
+    assert det.roi is None
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert str(uncapped.roi) in message
+    assert f"{share * 100:.1f}%" in message
+    assert "too large to be a timestamp" in message
+    assert "disabled" in message
+
+
+def test_small_corner_timestamp_is_unaffected_by_the_default_cap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    det = WarmupRoiDetector(FPS, 3.0)
+    with caplog.at_level(logging.WARNING, logger="petrify.roi_detect"):
+        _feed(det, det.warmup_frames)
+    assert det.roi == (0, 0, 128, 40)
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_cap_compares_against_the_final_box() -> None:
+    """A cap just under the corner timestamp's share rejects it, one just over keeps it."""
+    share = 128 * 40 / (W * H)
+    below = WarmupRoiDetector(FPS, 3.0, max_roi_area_frac=share - 0.001)
+    _feed(below, below.warmup_frames)
+    assert below.roi is None
+    at = WarmupRoiDetector(FPS, 3.0, max_roi_area_frac=share)
+    _feed(at, at.warmup_frames)
+    assert at.roi == (0, 0, 128, 40)
+
+
 # ---------------------------------------------------------------------------
 # Equivalence with the file version on identical frames
 # ---------------------------------------------------------------------------

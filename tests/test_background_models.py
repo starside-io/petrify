@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Iterator, Sequence
 
@@ -419,6 +420,146 @@ def test_background_and_synchronous_modes_agree() -> None:
 
 
 # ----------------------------------------------------------------------
+# Sample filter (RunningBackground)
+# ----------------------------------------------------------------------
+
+REJECT = 99  # Image level the recording filter rejects.
+
+
+class _RecordingFilter:
+    """Sample filter that records the level of every image it sees.
+
+    Rejects images of level REJECT and raises ``error`` for images of level
+    ``raise_level``.
+    """
+
+    def __init__(self, error: Exception | None = None, raise_level: int | None = None) -> None:
+        self.seen: list[int] = []
+        self.error = error
+        self.raise_level = raise_level
+
+    def __call__(self, image: np.ndarray) -> bool:
+        level = int(image[0, 0, 0])
+        self.seen.append(level)
+        if self.error is not None and level == self.raise_level:
+            raise self.error
+        return level != REJECT
+
+
+def _filter_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "sample filter raised" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("threaded", [False, True], ids=["sync", "threaded"])
+def test_running_filter_called_once_per_would_be_stored_sample(threaded: bool) -> None:
+    check = _RecordingFilter()
+    model = RunningBackground(
+        window=10,
+        interval=3,
+        min_samples=1,
+        recompute_in_background=threaded,
+        sample_filter=check,
+    )
+    for i in range(12):
+        # Subject frames are not candidates and never reach the filter.
+        model.update(_frame(_level(200), 2 * i), subject_present=True)
+        model.update(_frame(_level(i), 2 * i + 1), subject_present=False)
+    assert model.wait_idle(timeout=TIMEOUT)
+    assert check.seen == [0, 3, 6, 9]  # Candidates 0, 3, 6 and 9 only.
+    assert model.samples == 4
+    assert model.rejected == 0
+    assert _recompute_threads() == []
+
+
+@pytest.mark.parametrize("threaded", [False, True], ids=["sync", "threaded"])
+def test_running_rejected_samples_are_not_stored_and_trigger_no_recompute(threaded: bool) -> None:
+    check = _RecordingFilter()
+    model = RunningBackground(
+        window=10,
+        interval=1,
+        min_samples=1,
+        recompute_in_background=threaded,
+        sample_filter=check,
+    )
+    for i in range(5):
+        model.update(_frame(_level(REJECT), i), subject_present=False)
+        assert _recompute_threads() == []
+    assert model.wait_idle(timeout=0.0)
+    assert model.samples == 0
+    assert model.version == 0
+    assert model.current() is None
+    assert model.rejected == 5
+    # Accepted samples work as usual; the rejected ones never enter the median.
+    model.update(_frame(_level(10), 5), subject_present=False)
+    assert model.wait_idle(timeout=TIMEOUT)
+    model.update(_frame(_level(REJECT), 6), subject_present=False)
+    assert model.wait_idle(timeout=TIMEOUT)
+    assert model.samples == 1
+    assert model.version == 1
+    current = model.current()
+    assert current is not None and np.all(current == 10)
+    assert model.rejected == 6
+    assert len(check.seen) == 7
+    assert _recompute_threads() == []
+
+
+def test_running_rejection_does_not_shift_the_interval() -> None:
+    check = _RecordingFilter()
+    model = RunningBackground(window=10, interval=2, min_samples=1, sample_filter=check)
+    levels = [REJECT, 1, 2, 3, REJECT, 5, 6]
+    for i, level in enumerate(levels):
+        model.update(_frame(_level(level), i), subject_present=False)
+    # Candidates 0, 2, 4 and 6 are offered; 0 and 4 are rejected.
+    assert check.seen == [REJECT, 2, REJECT, 6]
+    assert model.samples == 2
+    assert model.rejected == 2
+
+
+@pytest.mark.parametrize("threaded", [False, True], ids=["sync", "threaded"])
+def test_running_filter_exception_rejects_and_warns_once(
+    threaded: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    check = _RecordingFilter(error=RuntimeError("detector exploded"), raise_level=50)
+    model = RunningBackground(
+        window=10,
+        interval=1,
+        min_samples=2,
+        recompute_in_background=threaded,
+        sample_filter=check,
+    )
+    with caplog.at_level(logging.WARNING, logger="petrify.background.running"):
+        for i in range(4):
+            model.update(_frame(_level(50), i), subject_present=False)  # Does not raise.
+        assert model.current() is None
+        assert model.rejected == 4
+        assert model.samples == 0
+        for i in range(4, 6):
+            model.update(_frame(_level(20), i), subject_present=False)
+        assert model.wait_idle(timeout=TIMEOUT)
+    warnings = _filter_warnings(caplog)
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "RuntimeError" in message and "detector exploded" in message
+    assert model.rejected == 4
+    assert model.samples == 2
+    current = model.current()
+    assert current is not None and np.all(current == 20)
+    assert _recompute_threads() == []
+
+
+def test_running_without_filter_has_no_rejections() -> None:
+    model = RunningBackground(window=5, interval=1, min_samples=1)
+    for i in range(3):
+        model.update(_frame(_level(REJECT), i), subject_present=False)
+    assert model.rejected == 0
+    assert model.samples == 3
+
+
+# ----------------------------------------------------------------------
 # CalibratedBackground
 # ----------------------------------------------------------------------
 
@@ -501,6 +642,132 @@ def test_calibrate_shape_mismatch_raises() -> None:
     model.update(_frame(_texture()), subject_present=False)
     with pytest.raises(ValueError, match="does not match"):
         model.update(_frame(np.zeros((H, W + 1, 3), dtype=np.uint8)), subject_present=False)
+
+
+
+def _calibrate_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "waiting for a scene without a person" in r.getMessage()
+    ]
+
+
+def test_calibrate_rejected_frames_do_not_advance() -> None:
+    check = _RecordingFilter()
+    model = CalibratedBackground(frames=5, sample_filter=check)
+    fed = 0
+    for n, level in enumerate([10, 20, 30, 40, 50]):
+        for _ in range(3):
+            model.update(_frame(_level(REJECT), fed), subject_present=False)
+            fed += 1
+            assert not model.ready
+            assert model.remaining == 5 - n
+        model.update(_frame(_level(level), fed), subject_present=False)
+        fed += 1
+        assert model.remaining == 4 - n
+    assert model.ready
+    assert model.version == 1
+    assert model.rejected == 15
+    current = model.current()
+    assert current is not None and np.all(current == 30)  # Median of the accepted only.
+    # Once ready the filter is no longer called.
+    calls = len(check.seen)
+    model.update(_frame(_level(REJECT), fed), subject_present=False)
+    assert len(check.seen) == calls
+    assert model.rejected == 15
+
+
+def test_calibrate_subsamples_over_accepted_frames() -> None:
+    frames = 100
+    model = CalibratedBackground(frames=frames, sample_filter=lambda image: image[0, 0, 0] != 255)
+    picks = sorted(model._picks)
+    accepted = 0
+    for i in range(3 * frames):
+        if i % 3 == 0:
+            model.update(_frame(np.full((H, W, 3), accepted, dtype=np.uint8), i), False)
+            accepted += 1
+        else:
+            model.update(_frame(np.full((H, W, 3), 255, dtype=np.uint8), i), False)
+        if model.ready:
+            break
+    assert accepted == frames
+    assert model.rejected == 2 * (frames - 1)
+    current = model.current()
+    assert current is not None
+    # Pixel value = accepted-frame index: the same picks as without a filter.
+    assert int(current[0, 0, 0]) == picks[14]
+
+
+def test_calibrate_warns_every_100_consecutive_rejections(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model = CalibratedBackground(frames=5, sample_filter=_RecordingFilter())
+    with caplog.at_level(logging.WARNING, logger="petrify.background.calibrate"):
+        for i in range(99):
+            model.update(_frame(_level(REJECT), i), subject_present=False)
+        assert _calibrate_warnings(caplog) == []
+        model.update(_frame(_level(REJECT), 99), subject_present=False)
+        assert len(_calibrate_warnings(caplog)) == 1
+        for i in range(100, 250):
+            model.update(_frame(_level(REJECT), i), subject_present=False)
+        assert len(_calibrate_warnings(caplog)) == 2
+        # An accepted frame resets the consecutive count.
+        model.update(_frame(_level(10), 250), subject_present=False)
+        for i in range(251, 350):
+            model.update(_frame(_level(REJECT), i), subject_present=False)
+        assert len(_calibrate_warnings(caplog)) == 2
+        model.update(_frame(_level(REJECT), 350), subject_present=False)
+    warnings = _calibrate_warnings(caplog)
+    assert len(warnings) == 3
+    assert "100 consecutive" in warnings[0].getMessage()
+    assert "200 consecutive" in warnings[1].getMessage()
+    assert "100 consecutive" in warnings[2].getMessage()
+    assert "4 accepted frames still needed" in warnings[2].getMessage()
+    assert model.rejected == 350
+    assert model.remaining == 4
+    assert not model.ready
+
+
+def test_calibrate_never_ready_when_everything_is_rejected() -> None:
+    model = CalibratedBackground(frames=5, sample_filter=lambda image: False)
+    for i in range(300):
+        model.update(_frame(_level(10), i), subject_present=False)
+    assert not model.ready
+    assert model.current() is None
+    assert model.version == 0
+    assert model.remaining == 5
+    assert model.rejected == 300
+
+
+def test_calibrate_filter_exception_rejects_and_warns_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    check = _RecordingFilter(error=ValueError("frame too small"), raise_level=50)
+    model = CalibratedBackground(frames=5, sample_filter=check)
+    with caplog.at_level(logging.WARNING, logger="petrify.background.running"):
+        for i in range(10):
+            model.update(_frame(_level(50), i), subject_present=False)  # Does not raise.
+        assert not model.ready
+        for i in range(10, 15):
+            model.update(_frame(_level(20), i), subject_present=False)
+    warnings = _filter_warnings(caplog)
+    assert len(warnings) == 1
+    assert "ValueError" in warnings[0].getMessage()
+    assert "frame too small" in warnings[0].getMessage()
+    assert model.rejected == 10
+    assert model.ready
+    current = model.current()
+    assert current is not None and np.all(current == 20)
+
+
+def test_calibrate_without_filter_has_no_rejections() -> None:
+    model = CalibratedBackground(frames=5)
+    for i in range(5):
+        model.update(_frame(_level(REJECT), i), subject_present=False)
+    assert model.ready
+    assert model.rejected == 0
 
 
 def test_frames_for() -> None:
@@ -746,3 +1013,70 @@ def test_engine_still_subject_leaving_at_ready(scenario, require: bool) -> None:
     assert set(range(ready_at, stop)) <= black
     for i in range(stop, len(images)):
         assert np.array_equal(sink.images[i], images[i])
+
+
+# A subject in view from the very first frame, still, that leaves at frame
+# PRESENT_UNTIL. MOG2 learns it as background, so the erase mode feeds those frames
+# to the model as "no subject". Without a filter the model absorbs it and shows it
+# on every frozen frame after it left (the known limitation); a filter that
+# recognizes it keeps it out.
+
+PRESENT_UNTIL = 20
+STARTUP_FRAMES = 80
+
+
+def _startup_running(sample_filter) -> BackgroundModel:  # type: ignore[no-untyped-def]
+    return RunningBackground(window=10, interval=2, min_samples=3, sample_filter=sample_filter)
+
+
+def _startup_calibrate(sample_filter) -> BackgroundModel:  # type: ignore[no-untyped-def]
+    return CalibratedBackground(frames=12, sample_filter=sample_filter)
+
+
+STARTUP_MODELS = pytest.mark.parametrize(
+    "make", [_startup_running, _startup_calibrate], ids=["running", "calibrate"]
+)
+
+
+def _no_block(image: np.ndarray) -> bool:
+    return not _has_block(image)
+
+
+@STARTUP_MODELS
+@pytest.mark.parametrize("require", [False, True])
+def test_engine_subject_at_startup_without_filter_is_absorbed(make, require: bool) -> None:  # type: ignore[no-untyped-def]
+    """Documents the known limitation: the subject is shown after it left."""
+    bg = _texture()
+    images = _still(bg, STARTUP_FRAMES, 0, PRESENT_UNTIL)
+    model = make(None)
+    _, sink, _ = _run(model, images, require=require)
+    current = model.current()
+    assert current is not None and _has_block(current)  # Baked into the background.
+    leaked_after = [
+        i for i in range(PRESENT_UNTIL, STARTUP_FRAMES) if _has_block(sink.images[i])
+    ]
+    assert leaked_after == list(range(PRESENT_UNTIL, STARTUP_FRAMES))
+
+
+@STARTUP_MODELS
+@pytest.mark.parametrize("require", [False, True])
+def test_engine_subject_at_startup_with_filter_never_shown(make, require: bool) -> None:  # type: ignore[no-untyped-def]
+    """Black until the empty scene was seen long enough, the live frame afterwards."""
+    bg = _texture()
+    images = _still(bg, STARTUP_FRAMES, 0, PRESENT_UNTIL)
+    model = make(_no_block)
+    recording, sink, failed = _run(model, images, require=require)
+    for i, out in enumerate(sink.images):
+        assert not _has_block(out), f"frame {i} leaked the subject"
+    not_ready = recording.not_ready
+    assert not_ready == list(range(len(not_ready)))  # A prefix of the stream.
+    assert len(not_ready) > PRESENT_UNTIL  # Ready only on samples taken after it left.
+    assert model.rejected > 0
+    current = model.current()
+    assert current is not None and np.array_equal(current, bg)
+    black = _black(sink)
+    first_live = len(not_ready) + (LOOKAHEAD if require else 0)
+    assert black == set(range(first_live))
+    assert failed == len(black)
+    for i in range(first_live, STARTUP_FRAMES):
+        assert np.array_equal(sink.images[i], images[i]), f"frame {i} must be the live frame"

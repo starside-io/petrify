@@ -18,14 +18,23 @@
 
 from __future__ import annotations
 
+import logging
 import math
 
 import numpy as np
 
-from petrify.background.running import _check_positive, median_image
+from petrify.background.running import (
+    SampleFilter,
+    _check_positive,
+    _SampleVetting,
+    median_image,
+)
 from petrify.core.frame import Frame
 
+logger = logging.getLogger(__name__)
+
 MAX_SAMPLES = 30
+REJECTION_WARNING_EVERY = 100
 
 
 def frames_for(seconds: float, fps: float, min_samples: int = 5) -> int:
@@ -39,15 +48,29 @@ def frames_for(seconds: float, fps: float, min_samples: int = 5) -> int:
 
 
 class CalibratedBackground:
-    """Background built once from the first ``frames`` updates, then fixed.
+    """Background built once from the first ``frames`` accepted updates, then fixed.
 
-    Every one of the first ``frames`` updates counts, whatever ``subject_present``
-    says: the user is expected to be out of view. At most 30 of them, spread evenly,
-    are kept. After the last one the per-pixel median is computed, ``version``
-    becomes 1, and the model never changes again. ``current`` is None until then.
+    ``subject_present`` is ignored: the user is expected to be out of view. With no
+    ``sample_filter`` every update is accepted, so the first ``frames`` updates are
+    used. With a filter, it is called with the image of every update until the
+    model is ready, on the calling thread; a False result or an exception rejects
+    the frame, which then does not advance the calibration (the first filter
+    exception is logged as a warning, none propagates). Calibration therefore lasts
+    until ``frames`` accepted frames were seen, and never ends while every frame is
+    rejected; a warning is logged every 100 consecutive rejections so that this is
+    visible. At most 30 accepted frames, spread evenly, are kept. After the last one
+    the per-pixel median is computed, ``version`` becomes 1, and the model never
+    changes again. ``current`` is None until then.
+
+    Known limitation: nothing but the filter checks the calibration frames. A
+    person in view during calibration is absorbed into the background (and shown
+    on frozen frames after they leave) unless ``sample_filter`` rejects those
+    frames. With no filter nothing checks them.
     """
 
-    def __init__(self, frames: int, min_samples: int = 5) -> None:
+    def __init__(
+        self, frames: int, min_samples: int = 5, sample_filter: SampleFilter | None = None
+    ) -> None:
         _check_positive("frames", frames)
         _check_positive("min_samples", min_samples)
         if min_samples > MAX_SAMPLES:
@@ -63,6 +86,8 @@ class CalibratedBackground:
         self._buffer: np.ndarray | None = None
         self._seen = 0
         self._current: np.ndarray | None = None
+        self._vetting = _SampleVetting(sample_filter, "CalibratedBackground")
+        self._consecutive_rejections = 0
 
     @property
     def ready(self) -> bool:
@@ -71,25 +96,42 @@ class CalibratedBackground:
 
     @property
     def remaining(self) -> int:
-        """Calibration frames still to be fed before the background is ready."""
+        """Accepted calibration frames still needed before the background is ready."""
         return self.frames - self._seen
+
+    @property
+    def rejected(self) -> int:
+        """Number of frames the sample filter rejected (including filter errors)."""
+        return self._vetting.rejected
 
     def current(self) -> np.ndarray | None:
         """Return the calibrated background, or None during calibration."""
         return self._current
 
     def update(self, frame: Frame, subject_present: bool) -> None:
-        """Collect ``frame`` during calibration; no-op once ready."""
+        """Collect ``frame`` during calibration if accepted; no-op once ready."""
         if self._current is not None:
             return
         image = frame.image
-        if self._buffer is None:
-            self._buffer = np.empty((len(self._picks), *image.shape), dtype=image.dtype)
-        elif image.shape != self._buffer.shape[1:]:
+        if self._buffer is not None and image.shape != self._buffer.shape[1:]:
             raise ValueError(
                 f"frame shape {image.shape} does not match calibration sample shape "
                 f"{self._buffer.shape[1:]}"
             )
+        if not self._vetting.accepts(image):
+            self._consecutive_rejections += 1
+            if self._consecutive_rejections % REJECTION_WARNING_EVERY == 0:
+                logger.warning(
+                    "CalibratedBackground: calibration is waiting for a scene without a "
+                    "person (%d consecutive frames rejected, %d accepted frames still "
+                    "needed)",
+                    self._consecutive_rejections,
+                    self.remaining,
+                )
+            return
+        self._consecutive_rejections = 0
+        if self._buffer is None:
+            self._buffer = np.empty((len(self._picks), *image.shape), dtype=image.dtype)
         slot = self._picks.get(self._seen)
         if slot is not None:
             self._buffer[slot] = image

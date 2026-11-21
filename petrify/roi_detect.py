@@ -582,8 +582,18 @@ class WarmupRoiDetector:
     neighbour rows when it is taken on the full frame, so those two rows differ.
     Keeping the few grayscale frames is also smaller than one ``CV_64F`` map.
 
-    Parameters other than ``fps`` and ``warmup_seconds`` mean the same as in
-    :func:`auto_detect_roi`.
+    ``max_roi_area_frac`` caps the final ROI, after snapping and edge extension:
+    a box larger than that fraction of the frame is discarded (:attr:`roi` stays
+    None, with one warning) because it is too large to be a timestamp. On a scene
+    with no burned-in timestamp, such as a webcam, a moving person can qualify as
+    the changing anchor and grow into a large region that would otherwise be
+    pasted live on every frozen frame. ``max_area_frac`` limits only the anchor
+    blob, not the final box. The file version :func:`auto_detect_roi` has no such
+    cap. Remaining limitation: a region under the cap is trusted and pasted live,
+    so a person moving through it is visible there.
+
+    Parameters other than ``fps``, ``warmup_seconds`` and ``max_roi_area_frac``
+    mean the same as in :func:`auto_detect_roi`.
     """
 
     def __init__(
@@ -603,6 +613,7 @@ class WarmupRoiDetector:
         edge_threshold: float = 80.0,
         edge_gap_tolerance: int = 30,
         n_edge_samples: int = 3,
+        max_roi_area_frac: float = 0.15,
     ) -> None:
         if not fps > 0:
             raise ValueError(f"fps must be > 0, got {fps}")
@@ -610,6 +621,9 @@ class WarmupRoiDetector:
             raise ValueError(f"warmup_seconds must be > 0, got {warmup_seconds}")
         if n_edge_samples < 1:
             raise ValueError(f"n_edge_samples must be >= 1, got {n_edge_samples}")
+        if not 0 < max_roi_area_frac <= 1:
+            raise ValueError(f"max_roi_area_frac must be in (0, 1], got {max_roi_area_frac}")
+        self._max_roi_area_frac = max_roi_area_frac
         self._min_freq = min_freq
         self._margin = margin
         self._min_area = min_area
@@ -745,7 +759,20 @@ class WarmupRoiDetector:
                 gap_tolerance=self._edge_gap_tolerance,
                 frame_w=plan.frame_w,
             )
-        return assemble_roi(plan, far_x, self._margin)
+        roi = assemble_roi(plan, far_x, self._margin)
+        _, _, w, h = roi
+        share = (w * h) / (plan.frame_w * plan.frame_h)
+        if share > self._max_roi_area_frac:
+            logger.warning(
+                "WarmupRoiDetector: detected ROI %s covers %.1f%% of the frame, more than "
+                "the %.1f%% cap; it is too large to be a timestamp, so the ROI overlay "
+                "is disabled.",
+                roi,
+                share * 100,
+                self._max_roi_area_frac * 100,
+            )
+            return None
+        return roi
 
     def _release(self) -> None:
         """Free every buffer held during warmup."""
