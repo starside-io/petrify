@@ -19,16 +19,18 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import os
 import signal
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType, TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -40,6 +42,7 @@ from petrify.background.running import RunningBackground
 from petrify.background.vetting import person_free
 from petrify.core.config import PetrifyConfig
 from petrify.core.engine import Engine, EngineStats, FrameTrace
+from petrify.core.frame import Frame
 from petrify.core.plugin import BackgroundModel, Detector, Sink, Source, Stage
 from petrify.detectors.bgdiff import BackgroundDiffer
 from petrify.detectors.motion import MotionDetector
@@ -54,6 +57,10 @@ from petrify.sinks.virtualcam import VirtualCamSink
 from petrify.sources.file import FileSource
 from petrify.sources.images import ImageFolderSource
 from petrify.stages.roi_overlay import Compositor, RoiOverlay, WarmupRoiOverlay
+
+if TYPE_CHECKING:
+    from petrify.server.control import RunControl
+    from petrify.sinks.mjpeg import MjpegSink
 
 logger = logging.getLogger(__name__)
 
@@ -812,8 +819,14 @@ def _drive(
     engine: Engine,
     source: Source,
     should_stop: Callable[[], bool],
+    before_step: Callable[[Frame], None] | None = None,
+    after_step: Callable[[], None] | None = None,
 ) -> tuple[EngineStats, bool]:
     """Run the engine over the source with the step API; return the stats and ``interrupted``.
+
+    ``before_step`` is called with each frame before :meth:`Engine.step` and
+    ``after_step`` right after it (both on this thread; ``after_step`` counts as
+    part of the step for the Ctrl-C guard, so it may reconfigure the engine).
 
     On a live source a ``KeyboardInterrupt`` ends the run: reading stops and the
     engine is closed normally, so the outputs are finalized. If the interrupt
@@ -839,8 +852,12 @@ def _drive(
             try:
                 for frame in source:
                     delivered += 1
+                    if before_step is not None:
+                        before_step(frame)
                     guard.in_step = True
                     engine.step(frame)
+                    if after_step is not None:
+                        after_step()
                     guard.in_step = False
                     if guard.pending:
                         interrupted = True
@@ -891,6 +908,370 @@ def _finalize_after_error(engine: Engine, failure: Exception) -> None:
     raise failure
 
 
+# ---------------------------------------------------------------------------
+# Components, and rebuilding them for a reconfiguration at a frame boundary
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Components:
+    """What :func:`run_stream` built from a config, kept so a later change can reuse it.
+
+    ``background`` (the locked image or the online model) is built once and never
+    rebuilt: rebuilding it would discard the learned background.
+    """
+
+    config: PetrifyConfig
+    motion: MotionDetector | None
+    person: PersonDetector | None
+    differ: BackgroundDiffer | None
+    background: np.ndarray | BackgroundModel
+    mode: EraseMode
+    roi_stage: Stage
+
+    @property
+    def detectors(self) -> list[Detector]:
+        """The detector list in the engine's order: motion, person, background differ."""
+        return [d for d in (self.motion, self.person, self.differ) if d is not None]
+
+
+def _frame_detectors(
+    config: PetrifyConfig,
+) -> tuple[MotionDetector | None, PersonDetector | None]:
+    """Build the motion and person detectors ``config.detector`` selects."""
+    motion = None
+    person = None
+    if config.detector in ("motion", "both"):
+        motion = MotionDetector.from_config(config.motion)
+    if config.detector in ("person", "both"):
+        person = PersonDetector.from_config(config.person)
+    return motion, person
+
+
+def _background_differ(
+    background: np.ndarray | BackgroundModel, config: PetrifyConfig, live: bool
+) -> BackgroundDiffer | None:
+    """Build the background differ against the locked image or the online model, or None.
+
+    Logs the differ's thresholds, or :data:`NO_BG_DIFF_LIVE_WARNING` when it is
+    off on a live source.
+    """
+    if config.background_diff is None:
+        if live:
+            logger.warning(NO_BG_DIFF_LIVE_WARNING)
+        return None
+    if isinstance(background, np.ndarray):
+        bg_differ = BackgroundDiffer.from_config(background, config.background_diff)
+    else:
+        bg_differ = BackgroundDiffer.from_model(background, config.background_diff)
+    logger.info(
+        "BackgroundDiffer enabled: pixel_threshold=%d area_threshold=%d",
+        bg_differ.pixel_threshold,
+        bg_differ.area_threshold,
+    )
+    return bg_differ
+
+
+def _requires_differ(
+    background: np.ndarray | BackgroundModel, differ: BackgroundDiffer | None
+) -> bool:
+    """``require_background_diff`` for the erase mode: True exactly with a model-backed differ."""
+    return differ is not None and not isinstance(background, np.ndarray)
+
+
+def _build_components(source: Source, config: PetrifyConfig) -> tuple[_Components, int | None]:
+    """Build the detectors, ROI stage, background and mode at startup.
+
+    Same order as :func:`run_file`: detectors, ROI, background, then the
+    background differ. Returns the components and the locked background's index.
+    """
+    motion, person = _frame_detectors(config)
+    logger.info("Detector mode: %s", config.detector)
+    roi_stage = _roi_stage(source, config)
+    background, bg_idx = _background_for(source, config)
+    differ = _background_differ(background, config, source.info.live)
+    mode = EraseMode(background, require_background_diff=_requires_differ(background, differ))
+    components = _Components(config, motion, person, differ, background, mode, roi_stage)
+    return components, bg_idx
+
+
+def _rebuild(old: _Components, new: PetrifyConfig) -> tuple[_Components, dict[str, Any]]:
+    """Return the components for ``new`` and the :meth:`Engine.reconfigure` arguments.
+
+    Only what changed is rebuilt; an unchanged detector is reused (the engine
+    still resets every detector when the detector list changes). The background
+    model or image is always kept, and a model-backed differ is rebuilt from that
+    same model. The erase mode is replaced, around the same background model,
+    whenever its ``require_background_diff`` must change, so the flag always
+    matches whether a model-backed differ is in the detector list. At runtime the
+    ROI is either a manual box or disabled. Raises ``ValueError`` for an invalid
+    combination; nothing is installed then.
+    """
+    cfg = old.config
+    motion: MotionDetector | None = None
+    if new.detector in ("motion", "both"):
+        motion = old.motion
+        if motion is None or new.motion != cfg.motion:
+            motion = MotionDetector.from_config(new.motion)
+    person: PersonDetector | None = None
+    if new.detector in ("person", "both"):
+        person = old.person
+        if person is None or new.person != cfg.person:
+            person = PersonDetector.from_config(new.person)
+    differ = old.differ
+    if new.background_diff != cfg.background_diff:
+        differ = None
+        if new.background_diff is not None:
+            if isinstance(old.background, np.ndarray):
+                differ = BackgroundDiffer.from_config(old.background, new.background_diff)
+            else:
+                differ = BackgroundDiffer.from_model(old.background, new.background_diff)
+    mode = old.mode
+    require = _requires_differ(old.background, differ)
+    if require != mode.require_background_diff:
+        mode = EraseMode(old.mode.model, require_background_diff=require)
+    roi_stage = old.roi_stage
+    if new.roi != cfg.roi:
+        roi_stage = RoiOverlay(new.roi.box if new.roi.mode == "manual" else None)
+
+    built = _Components(new, motion, person, differ, old.background, mode, roi_stage)
+    kwargs: dict[str, Any] = {}
+    if [id(d) for d in built.detectors] != [id(d) for d in old.detectors]:
+        kwargs["detectors"] = built.detectors
+    if mode is not old.mode:
+        kwargs["mode"] = mode
+    if roi_stage is not old.roi_stage:
+        kwargs["stages"] = [roi_stage]
+    if new.engine != cfg.engine:
+        kwargs["config"] = new.engine
+    return built, kwargs
+
+
+def _apply_pending(
+    engine: Engine, components: _Components, control: RunControl, live: bool
+) -> _Components:
+    """Apply the latest config the control accepted, if any; return the components in use.
+
+    A ``ValueError`` from rebuilding or from :meth:`Engine.reconfigure` (an
+    invalid combination) keeps the old configuration running: the message goes
+    to the control and a warning is logged. Any other error propagates.
+    """
+    new = control.take_pending()
+    if new is None:
+        return components
+    try:
+        built, kwargs = _rebuild(components, new)
+        if kwargs:
+            engine.reconfigure(**kwargs)
+    except ValueError as exc:
+        if not engine.is_open:
+            raise  # Writing the tail failed and aborted the engine: not a bad setting.
+        logger.warning("The new settings were not applied, the previous ones stay: %s", exc)
+        control.report_rejected(str(exc))
+        return components
+    if live and new.background_diff is None and components.config.background_diff is not None:
+        logger.warning(NO_BG_DIFF_LIVE_WARNING)
+    if kwargs:
+        logger.info("Settings changed at a frame boundary: %s", ", ".join(sorted(kwargs)))
+    control.report_applied(new)
+    return built
+
+
+# ---------------------------------------------------------------------------
+# Run state for the web page
+# ---------------------------------------------------------------------------
+
+
+def _engine_stats(engine: Engine) -> EngineStats:
+    """Return a copy of the engine's running counters.
+
+    ``Engine`` returns its stats only from :meth:`Engine.close`; the page needs
+    them after every frame, so this reads the private counters (read only).
+    """
+    stats = getattr(engine, "_stats", None)
+    return dataclasses.replace(stats) if isinstance(stats, EngineStats) else EngineStats()
+
+
+class _Publisher:
+    """Builds :class:`~petrify.server.control.RunSnapshot` values and publishes them."""
+
+    def __init__(self, control: RunControl, source: Source) -> None:
+        from petrify.sources.file import display_spec  # noqa: PLC0415
+
+        self._control = control
+        self._source = source
+        uri = source.info.uri
+        self._uri = display_spec(uri) if uri else None
+        self._config: PetrifyConfig | None = None
+        self._config_dict: dict[str, Any] = {}
+        self._components: _Components | None = None
+        self._engine: Engine | None = None
+        self._stats = EngineStats()
+        self._ended = False
+
+    def attach(self, components: _Components, engine: Engine | None = None) -> None:
+        """Use ``components`` (and ``engine``, when given) for the next snapshots."""
+        self._components = components
+        if engine is not None:
+            self._engine = engine
+
+    def publish(self, *, running: bool = True, stats: EngineStats | None = None) -> None:
+        """Publish the current state; ``running=False`` marks the run as ended (once)."""
+        from petrify.server.control import (  # noqa: PLC0415
+            BackgroundState,
+            RunSnapshot,
+            RunStats,
+            RunTimings,
+            SourceFacts,
+            config_to_dict,
+        )
+
+        if self._ended:
+            return
+        components = self._components
+        config = components.config if components is not None else self._control.applied
+        if config is not self._config:
+            self._config = config
+            self._config_dict = config_to_dict(config)
+        engine = self._engine
+        if stats is not None:
+            self._stats = stats
+        elif engine is not None:
+            self._stats = _engine_stats(engine)
+        timings = RunTimings()
+        if engine is not None:
+            t = engine.timings
+            timings = RunTimings(
+                detect_mean_ms=t.detect.mean_ms,
+                detect_last_ms=t.detect.last_ms,
+                render_mean_ms=t.render.mean_ms,
+                render_last_ms=t.render.last_ms,
+                write_mean_ms=t.write.mean_ms,
+                write_last_ms=t.write.last_ms,
+                fps=t.frames_per_second,
+            )
+        background = BackgroundState(strategy=config.background.strategy)
+        roi = None
+        if components is not None:
+            model = components.mode.model
+            try:
+                ready = model.current() is not None
+            except Exception:  # noqa: BLE001 (a failing model is simply not ready)
+                ready = False
+            background = BackgroundState(
+                strategy=config.background.strategy,
+                ready=ready,
+                rejected=int(getattr(model, "rejected", 0) or 0),
+            )
+            roi = getattr(components.roi_stage, "roi", None)
+        info = self._source.info
+        self._control.publish(
+            RunSnapshot(
+                config=self._config_dict,
+                stats=RunStats(**dataclasses.asdict(self._stats)),
+                timings=timings,
+                source=SourceFacts(
+                    uri=self._uri,
+                    width=info.width,
+                    height=info.height,
+                    fps=float(info.fps),
+                    live=info.live,
+                    dropped=int(getattr(self._source, "dropped", 0) or 0),
+                ),
+                background=background,
+                roi=roi,
+                running=running,
+                ended=not running,
+            )
+        )
+        if not running:
+            self._ended = True
+
+
+# ---------------------------------------------------------------------------
+# Raw preview tap (opt-in) and realtime pacing
+# ---------------------------------------------------------------------------
+
+RAW_PREVIEW_WARNING = (
+    "Raw preview enabled (--web-raw-preview): the UNPROCESSED feed is exposed to the "
+    "local web page. Anyone with the page link sees the original frames."
+)
+
+
+def _expose_unprocessed_frame(raw_preview: MjpegSink, frame: Frame) -> None:
+    """Hand an UNPROCESSED input frame to the opt-in raw preview sink.
+
+    This is the only place in petrify where an unprocessed frame is given to an
+    output. It is reached only when the caller of :func:`run_stream` passed a
+    ``raw_preview`` sink explicitly, and that sink is never in the engine's sink
+    list.
+    """
+    raw_preview.write(frame.image, frame.meta)
+
+
+class _RawTap:
+    """Opens, feeds and closes the raw preview sink; a failure only turns the tap off."""
+
+    def __init__(self, sink: MjpegSink) -> None:
+        self._sink = sink
+        self._open = False
+
+    def open(self, info: Any) -> None:
+        try:
+            self._sink.open(info)
+            self._open = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("The raw preview could not start and is off: %r", exc)
+
+    def __call__(self, frame: Frame) -> None:
+        if not self._open:
+            return
+        try:
+            _expose_unprocessed_frame(self._sink, frame)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("The raw preview failed and is off for the rest of the run: %r", exc)
+            self.close()
+
+    def close(self) -> None:
+        self._open = False
+        try:
+            self._sink.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("The raw preview failed to close: %r", exc)
+
+
+class _Pacer:
+    """Wait until ``start + frame.timestamp`` so a file is processed at its own speed.
+
+    The first frame sets the start. Each wait is cut into short sleeps so that a
+    stop request ends it at once; a Ctrl-C raises from the sleep as usual.
+    """
+
+    _SLICE = 0.05
+
+    def __init__(
+        self,
+        clock: Callable[[], float],
+        sleep: Callable[[float], None],
+        should_stop: Callable[[], bool],
+    ) -> None:
+        self._clock = clock
+        self._sleep = sleep
+        self._should_stop = should_stop
+        self._origin: float | None = None
+
+    def __call__(self, frame: Frame) -> None:
+        if self._origin is None:
+            self._origin = self._clock() - frame.timestamp
+            return
+        target = self._origin + frame.timestamp
+        while not self._should_stop():
+            remaining = target - self._clock()
+            if remaining <= 0:
+                return
+            self._sleep(min(remaining, self._SLICE))
+
+
 def run_stream(
     source: Source,
     config: PetrifyConfig,
@@ -899,6 +1280,12 @@ def run_stream(
     observer: Callable[[FrameTrace], None] | None = None,
     sinks: Sequence[Sink] | None = None,
     stop: Callable[[], bool] | None = None,
+    web_sink: MjpegSink | None = None,
+    raw_preview: MjpegSink | None = None,
+    control: RunControl | None = None,
+    realtime: bool = False,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> RunReport:
     """Run the streaming engine on any source and write to the selected outputs.
 
@@ -907,18 +1294,35 @@ def run_stream(
     background differ. On a file source with the locked background and whole-clip
     ROI detection the written frames are exactly the ones :func:`run_file` writes.
 
-    The run stops at the end of the source, when ``stop()`` returns True or a
-    preview window asks to stop (both checked after each frame), or on Ctrl-C for a
-    live source; the lookahead tail is still written and the outputs are
-    finalized. A ``KeyboardInterrupt`` on a non-live source aborts the outputs and
-    propagates. Any other error aborts the outputs and propagates, except on a live
-    source where the outputs written so far are finalized first (see :func:`_drive`).
-    The source is always closed.
+    The run stops at the end of the source, when ``stop()`` returns True,
+    ``control.stop_requested`` is set, or a preview window asks to stop (all
+    checked after each frame), or on Ctrl-C for a live source; the lookahead tail
+    is still written and the outputs are finalized. A ``KeyboardInterrupt`` on a
+    non-live source aborts the outputs and propagates. Any other error aborts the
+    outputs and propagates, except on a live source where the outputs written so
+    far are finalized first (see :func:`_drive`). The source is always closed.
+
+    Web page support (all optional):
+
+    - ``web_sink`` is the processed feed for the local web page. It is added to
+      the sinks and counts as an output.
+    - ``control`` links the run to the page: after each frame the latest config
+      it accepted is applied at that frame boundary (see :func:`_apply_pending`),
+      and a snapshot is published after every frame, plus a final one with
+      ``running=False`` on every exit path.
+    - ``raw_preview`` receives every INPUT frame before it is processed (see
+      :func:`_expose_unprocessed_frame`). Pass it only when the user asked for it.
+    - ``realtime=True`` on a non-live source processes frames no faster than
+      their timestamps (``clock`` and ``sleep`` do the pacing). It changes no
+      output frame. It is ignored on a live source.
 
     Raises ``ValueError`` when ``outputs.file`` is the input file, or one of the
     images of an image folder source, and :class:`FfmpegNotFoundError` before any
     processing when the file output is built here and FFmpeg is missing.
     """
+    publisher = _Publisher(control, source) if control is not None else None
+    raw_tap = _RawTap(raw_preview) if raw_preview is not None else None
+    final_stats: EngineStats | None = None
     try:
         if outputs.file is not None and output_overwrites_input(source, outputs.file):
             raise ValueError("The output file is the input; choose another output path")
@@ -930,45 +1334,41 @@ def run_stream(
         if sinks is not None:
             sink_list = list(sinks)
         else:
-            if not outputs.selected:
+            if not outputs.selected and web_sink is None:
                 raise ValueError(
-                    "At least one output is required: a file, the virtual camera, or the preview"
+                    "At least one output is required: a file, the virtual camera, the "
+                    "preview, or the web page"
                 )
             sink_list = _build_sinks(source, config, outputs)
+        if web_sink is not None:
+            sink_list.append(web_sink)
         if not sink_list:
             raise ValueError("At least one sink is required")
         previews = [s for s in sink_list if isinstance(s, PreviewSink)]
+        if raw_tap is not None:
+            logger.warning(RAW_PREVIEW_WARNING)
 
-        detectors: list[Detector] = []
-        if config.detector in ("motion", "both"):
-            detectors.append(MotionDetector.from_config(config.motion))
-        if config.detector in ("person", "both"):
-            detectors.append(PersonDetector.from_config(config.person))
-        logger.info("Detector mode: %s", config.detector)
-
-        roi_stage = _roi_stage(source, config)
-        background, bg_idx = _background_for(source, config)
-        model_backed = False
-        if config.background_diff is not None:
-            if isinstance(background, np.ndarray):
-                bg_differ = BackgroundDiffer.from_config(background, config.background_diff)
-            else:
-                bg_differ = BackgroundDiffer.from_model(background, config.background_diff)
-                model_backed = True
-            detectors.append(bg_differ)
-            logger.info(
-                "BackgroundDiffer enabled: pixel_threshold=%d area_threshold=%d",
-                bg_differ.pixel_threshold,
-                bg_differ.area_threshold,
-            )
-        elif source.info.live:
-            logger.warning(NO_BG_DIFF_LIVE_WARNING)
-        mode = EraseMode(background, require_background_diff=model_backed)
+        components, bg_idx = _build_components(source, config)
+        live = source.info.live
 
         def should_stop() -> bool:
             if stop is not None and stop():
                 return True
+            if control is not None and control.stop_requested:
+                return True
             return any(p.stop_requested for p in previews)
+
+        hooks: list[Callable[[Frame], None]] = []
+        if realtime and not live:
+            hooks.append(_Pacer(clock, sleep, should_stop))
+        elif realtime:
+            logger.info("Realtime pacing is ignored on a live source")
+        if raw_tap is not None:
+            hooks.append(raw_tap)
+
+        def before_step(frame: Frame) -> None:
+            for hook in hooks:
+                hook(frame)
 
         with tqdm(
             total=source.info.frame_count or None,
@@ -982,18 +1382,47 @@ def run_stream(
                 if observer is not None:
                     observer(trace)
 
-            stages: list[Stage] = [roi_stage]
-            engine = Engine(detectors, mode, stages, sink_list, config.engine, on_frame)
-            stats, interrupted = _drive(engine, source, should_stop)
+            stages: list[Stage] = [components.roi_stage]
+            engine = Engine(
+                components.detectors, components.mode, stages, sink_list, config.engine, on_frame
+            )
+            after_step: Callable[[], None] | None = None
+            if control is not None and publisher is not None:
+                publisher.attach(components, engine)
+                publisher.publish(running=True)
+                ctl, pub = control, publisher
+
+                def after_step() -> None:
+                    nonlocal components
+                    components = _apply_pending(engine, components, ctl, live)
+                    pub.attach(components)
+                    pub.publish(running=True)
+
+            if raw_tap is not None:
+                raw_tap.open(source.info)
+            stats, interrupted = _drive(
+                engine,
+                source,
+                should_stop,
+                before_step if hooks else None,
+                after_step,
+            )
+            final_stats = stats
         dropped = int(getattr(source, "dropped", 0) or 0)
     finally:
-        source.close()
+        try:
+            source.close()
+        finally:
+            if raw_tap is not None:
+                raw_tap.close()
+            if publisher is not None:
+                publisher.publish(running=False, stats=final_stats)
 
     _log_summary(stats, dropped)
     return RunReport(
         stats=stats,
         background_index=bg_idx,
-        roi=roi_stage.roi,
+        roi=getattr(components.roi_stage, "roi", None),
         dropped_frames=dropped,
         interrupted=interrupted,
     )

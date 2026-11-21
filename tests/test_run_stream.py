@@ -43,6 +43,7 @@ from petrify.pipeline import (
     run_file,
     run_stream,
 )
+from petrify.server.control import RunControl, RunSnapshot
 from petrify.sinks import FfmpegPipeSink, PreviewSink, ThreadedSink, VirtualCamSink
 from petrify.sources import FileSource, ImageFolderSource
 
@@ -966,3 +967,546 @@ def test_d5_cli_exits_1_for_missing_ffmpeg_and_2_for_missing_input(
         assert petrify.cli.main(["run", "--source", str(missing), "--output",
                                  str(tmp_path / "o.mp4")]) == 2
     assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Web page support: RunControl, raw preview tap, realtime pacing (P3-3)
+# ---------------------------------------------------------------------------
+
+QUIET = Scene(total=200, enter=10_000, stand=10_000, leave=10_000, gone=10_000)
+
+
+class HookSource(FakeSource):
+    """A fake source that calls ``hooks[i]()`` just before it yields frame ``i``."""
+
+    def __init__(self, scene: Scene | None = None, *, hooks: dict[int, Callable[[], None]],
+                 live: bool = True, fail_at: int | None = None,
+                 interrupt_at: int | None = None) -> None:
+        super().__init__(scene, live=live, interrupt_at=interrupt_at)
+        self.hooks = hooks
+        self.fail_at = fail_at
+
+    def __iter__(self) -> Iterator[Frame]:
+        for i in range(self.scene.total):
+            if i == self.interrupt_at:
+                raise KeyboardInterrupt
+            if i == self.fail_at:
+                raise OSError("camera unplugged")
+            hook = self.hooks.get(i)
+            if hook is not None:
+                hook()
+            img = self.scene.image(i)
+            self.yielded.append(img)
+            yield Frame(image=img, index=i, timestamp=i / FPS, source=self.info)
+
+
+class RecordingControl(RunControl):
+    """A RunControl that keeps every published snapshot."""
+
+    def __init__(self, config: PetrifyConfig) -> None:
+        super().__init__(config, (W, H))
+        self.published: list[RunSnapshot] = []
+
+    def publish(self, snapshot: RunSnapshot) -> None:
+        self.published.append(snapshot)
+        super().publish(snapshot)
+
+
+@pytest.fixture
+def fake_person_check() -> Iterator[None]:
+    with mock.patch.object(pipeline, "person_free", side_effect=_fake_person_free):
+        yield
+
+
+def _submit_at(control: RunControl, patch: dict[str, Any]) -> Callable[[], None]:
+    return lambda: control.submit(patch)
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_web_change_is_applied_between_two_frames_with_the_freeze_rule() -> None:
+    config = _live_config("calibrate")
+    control = RecordingControl(config)
+    src = HookSource(QUIET, hooks={100: _submit_at(control, {"roi": [0, 0, 16, 16]})})
+    sink = ListSink()
+    traces: list[FrameTrace] = []
+    calls: list[int] = []
+    real = pipeline.Engine.reconfigure
+
+    def spy(self: Any, **kwargs: Any) -> Any:
+        calls.append(len(src.yielded))
+        return real(self, **kwargs)
+
+    with mock.patch.object(pipeline.Engine, "reconfigure", spy):
+        report = run_stream(src, config, OutputConfig(), sinks=[sink], control=control,
+                            observer=traces.append)
+    # Taken after step(100), applied before frame 101 was read.
+    assert calls == [101]
+    assert report.stats.reconfigurations == 1
+    assert report.roi == (0, 0, 16, 16)
+    kinds = [_kind(t) for t in traces]
+    # Lookahead 3: the buffered tail (98..100) and one lookahead window after the
+    # switch (101..103) are frozen; the quiet scene passes through around it.
+    assert kinds[90:98] == ["pass"] * 8
+    assert kinds[98:104] == ["frozen"] * 6
+    assert kinds[104:120] == ["pass"] * 16
+    assert len(sink.images) == QUIET.total
+    final = control.snapshot()
+    assert final.config["roi"]["mode"] == "manual"
+    assert final.roi == (0, 0, 16, 16)
+    assert final.stats.reconfigurations == 1
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_web_snapshot_reflects_the_applied_config_only_after_the_switch() -> None:
+    config = _live_config("calibrate")
+    control = RecordingControl(config)
+    src = HookSource(QUIET, hooks={80: _submit_at(control, {"engine": {"lookahead": 6}})})
+    run_stream(src, config, OutputConfig(), sinks=[ListSink()], control=control)
+    lookaheads = [s.config["engine"]["lookahead"] for s in control.published]
+    # One snapshot before the first frame, one per frame, one final.
+    assert len(control.published) == QUIET.total + 2
+    switch = lookaheads.index(6)
+    assert set(lookaheads[:switch]) == {3}
+    assert set(lookaheads[switch:]) == {6}
+    # The snapshot published after step(80) is the first with the new value.
+    assert switch == 1 + 80
+    assert control.published[switch - 1].stats.reconfigurations == 0
+    assert control.published[switch].stats.reconfigurations == 1
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_web_background_model_is_kept_across_reconfigurations() -> None:
+    config = _live_config("calibrate")
+    control = RunControl(config, (W, H))
+    patches = {
+        60: {"background_diff": {"enabled": False}},
+        90: {"motion": {"threshold": 200}},
+        120: {"background_diff": {"enabled": True, "pixel_threshold": 30}},
+    }
+    hooks = {i: _submit_at(control, p) for i, p in patches.items()}
+    built: list[Any] = []
+    real_build = pipeline._build_components
+    real_rebuild = pipeline._rebuild
+
+    def spy_build(*args: Any) -> Any:
+        components, idx = real_build(*args)
+        built.append(components)
+        return components, idx
+
+    def spy_rebuild(old: Any, new: Any) -> Any:
+        components, kwargs = real_rebuild(old, new)
+        built.append(components)
+        return components, kwargs
+
+    with (
+        mock.patch.object(pipeline, "_build_components", spy_build),
+        mock.patch.object(pipeline, "_rebuild", spy_rebuild),
+    ):
+        report = run_stream(HookSource(QUIET, hooks=hooks), config, OutputConfig(),
+                            sinks=[ListSink()], control=control)
+    assert report.stats.reconfigurations == 3
+    first = built[0]
+    assert isinstance(first.background, pipeline.CalibratedBackground)
+    for components in built[1:]:
+        assert components.background is first.background
+        assert components.mode.model is first.background
+    # The re-enabled differ compares against that same model.
+    assert built[-1].differ is not None
+    assert built[-1].differ._model is first.background
+
+
+def _model_backed(components: Any) -> bool:
+    return components.differ is not None and not isinstance(components.background, np.ndarray)
+
+
+def test_rebuild_keeps_require_background_diff_in_step_with_the_differ() -> None:
+    config = _live_config("calibrate")
+    components, _ = pipeline._build_components(FakeSource(), config)
+    assert components.mode.require_background_diff is True
+    off_cfg = dataclasses.replace(config, background_diff=None)
+    off, kwargs = pipeline._rebuild(components, off_cfg)
+    assert off.differ is None
+    assert off.mode.require_background_diff is False  # Never True without a differ.
+    assert kwargs["mode"] is off.mode and kwargs["detectors"] == off.detectors
+    on, kwargs = pipeline._rebuild(off, config)
+    assert on.differ is not None
+    assert on.mode.require_background_diff is True  # Never False with a model differ.
+    assert on.mode.model is components.mode.model
+    # A threshold change keeps the flag and the mode; only the differ is rebuilt.
+    tuned_cfg = dataclasses.replace(
+        config, background_diff=dataclasses.replace(config.background_diff, area_threshold=9)
+    )
+    tuned, kwargs = pipeline._rebuild(on, tuned_cfg)
+    assert tuned.mode is on.mode and "mode" not in kwargs
+    assert tuned.differ is not on.differ and tuned.motion is on.motion
+
+
+def test_rebuild_with_a_locked_image_never_requires_the_differ(clip: Path) -> None:
+    source = FileSource(clip)
+    try:
+        components, _ = pipeline._build_components(
+            source, PetrifyConfig(encode=ENCODE, roi=RoiConfig(mode="disabled"))
+        )
+    finally:
+        source.close()
+    assert isinstance(components.background, np.ndarray)
+    assert components.mode.require_background_diff is False
+    off, _ = pipeline._rebuild(
+        components, dataclasses.replace(components.config, background_diff=None)
+    )
+    on, _ = pipeline._rebuild(off, components.config)
+    assert off.mode.require_background_diff is on.mode.require_background_diff is False
+    assert on.differ is not None and on.differ._model is None
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_web_differ_off_then_on_never_blacks_quiet_frames_nor_passes_unchecked() -> None:
+    config = _live_config("calibrate")
+    control = RunControl(config, (W, H))
+    # A detector change resets the detectors and restarts the 50-frame cold start.
+    scene = dataclasses.replace(QUIET, total=400)
+    off_at, on_at = 90, 220
+    hooks = {
+        off_at: _submit_at(control, {"background_diff": {"enabled": False}}),
+        on_at: _submit_at(control, {"background_diff": {"enabled": True}}),
+    }
+    checked: set[int] = set()
+    real_detect = pipeline.BackgroundDiffer.detect
+
+    def spy_detect(self: Any, frame: Frame) -> Any:
+        result = real_detect(self, frame)
+        if result.background_diff is not None:
+            checked.add(frame.index)
+        return result
+
+    invariant: list[bool] = []
+    real_apply = pipeline._apply_pending
+
+    def spy_apply(engine: Any, components: Any, ctl: Any, live: bool) -> Any:
+        result = real_apply(engine, components, ctl, live)
+        invariant.append(result.mode.require_background_diff == _model_backed(result))
+        invariant.append(engine.mode is result.mode)
+        return result
+
+    traces: list[FrameTrace] = []
+    with (
+        mock.patch.object(pipeline.BackgroundDiffer, "detect", spy_detect),
+        mock.patch.object(pipeline, "_apply_pending", spy_apply),
+    ):
+        report = run_stream(HookSource(scene, hooks=hooks), config, OutputConfig(),
+                            sinks=[ListSink()], control=control, observer=traces.append)
+    assert report.stats.reconfigurations == 2
+    assert all(invariant)
+    kinds = [_kind(t) for t in traces]
+    first_ok = next(k for k, kind in enumerate(kinds) if kind != "black")
+    # Once the background is ready no quiet frame is ever black, across both switches.
+    assert "black" not in kinds[first_ok:]
+    assert report.stats.failed_closed == first_ok
+    # Frames pass again between and after the switches.
+    assert "pass" in kinds[off_at + 60 : on_at]
+    assert "pass" in kinds[on_at + 60 :]
+    # With the model-backed differ in the list, every passed frame was checked by it.
+    for k, kind in enumerate(kinds):
+        if kind == "pass" and not off_at + 1 <= k <= on_at:
+            assert k in checked, k
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_web_turning_the_differ_off_on_a_live_source_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _live_config("calibrate")
+    control = RunControl(config, (W, H))
+    hooks = {60: _submit_at(control, {"background_diff": {"enabled": False}})}
+    with caplog.at_level(logging.WARNING, logger="petrify.pipeline"):
+        run_stream(HookSource(Scene(total=100), hooks=hooks), config, OutputConfig(),
+                   sinks=[ListSink()], control=control)
+    assert _warnings(caplog).count(NO_BG_DIFF_LIVE_WARNING) == 1
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_web_invalid_combination_keeps_the_old_config_running(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _live_config("calibrate")
+    control = RecordingControl(config)
+    hooks = {70: _submit_at(control, {"motion": {"threshold": 100}})}
+    real = pipeline.MotionDetector.from_config
+    built = 0
+
+    def from_config(cfg: Any) -> Any:
+        nonlocal built
+        built += 1
+        if built > 1:
+            raise ValueError("this combination is not supported")
+        return real(cfg)
+
+    sink = ListSink()
+    with (
+        caplog.at_level(logging.WARNING, logger="petrify.pipeline"),
+        mock.patch.object(pipeline.MotionDetector, "from_config", side_effect=from_config),
+    ):
+        report = run_stream(HookSource(QUIET, hooks=hooks), config, OutputConfig(),
+                            sinks=[sink], control=control)
+    assert len(sink.images) == QUIET.total  # The run went on to the end.
+    assert report.stats.reconfigurations == 0
+    final = control.snapshot()
+    assert final.last_error == "this combination is not supported"
+    assert final.config["motion"]["threshold"] == 500
+    assert control.applied.motion.threshold == 500
+    assert any("were not applied" in m for m in _warnings(caplog))
+    # A later valid change is based on the running config and is applied.
+    assert control.submit({"engine": {"lookahead": 4}}).motion.threshold == 500
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_web_reconfigure_value_error_keeps_the_old_config() -> None:
+    config = _live_config("calibrate")
+    control = RunControl(config, (W, H))
+    hooks = {70: _submit_at(control, {"engine": {"lookahead": 5}})}
+    with mock.patch.object(pipeline.Engine, "reconfigure",
+                           side_effect=ValueError("no detector provides")):
+        report = run_stream(HookSource(QUIET, hooks=hooks), config, OutputConfig(),
+                            sinks=[ListSink()], control=control)
+    assert report.stats.frames == QUIET.total
+    assert control.snapshot().last_error == "no detector provides"
+    assert control.snapshot().config["engine"]["lookahead"] == 3
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_web_other_reconfigure_errors_follow_the_error_path() -> None:
+    config = _live_config("calibrate")
+    control = RunControl(config, (W, H))
+    hooks = {70: _submit_at(control, {"engine": {"lookahead": 5}})}
+    sink = ListSink()
+    with (
+        mock.patch.object(pipeline.Engine, "reconfigure", side_effect=OSError("disk full")),
+        pytest.raises(OSError, match="disk full"),
+    ):
+        run_stream(HookSource(QUIET, hooks=hooks), config, OutputConfig(), sinks=[sink],
+                   control=control)
+    # Live source: the outputs written so far are finalized, as for any live error.
+    assert (sink.closed, sink.aborted) == (1, 0)
+    assert control.snapshot().ended is True
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_web_stop_request_finalizes_the_outputs() -> None:
+    config = _live_config("calibrate")
+    control = RecordingControl(config)
+    src = HookSource(hooks={60: control.request_stop})
+    sink = ListSink()
+    report = run_stream(src, config, OutputConfig(), sinks=[sink], control=control)
+    assert len(src.yielded) == 61
+    assert len(sink.images) == report.stats.frames == 61  # The tail was written.
+    assert (sink.closed, sink.aborted) == (1, 0)
+    assert src.closed == 1
+    final = control.snapshot()
+    assert (final.running, final.ended) == (False, True)
+    assert final.stats.frames == 61
+
+
+def _final(control: RecordingControl) -> RunSnapshot:
+    assert control.published, "nothing was published"
+    last = control.published[-1]
+    assert (last.running, last.ended) == (False, True)
+    assert sum(1 for s in control.published if s.ended) == 1
+    return last
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_web_final_snapshot_on_normal_end() -> None:
+    config = _live_config("calibrate")
+    control = RecordingControl(config)
+    report = run_stream(FakeSource(Scene(total=80)), config, OutputConfig(),
+                        sinks=[ListSink()], control=control)
+    final = _final(control)
+    assert final.stats.frames == report.stats.frames == 80
+    assert all(s.running for s in control.published[:-1])
+    assert final.background.strategy == "calibrate" and final.background.ready
+    assert final.source == pipeline_source_facts()
+
+
+def pipeline_source_facts() -> Any:
+    from petrify.server.control import SourceFacts
+
+    return SourceFacts(uri="fake", width=W, height=H, fps=FPS, live=True, dropped=0)
+
+
+@pytest.mark.usefixtures("fake_person_check", "sigint_restored")
+def test_web_final_snapshot_on_interrupt() -> None:
+    config = _live_config("calibrate")
+    control = RecordingControl(config)
+    report = _no_interrupt(lambda: run_stream(
+        FakeSource(interrupt_at=50, dropped=4), config, OutputConfig(), sinks=[ListSink()],
+        control=control))
+    assert report.interrupted is True
+    final = _final(control)
+    assert final.stats.frames == 50
+    assert final.source.dropped == 4
+
+
+@pytest.mark.usefixtures("fake_person_check")
+@pytest.mark.parametrize("live", [True, False])
+def test_web_final_snapshot_on_error(live: bool) -> None:
+    config = _live_config("calibrate")
+    control = RecordingControl(config)
+    with pytest.raises(OSError, match="camera unplugged"):
+        run_stream(FailingSource(Scene(total=80), fail_at=40, live=live), config,
+                   OutputConfig(), sinks=[ListSink()], control=control)
+    final = _final(control)
+    assert final.stats.frames == (40 if live else 40 - 3)
+
+
+def test_web_final_snapshot_when_the_run_cannot_start() -> None:
+    config = _live_config("calibrate")
+    control = RecordingControl(config)
+    with pytest.raises(ValueError, match="At least one output"):
+        run_stream(FakeSource(), config, OutputConfig(), control=control)
+    final = _final(control)
+    assert final.stats.frames == 0
+
+
+def test_web_sink_counts_as_an_output_and_gets_processed_frames() -> None:
+    web = ListSink(critical=False)
+    config = _live_config("calibrate")
+    with mock.patch.object(pipeline, "person_free", side_effect=_fake_person_free):
+        report = run_stream(FakeSource(Scene(total=60)), config, OutputConfig(), web_sink=web)
+    assert len(web.images) == report.stats.frames == 60
+    assert (web.closed, web.aborted) == (1, 0)
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[tuple[int, float]] = []
+        self.source: FakeSource | None = None
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        assert seconds > 0
+        self.sleeps.append((len(self.source.yielded) if self.source else -1, seconds))
+        self.now += seconds
+
+
+def test_realtime_paces_a_non_live_source_and_changes_no_output() -> None:
+    config = _live_config("calibrate")
+    fake = _FakeClock()
+    src = FakeSource(Scene(total=40), live=False)
+    fake.source = src
+    paced = ListSink()
+    with mock.patch.object(pipeline, "person_free", side_effect=_fake_person_free):
+        run_stream(src, config, OutputConfig(), sinks=[paced], realtime=True,
+                   clock=fake.clock, sleep=fake.sleep)
+        plain = ListSink()
+        run_stream(FakeSource(Scene(total=40), live=False), config, OutputConfig(),
+                   sinks=[plain])
+    # Frame k waits until start + k / FPS: 1 / FPS per frame after the first.
+    waited: dict[int, float] = {}
+    for yielded, seconds in fake.sleeps:
+        waited[yielded - 1] = waited.get(yielded - 1, 0.0) + seconds
+    assert sorted(waited) == list(range(1, 40))
+    assert all(abs(v - 1 / FPS) < 1e-9 for v in waited.values())
+    assert all(s <= 0.05 + 1e-12 for _, s in fake.sleeps)  # Short, interruptible slices.
+    assert len(paced.images) == len(plain.images) == 40
+    assert all(np.array_equal(a, b) for a, b in zip(paced.images, plain.images))
+
+
+def test_realtime_stop_ends_the_wait_at_once() -> None:
+    config = _live_config("calibrate")
+    fake = _FakeClock()
+    control = RunControl(config, (W, H))
+    # 10 s between frames: without the stop check the wait would take 200 slices.
+    class Slow(FakeSource):
+        def __iter__(self) -> Iterator[Frame]:
+            for i in range(5):
+                img = self.scene.image(i)
+                self.yielded.append(img)
+                yield Frame(image=img, index=i, timestamp=i * 10.0, source=self.info)
+
+    src = Slow(Scene(total=5), live=False)
+    fake.source = src
+
+    def sleep(seconds: float) -> None:
+        fake.sleep(seconds)
+        if len(fake.sleeps) == 3:
+            control.request_stop()
+
+    with mock.patch.object(pipeline, "person_free", side_effect=_fake_person_free):
+        run_stream(src, config, OutputConfig(), sinks=[ListSink()], realtime=True,
+                   clock=fake.clock, sleep=sleep, control=control)
+    assert len(fake.sleeps) == 3
+    assert len(src.yielded) == 2
+
+
+def test_realtime_is_ignored_on_a_live_source() -> None:
+    fake = _FakeClock()
+    with mock.patch.object(pipeline, "person_free", side_effect=_fake_person_free):
+        run_stream(FakeSource(Scene(total=30)), _live_config("calibrate"), OutputConfig(),
+                   sinks=[ListSink()], realtime=True, clock=fake.clock, sleep=fake.sleep)
+    assert fake.sleeps == []
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_raw_tap_gets_every_input_frame_and_never_reaches_the_engine_sinks(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    src = FakeSource()
+    processed = ListSink()
+    raw = ListSink(critical=False)
+    traces: list[FrameTrace] = []
+    engine_sinks: list[Any] = []
+    real_init = pipeline.Engine.__init__
+
+    def spy_init(self: Any, detectors: Any, mode: Any, stages: Any, sinks: Any,
+                 *args: Any, **kwargs: Any) -> None:
+        engine_sinks.extend(sinks)
+        real_init(self, detectors, mode, stages, sinks, *args, **kwargs)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="petrify.pipeline"),
+        mock.patch.object(pipeline.Engine, "__init__", spy_init),
+    ):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[processed],
+                   raw_preview=raw, observer=traces.append)  # type: ignore[arg-type]
+    assert raw not in engine_sinks and engine_sinks == [processed]
+    assert _warnings(caplog).count(pipeline.RAW_PREVIEW_WARNING) == 1
+    assert (raw.opened, raw.closed) == (1, 1)
+    assert len(raw.images) == len(src.yielded) == src.scene.total
+    assert all(np.array_equal(r, i) for r, i in zip(raw.images, src.yielded))
+    assert [m.index for m in raw.metas] == list(range(src.scene.total))
+    # The processed sink only ever got engine output: the subject never shows.
+    assert any(_shows_subject(r) for r in raw.images)
+    assert not any(_shows_subject(p) for p in processed.images)
+    kinds = [_kind(t) for t in traces]
+    for kind, out, inp in zip(kinds, processed.images, src.yielded):
+        expected = {"black": np.zeros_like(inp), "frozen": BACKGROUND, "pass": inp}[kind]
+        assert np.array_equal(out, expected)
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_no_raw_tap_unless_given(caplog: pytest.LogCaptureFixture) -> None:
+    calls: list[Any] = []
+    with (
+        caplog.at_level(logging.WARNING, logger="petrify.pipeline"),
+        mock.patch.object(pipeline, "_expose_unprocessed_frame",
+                          side_effect=lambda *a: calls.append(a)),
+    ):
+        run_stream(FakeSource(Scene(total=40)), _live_config("calibrate"), OutputConfig(),
+                   sinks=[ListSink()], control=RunControl(_live_config("calibrate"), (W, H)),
+                   web_sink=ListSink(critical=False))
+    assert calls == []
+    assert pipeline.RAW_PREVIEW_WARNING not in _warnings(caplog)
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_failing_raw_tap_only_turns_itself_off() -> None:
+    raw = ListSink(critical=False, fail_at=5)
+    sink = ListSink()
+    report = run_stream(FakeSource(Scene(total=60)), _live_config("calibrate"), OutputConfig(),
+                        sinks=[sink], raw_preview=raw)  # type: ignore[arg-type]
+    assert len(raw.images) == 5
+    assert len(sink.images) == report.stats.frames == 60
+    assert report.stats.sink_failures == 0

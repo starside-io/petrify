@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
+import socket
+import subprocess
+import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -657,3 +663,165 @@ def test_k2_run_hwaccel_help_is_accurate() -> None:
     )
     assert "intermediate file" not in run_help
     assert "raw frames" in run_help and "--codec" in run_help
+
+
+# ---------------------------------------------------------------------------
+# petrify run --web (P3-3)
+# ---------------------------------------------------------------------------
+
+_WEB_LINE = re.compile(r"http://127\.0\.0\.1:(\d+)/#token=([A-Za-z0-9_-]+)")
+
+
+def test_web_alone_is_a_valid_output() -> None:
+    config, outputs = _resolved(["--source", IN, "--web"])
+    assert not outputs.selected  # Not a file, virtual camera or preview ...
+    assert config.engine.lookahead == 10  # ... but the run resolves.
+
+
+def test_web_options_default() -> None:
+    args = _build_run_parser().parse_args(["--source", IN, "--output", OUT])
+    assert (args.web, args.web_port, args.web_raw_preview, args.realtime) == (
+        False, 8765, False, False)
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--source", IN, "--output", OUT, "--web-raw-preview"],
+         "--web-raw-preview requires --web"),
+        (["--source", IN, "--web", "--web-port", "70000"], "--web-port must be in 0..65535"),
+        (["--source", IN, "--web", "--web-port", "-1"], "--web-port must be in 0..65535"),
+        (["--source", IN], "--preview or --web"),
+    ],
+)
+def test_web_usage_errors(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str], argv: list[str],
+    message: str,
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run", *argv])
+    assert excinfo.value.code == 2
+    assert message in capsys.readouterr().err
+    run_stream.assert_not_called()
+
+
+def test_web_help_mentions_the_raw_feed_and_realtime(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["run", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "UNPROCESSED input feed" in out
+    assert "Ignored for live sources" in out
+    assert "0 picks a free port" in out
+
+
+def test_run_without_web_calls_run_stream_exactly_as_before(run_stream: mock.MagicMock) -> None:
+    assert main(["run", "--source", IN, "--output", OUT]) == 0
+    assert len(run_stream.call_args.args) == 3
+    assert run_stream.call_args.kwargs == {}
+
+
+def test_realtime_without_web_reaches_run_stream(run_stream: mock.MagicMock) -> None:
+    assert main(["run", "--source", IN, "--output", OUT, "--realtime"]) == 0
+    assert run_stream.call_args.kwargs == {"realtime": True}
+
+
+def _web_run(argv: list[str], capsys: pytest.CaptureFixture[str],
+             caplog: pytest.LogCaptureFixture) -> tuple[mock.MagicMock, str, str]:
+    seen: dict[str, Any] = {}
+
+    def fake_run_stream(source: Any, config: Any, outputs: Any, **kwargs: Any) -> RunReport:
+        # The server is up while the run is in progress.
+        seen["kwargs"] = kwargs
+        seen["threads"] = [t.name for t in threading.enumerate()]
+        return _report()
+
+    with (
+        caplog.at_level(logging.DEBUG),
+        mock.patch.object(petrify.pipeline, "run_stream", side_effect=fake_run_stream) as rs,
+        mock.patch.object(petrify.sources, "open_source", return_value=_StubSource()),
+    ):
+        assert main(["run", *argv]) == 0
+    err = capsys.readouterr().err
+    rs.seen = seen  # type: ignore[attr-defined]
+    return rs, err, caplog.text
+
+
+def test_web_startup_line_is_printed_once_and_is_the_only_place_of_the_token(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    from petrify.server.control import RunControl
+    from petrify.sinks.mjpeg import MjpegSink
+
+    rs, err, logs = _web_run(["--source", IN, "--web", "--web-port", "0"], capsys, caplog)
+    lines = [line for line in err.splitlines() if "#token=" in line]
+    assert len(lines) == 1
+    assert "gives control of this run to whoever has it" in lines[0]
+    match = _WEB_LINE.search(lines[0])
+    assert match is not None
+    port, token = int(match.group(1)), match.group(2)
+    assert port > 0 and len(token) >= 40
+    assert err.count(token) == 1
+    assert token not in logs
+    kwargs = rs.seen["kwargs"]  # type: ignore[attr-defined]
+    assert isinstance(kwargs["control"], RunControl)
+    assert isinstance(kwargs["web_sink"], MjpegSink)
+    assert kwargs["raw_preview"] is None
+    assert kwargs["realtime"] is False
+    assert "petrify-web" in rs.seen["threads"]  # type: ignore[attr-defined]
+    # The server was stopped when the run ended.
+    assert "petrify-web" not in [t.name for t in threading.enumerate()]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        assert s.connect_ex(("127.0.0.1", port)) != 0
+
+
+def test_web_raw_preview_and_realtime_reach_run_stream(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    from petrify.sinks.mjpeg import MjpegSink
+
+    rs, _, _ = _web_run(["--source", IN, "--web", "--web-port", "0", "--web-raw-preview",
+                         "--realtime"], capsys, caplog)
+    kwargs = rs.seen["kwargs"]  # type: ignore[attr-defined]
+    assert isinstance(kwargs["raw_preview"], MjpegSink)
+    assert kwargs["raw_preview"] is not kwargs["web_sink"]
+    assert kwargs["realtime"] is True
+
+
+def test_web_tokens_differ_per_run(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    _, first, _ = _web_run(["--source", IN, "--web", "--web-port", "0"], capsys, caplog)
+    _, second, _ = _web_run(["--source", IN, "--web", "--web-port", "0"], capsys, caplog)
+    a, b = _WEB_LINE.search(first), _WEB_LINE.search(second)
+    assert a is not None and b is not None and a.group(2) != b.group(2)
+
+
+def test_web_server_is_stopped_when_the_run_fails(capsys: pytest.CaptureFixture[str]) -> None:
+    with (
+        mock.patch.object(petrify.pipeline, "run_stream", side_effect=OSError("boom")),
+        mock.patch.object(petrify.sources, "open_source", return_value=_StubSource()),
+    ):
+        assert main(["run", "--source", IN, "--web", "--web-port", "0"]) == 1
+    assert "petrify-web" not in [t.name for t in threading.enumerate()]
+
+
+def test_missing_fastapi_is_a_clear_error(
+    run_stream: mock.MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    with mock.patch.dict(sys.modules, {"fastapi": None}):
+        assert main(["run", "--source", IN, "--web"]) == 1
+    assert "petrify[web]" in caplog.text
+    run_stream.assert_not_called()
+    petrify.sources.open_source.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_importing_the_cli_does_not_import_the_web_stack() -> None:
+    code = (
+        "import sys\n"
+        "import petrify, petrify.cli, petrify.pipeline, petrify.server, petrify.server.app\n"
+        "print(sorted(m for m in ('fastapi', 'uvicorn', 'starlette') if m in sys.modules))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         check=True)
+    assert out.stdout.strip() == "[]"

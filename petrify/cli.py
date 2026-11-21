@@ -21,9 +21,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import secrets
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from petrify import __version__
 
@@ -477,6 +478,9 @@ _RUN_HWACCEL_HELP = (
 
 _LIVE_KINDS = ("camera", "stream")
 
+# Default port of the --web page (on 127.0.0.1 only).
+_WEB_PORT = 8765
+
 
 def _build_run_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -569,6 +573,36 @@ def _build_run_parser() -> argparse.ArgumentParser:
             "build with GUI support)."
         ),
     )
+    out_group.add_argument(
+        "--web",
+        action="store_true",
+        default=False,
+        help=(
+            "Serve a local web page on 127.0.0.1 to watch the processed feed and change "
+            "the erase settings while the run is in progress (needs FastAPI and uvicorn: "
+            "pip install petrify[web]). The link is printed at start; it holds a "
+            "per-run token and gives control of the run to whoever has it."
+        ),
+    )
+    out_group.add_argument(
+        "--web-port",
+        type=int,
+        default=_WEB_PORT,
+        metavar="PORT",
+        dest="web_port",
+        help=f"Port of the web page on 127.0.0.1 (with --web); 0 picks a free port. Default: {_WEB_PORT}.",
+    )
+    out_group.add_argument(
+        "--web-raw-preview",
+        action="store_true",
+        default=False,
+        dest="web_raw_preview",
+        help=(
+            "Also show the UNPROCESSED input feed next to the processed one on the web "
+            "page (with --web). This exposes the original frames, people included, to "
+            "the local page. Off by default."
+        ),
+    )
 
     # -- Streaming engine ---------------------------------------------------
     engine_group = parser.add_argument_group("Streaming Engine")
@@ -596,6 +630,16 @@ def _build_run_parser() -> argparse.ArgumentParser:
         help=(
             "Per-frame time budget for detection plus rendering, in milliseconds. A "
             "frame over budget is written black. Default: no budget."
+        ),
+    )
+    engine_group.add_argument(
+        "--realtime",
+        action="store_true",
+        default=False,
+        help=(
+            "Process a video file or image folder no faster than its frame rate, so it "
+            "can be watched on the web page. It changes no output frame. Ignored for "
+            "live sources (camera:N and stream URLs), which are already real time."
         ),
     )
     # Rejected with a pointer to --lookahead; hidden from the help.
@@ -725,10 +769,16 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
         parser.error(str(exc))  # Holds only the redacted URL.
     live = kind in _LIVE_KINDS
 
-    if not (args.output or args.virtualcam or args.preview):
-        parser.error("at least one output is required: --output, --virtualcam or --preview")
+    if not (args.output or args.virtualcam or args.preview or args.web):
+        parser.error(
+            "at least one output is required: --output, --virtualcam, --preview or --web"
+        )
     if args.virtualcam_device is not None and not args.virtualcam:
         parser.error("--virtualcam-device requires --virtualcam")
+    if args.web_raw_preview and not args.web:
+        parser.error("--web-raw-preview requires --web")
+    if not 0 <= args.web_port <= 65535:
+        parser.error(f"--web-port must be in 0..65535, got {args.web_port}")
 
     if not (0.0 < args.downsample <= 1.0):
         parser.error(f"--downsample must be in (0, 1], got {args.downsample}")
@@ -843,6 +893,14 @@ def _run_main(argv: list[str]) -> int:
     from petrify.sources import display_spec, open_source  # noqa: PLC0415
 
     log = logging.getLogger(__name__)
+    if args.web:
+        from petrify.server.app import require_web  # noqa: PLC0415
+
+        try:
+            require_web()
+        except RuntimeError as exc:
+            log.error("%s", exc)
+            return 1
     try:
         source = open_source(args.source, fps=args.fps)
         if settings.outputs.file is not None and output_overwrites_input(
@@ -859,7 +917,12 @@ def _run_main(argv: list[str]) -> int:
         # Failed-closed frames still exit 0 (they are written black and logged), and
         # so does a live run ended with Ctrl-C: its outputs were finalized. A missing
         # FFmpeg is a fatal error (exit 1), not a missing input (exit 2).
-        run_stream(source, settings.config, settings.outputs)
+        if args.web:
+            _run_with_web(args, settings, source)
+        elif args.realtime:
+            run_stream(source, settings.config, settings.outputs, realtime=True)
+        else:
+            run_stream(source, settings.config, settings.outputs)
     except FileNotFoundError as exc:
         log.error("%s", exc)
         return 2
@@ -870,6 +933,49 @@ def _run_main(argv: list[str]) -> int:
         log.error("Fatal error: %s", exc, exc_info=args.verbose)
         return 1
     return 0
+
+
+def _run_with_web(args: argparse.Namespace, settings: _RunSettings, source: Any) -> None:
+    """Run the stream with the local web page: serve it on a thread, process on this one.
+
+    The processing loop stays on the calling (main) thread; the server runs on a
+    daemon thread and is stopped when the run ends for any reason. The process
+    does not wait after the run: the page then reports that the run has ended.
+    The link printed here is the only place the token is shown.
+    """
+    from petrify.pipeline import run_stream  # noqa: PLC0415
+    from petrify.server.app import create_app, serve_in_thread  # noqa: PLC0415
+    from petrify.server.control import RunControl  # noqa: PLC0415
+    from petrify.sinks.mjpeg import MjpegSink  # noqa: PLC0415
+
+    try:
+        token = secrets.token_urlsafe(32)
+        control = RunControl(settings.config, (source.info.width, source.info.height))
+        processed = MjpegSink()
+        raw = MjpegSink() if args.web_raw_preview else None
+        app = create_app(control, processed, token=token, raw=raw, port=args.web_port)
+        handle = serve_in_thread(app, args.web_port)
+    except BaseException:
+        source.close()
+        raise
+    try:
+        print(
+            f"Web page (this link gives control of this run to whoever has it): "
+            f"http://127.0.0.1:{handle.port}/#token={token}",
+            file=sys.stderr,
+            flush=True,
+        )
+        run_stream(
+            source,
+            settings.config,
+            settings.outputs,
+            web_sink=processed,
+            raw_preview=raw,
+            control=control,
+            realtime=args.realtime,
+        )
+    finally:
+        handle.stop()
 
 
 def _run_form_argv(argv: list[str]) -> list[str] | None:

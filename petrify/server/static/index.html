@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>petrify run</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1>petrify run</h1>
+  <p id="run-state" class="run-state" role="status" aria-live="polite">Connecting...</p>
+</header>
+
+<main>
+  <p id="token-missing" class="notice notice-error" hidden>
+    No access token found. Open the full link printed in the terminal when the run started.
+  </p>
+  <p id="ended-banner" class="notice" role="status" hidden>
+    The run has ended. The feed and the settings are no longer live.
+  </p>
+
+  <section class="feeds" aria-label="Video">
+    <figure class="feed">
+      <img id="stream-processed" alt="Processed feed (what the outputs receive)">
+      <figcaption>Processed feed (what the outputs receive)</figcaption>
+    </figure>
+    <figure id="raw-figure" class="feed feed-raw" hidden>
+      <img id="stream-raw" alt="Unprocessed feed, not anonymized">
+      <figcaption><strong>Unprocessed feed, not anonymized.</strong> Shown because the run was started with --web-raw-preview.</figcaption>
+    </figure>
+  </section>
+
+  <section aria-labelledby="status-title">
+    <h2 id="status-title">Status</h2>
+    <dl class="status">
+      <dt>Run</dt><dd id="st-running">-</dd>
+      <dt>Source</dt><dd id="st-source">-</dd>
+      <dt>Background</dt><dd id="st-background">-</dd>
+      <dt>Frames</dt><dd id="st-frames">-</dd>
+      <dt>Frozen</dt><dd id="st-frozen">-</dd>
+      <dt>Failed closed (black)</dt><dd id="st-failed">-</dd>
+      <dt>Over budget</dt><dd id="st-over-budget">-</dd>
+      <dt>Dropped by the source</dt><dd id="st-dropped">-</dd>
+      <dt>Output frame rate</dt><dd id="st-fps">-</dd>
+      <dt>Detect / render / write</dt><dd id="st-timings">-</dd>
+      <dt>Timestamp ROI in use</dt><dd id="st-roi">-</dd>
+      <dt>Settings changes applied</dt><dd id="st-reconfigurations">-</dd>
+      <dt>Last error</dt><dd id="st-error">None</dd>
+    </dl>
+  </section>
+
+  <section aria-labelledby="settings-title">
+    <h2 id="settings-title">Settings</h2>
+    <p class="notice">
+      Every change briefly freezes the output around the switch: the frames buffered at
+      that moment, and at least one lookahead window after it, show the background.
+      Changes are applied at the next frame boundary.
+    </p>
+
+    <form id="settings" class="settings" novalidate>
+      <fieldset>
+        <legend>Detector</legend>
+        <div class="field">
+          <label for="ctl-detector">Detector</label>
+          <select id="ctl-detector" data-field="detector" aria-describedby="err-ctl-detector">
+            <option value="motion">Motion (MOG2)</option>
+            <option value="person">Person (HOG)</option>
+            <option value="both">Both</option>
+          </select>
+          <span class="applied" id="applied-ctl-detector"></span>
+          <span class="error" id="err-ctl-detector" aria-live="polite"></span>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Motion detector</legend>
+        <div class="field">
+          <label for="ctl-motion-threshold">Motion area threshold (px, 0 to 10000000)</label>
+          <input id="ctl-motion-threshold" data-field="motion.threshold" data-type="int" type="number" min="0" max="10000000" step="1" inputmode="numeric" aria-describedby="err-ctl-motion-threshold">
+          <span class="applied" id="applied-ctl-motion-threshold"></span>
+          <span class="error" id="err-ctl-motion-threshold" aria-live="polite"></span>
+        </div>
+        <div class="field">
+          <label for="ctl-motion-var-threshold">MOG2 variance threshold (above 0, at most 1000)</label>
+          <input id="ctl-motion-var-threshold" data-field="motion.var_threshold" data-type="float" type="number" min="0" max="1000" step="any" inputmode="decimal" aria-describedby="err-ctl-motion-var-threshold">
+          <span class="applied" id="applied-ctl-motion-var-threshold"></span>
+          <span class="error" id="err-ctl-motion-var-threshold" aria-live="polite"></span>
+        </div>
+        <div class="field field-check">
+          <input id="ctl-motion-detect-shadows" data-field="motion.detect_shadows" data-type="bool" type="checkbox" aria-describedby="err-ctl-motion-detect-shadows">
+          <label for="ctl-motion-detect-shadows">Detect shadows</label>
+          <span class="applied" id="applied-ctl-motion-detect-shadows"></span>
+          <span class="error" id="err-ctl-motion-detect-shadows" aria-live="polite"></span>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Person detector</legend>
+        <div class="field">
+          <label for="ctl-person-min-confidence">Minimum confidence (0 to 10)</label>
+          <input id="ctl-person-min-confidence" data-field="person.min_confidence" data-type="float" type="number" min="0" max="10" step="any" inputmode="decimal" aria-describedby="err-ctl-person-min-confidence">
+          <span class="applied" id="applied-ctl-person-min-confidence"></span>
+          <span class="error" id="err-ctl-person-min-confidence" aria-live="polite"></span>
+        </div>
+        <div class="field">
+          <label for="ctl-person-min-box-area">Minimum box area (px, 0 to 10000000)</label>
+          <input id="ctl-person-min-box-area" data-field="person.min_box_area" data-type="int" type="number" min="0" max="10000000" step="1" inputmode="numeric" aria-describedby="err-ctl-person-min-box-area">
+          <span class="applied" id="applied-ctl-person-min-box-area"></span>
+          <span class="error" id="err-ctl-person-min-box-area" aria-live="polite"></span>
+        </div>
+        <div class="field">
+          <label for="ctl-person-scale">Pyramid scale (above 1, at most 2)</label>
+          <input id="ctl-person-scale" data-field="person.scale" data-type="float" type="number" min="1" max="2" step="any" inputmode="decimal" aria-describedby="err-ctl-person-scale">
+          <span class="applied" id="applied-ctl-person-scale"></span>
+          <span class="error" id="err-ctl-person-scale" aria-live="polite"></span>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Background differ</legend>
+        <div class="field field-check">
+          <input id="ctl-background-diff-enabled" data-field="background_diff.enabled" data-type="bool" type="checkbox" aria-describedby="err-ctl-background-diff-enabled bg-diff-warning">
+          <label for="ctl-background-diff-enabled">Background differ on</label>
+          <span class="applied" id="applied-ctl-background-diff-enabled"></span>
+          <span class="error" id="err-ctl-background-diff-enabled" aria-live="polite"></span>
+        </div>
+        <p id="bg-diff-warning" class="notice notice-warning" hidden>
+          Warning: the background differ is off on a live source. A person who stops moving
+          is no longer detected and can be shown. The differ is the only protection against that.
+        </p>
+        <div class="field">
+          <label for="ctl-background-diff-pixel-threshold">Pixel threshold (0 to 255)</label>
+          <input id="ctl-background-diff-pixel-threshold" data-field="background_diff.pixel_threshold" data-type="int" type="number" min="0" max="255" step="1" inputmode="numeric" aria-describedby="err-ctl-background-diff-pixel-threshold">
+          <span class="applied" id="applied-ctl-background-diff-pixel-threshold"></span>
+          <span class="error" id="err-ctl-background-diff-pixel-threshold" aria-live="polite"></span>
+        </div>
+        <div class="field">
+          <label for="ctl-background-diff-area-threshold">Area threshold (px, 0 to 10000000)</label>
+          <input id="ctl-background-diff-area-threshold" data-field="background_diff.area_threshold" data-type="int" type="number" min="0" max="10000000" step="1" inputmode="numeric" aria-describedby="err-ctl-background-diff-area-threshold">
+          <span class="applied" id="applied-ctl-background-diff-area-threshold"></span>
+          <span class="error" id="err-ctl-background-diff-area-threshold" aria-live="polite"></span>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Engine</legend>
+        <div class="field">
+          <label for="ctl-engine-lookahead">Lookahead (frames, 0 to 600)</label>
+          <input id="ctl-engine-lookahead" data-field="engine.lookahead" data-type="int" type="number" min="0" max="600" step="1" inputmode="numeric" aria-describedby="err-ctl-engine-lookahead">
+          <span class="applied" id="applied-ctl-engine-lookahead"></span>
+          <span class="error" id="err-ctl-engine-lookahead" aria-live="polite"></span>
+        </div>
+        <div class="field">
+          <label for="ctl-engine-frame-budget-ms">Frame budget (ms, empty for none)</label>
+          <input id="ctl-engine-frame-budget-ms" data-field="engine.frame_budget_ms" data-type="float-or-null" type="number" min="0" max="60000" step="any" inputmode="decimal" aria-describedby="err-ctl-engine-frame-budget-ms">
+          <span class="applied" id="applied-ctl-engine-frame-budget-ms"></span>
+          <span class="error" id="err-ctl-engine-frame-budget-ms" aria-live="polite"></span>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Timestamp ROI</legend>
+        <div class="field">
+          <label for="ctl-roi">ROI</label>
+          <select id="ctl-roi" data-field="roi" data-type="roi" aria-describedby="err-ctl-roi">
+            <option value="auto" disabled>Automatic (as started)</option>
+            <option value="disabled">Disabled</option>
+            <option value="manual">Manual box</option>
+          </select>
+          <span class="applied" id="applied-ctl-roi"></span>
+          <span class="error" id="err-ctl-roi" aria-live="polite"></span>
+        </div>
+        <div class="roi-box">
+          <div class="field"><label for="roi-x">Box X (px)</label>
+          <input id="roi-x" data-roi-part="0" type="number" min="0" step="1" inputmode="numeric"></div>
+          <div class="field"><label for="roi-y">Box Y (px)</label>
+          <input id="roi-y" data-roi-part="1" type="number" min="0" step="1" inputmode="numeric"></div>
+          <div class="field"><label for="roi-w">Box width (px)</label>
+          <input id="roi-w" data-roi-part="2" type="number" min="1" step="1" inputmode="numeric"></div>
+          <div class="field"><label for="roi-h">Box height (px)</label>
+          <input id="roi-h" data-roi-part="3" type="number" min="1" step="1" inputmode="numeric"></div>
+        </div>
+      </fieldset>
+    </form>
+  </section>
+
+  <section aria-labelledby="stop-title">
+    <h2 id="stop-title">Stop</h2>
+    <p>Stopping writes the remaining frames, finalizes the outputs and ends the run.</p>
+    <button id="stop-button" type="button" class="danger">Stop the run</button>
+    <span class="error" id="err-stop" aria-live="polite"></span>
+  </section>
+</main>
+</body>
+</html>

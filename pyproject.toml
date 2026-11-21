@@ -49,8 +49,10 @@ dev = [
     "pytest-cov>=4.0",
     "ruff>=0.1",
     "mypy>=1.0",
+    "httpx>=0.27",
 ]
 virtualcam = ["pyvirtualcam>=0.11"]
+web = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
 petrify = "petrify.cli:main"
