@@ -38,20 +38,51 @@ _NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,31}")
 # Detectors that may vet a background sample, in BackgroundConfig.sample_checkers.
 SAMPLE_CHECKERS: tuple[str, ...] = ("hog", "yunet", "dnn", "segment")
 
+# Upper bounds for the integer settings of the detector sections. Each is far above
+# any useful value and stops a typo from exhausting memory once the value is used.
+MAX_TOP_K = 100_000  # YuNet candidates kept before NMS.
+MAX_HOLD_FRAMES = 10_000  # Over five minutes at 30 fps.
+MAX_TRACKS = 10_000
+MAX_DILATE_PX = 512  # Pixels grown around the segmentation mask.
 
-def _check_model_path(owner: str, value: str | None) -> None:
-    if value is not None and (not isinstance(value, str) or not value):
-        raise ValueError(f"{owner} must be a non-empty string or None, got {value!r}")
+
+def _check_int(owner: str, value: object, low: int, high: int) -> None:
+    """Require a real int (bool rejected) in [low, high]."""
+    if not isinstance(value, int) or type(value) is not int or not low <= value <= high:
+        raise ValueError(f"{owner} must be a whole number from {low} to {high}, got {value!r}")
+
+
+def _check_unit(owner: str, value: object, *, high_closed: bool) -> None:
+    """Require a real finite number (bool rejected) in (0, 1), or (0, 1] when high_closed."""
+    ok = (
+        isinstance(value, (int, float))
+        and type(value) in (int, float)
+        and math.isfinite(value)
+        and (0 < value <= 1 if high_closed else 0 < value < 1)
+    )
+    if not ok:
+        bound = "(0, 1]" if high_closed else "(0, 1)"
+        raise ValueError(f"{owner} must be a number in {bound}, got {value!r}")
+
+
+def _check_model_path(owner: str, value: object) -> None:
+    if value is None:
+        return
+    if type(value) is not str or not value.strip() or "\x00" in value:
+        raise ValueError(
+            f"{owner} must be None or a path that is not blank and has no NUL character, "
+            f"got {value!r}"
+        )
 
 
 def _check_option_value(name: str, value: object) -> None:
-    if isinstance(value, tuple):
-        if not all(isinstance(item, str) for item in value):
+    if type(value) is tuple:
+        if not all(type(item) is str for item in value):
             raise ValueError(
                 f"mode option {name!r}: a tuple value must hold only strings, got {value!r}"
             )
         return
-    if not isinstance(value, (bool, int, float, str)):
+    if type(value) not in (bool, int, float, str):
         raise ValueError(
             f"mode option {name!r} must be a bool, int, float, str or tuple of str, "
             f"got {type(value).__name__}"
@@ -73,7 +104,7 @@ def _check_mode_options(options: object) -> None:
                 f"PetrifyConfig.mode_options entries must be (name, value) pairs, got {entry!r}"
             )
         name, value = entry
-        if not isinstance(name, str) or not _NAME_PATTERN.fullmatch(name):
+        if type(name) is not str or not _NAME_PATTERN.fullmatch(name):
             raise ValueError(
                 f"mode option name must match [a-z][a-z0-9_]{{0,31}}, got {name!r}"
             )
@@ -89,7 +120,7 @@ def _check_mode_options(options: object) -> None:
 def mode_options_from(options: Mapping[str, OptionValue]) -> tuple[tuple[str, OptionValue], ...]:
     """Return ``options`` as the sorted, validated pairs ``PetrifyConfig.mode_options`` holds."""
     for name in options:
-        if not isinstance(name, str):
+        if type(name) is not str:
             raise ValueError(f"mode option names must be strings, got {name!r}")
     pairs = tuple(sorted(options.items(), key=lambda pair: pair[0]))
     _check_mode_options(pairs)
@@ -193,7 +224,7 @@ class BackgroundConfig:
                 f"got {self.sample_checkers!r}"
             )
         for checker in self.sample_checkers:
-            if checker not in SAMPLE_CHECKERS:
+            if type(checker) is not str or checker not in SAMPLE_CHECKERS:
                 raise ValueError(
                     "BackgroundConfig.sample_checkers entries must be one of "
                     f"{', '.join(SAMPLE_CHECKERS)}, got {checker!r}"
@@ -270,16 +301,9 @@ class FaceYuNetConfig:
     model_path: str | None = None  # Explicit model file; None searches the model directories.
 
     def __post_init__(self) -> None:
-        if not 0 < self.score_threshold < 1:
-            raise ValueError(
-                f"FaceYuNetConfig.score_threshold must be in (0, 1), got {self.score_threshold}"
-            )
-        if not 0 < self.nms_threshold <= 1:
-            raise ValueError(
-                f"FaceYuNetConfig.nms_threshold must be in (0, 1], got {self.nms_threshold}"
-            )
-        if self.top_k <= 0:
-            raise ValueError(f"FaceYuNetConfig.top_k must be > 0, got {self.top_k}")
+        _check_unit("FaceYuNetConfig.score_threshold", self.score_threshold, high_closed=False)
+        _check_unit("FaceYuNetConfig.nms_threshold", self.nms_threshold, high_closed=True)
+        _check_int("FaceYuNetConfig.top_k", self.top_k, 1, MAX_TOP_K)
         _check_model_path("FaceYuNetConfig.model_path", self.model_path)
 
 
@@ -292,14 +316,8 @@ class PersonDnnConfig:
     model_path: str | None = None  # Explicit model file; None searches the model directories.
 
     def __post_init__(self) -> None:
-        if not 0 < self.score_threshold < 1:
-            raise ValueError(
-                f"PersonDnnConfig.score_threshold must be in (0, 1), got {self.score_threshold}"
-            )
-        if not 0 < self.nms_threshold <= 1:
-            raise ValueError(
-                f"PersonDnnConfig.nms_threshold must be in (0, 1], got {self.nms_threshold}"
-            )
+        _check_unit("PersonDnnConfig.score_threshold", self.score_threshold, high_closed=False)
+        _check_unit("PersonDnnConfig.nms_threshold", self.nms_threshold, high_closed=True)
         _check_model_path("PersonDnnConfig.model_path", self.model_path)
 
 
@@ -314,14 +332,9 @@ class SegmentConfig:
     model_path: str | None = None  # Explicit model file; None searches the model directories.
 
     def __post_init__(self) -> None:
-        if not 0 < self.threshold < 1:
-            raise ValueError(f"SegmentConfig.threshold must be in (0, 1), got {self.threshold}")
-        if self.dilate_px < 0:
-            raise ValueError(f"SegmentConfig.dilate_px must be >= 0, got {self.dilate_px}")
-        if not 0 < self.min_area_share <= 1:
-            raise ValueError(
-                f"SegmentConfig.min_area_share must be in (0, 1], got {self.min_area_share}"
-            )
+        _check_unit("SegmentConfig.threshold", self.threshold, high_closed=False)
+        _check_int("SegmentConfig.dilate_px", self.dilate_px, 0, MAX_DILATE_PX)
+        _check_unit("SegmentConfig.min_area_share", self.min_area_share, high_closed=True)
         _check_model_path("SegmentConfig.model_path", self.model_path)
 
 
@@ -334,14 +347,9 @@ class TrackerConfig:
     max_tracks: int = 256
 
     def __post_init__(self) -> None:
-        if not 0 < self.iou_threshold <= 1:
-            raise ValueError(
-                f"TrackerConfig.iou_threshold must be in (0, 1], got {self.iou_threshold}"
-            )
-        if self.hold_frames < 0:
-            raise ValueError(f"TrackerConfig.hold_frames must be >= 0, got {self.hold_frames}")
-        if self.max_tracks <= 0:
-            raise ValueError(f"TrackerConfig.max_tracks must be > 0, got {self.max_tracks}")
+        _check_unit("TrackerConfig.iou_threshold", self.iou_threshold, high_closed=True)
+        _check_int("TrackerConfig.hold_frames", self.hold_frames, 0, MAX_HOLD_FRAMES)
+        _check_int("TrackerConfig.max_tracks", self.max_tracks, 1, MAX_TRACKS)
 
 
 @dataclass(frozen=True)
@@ -383,7 +391,7 @@ class PetrifyConfig:
     models: ModelConfig = field(default_factory=ModelConfig)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.mode, str) or not _NAME_PATTERN.fullmatch(self.mode):
+        if type(self.mode) is not str or not _NAME_PATTERN.fullmatch(self.mode):
             raise ValueError(
                 f"PetrifyConfig.mode must match [a-z][a-z0-9_]{{0,31}}, got {self.mode!r}"
             )

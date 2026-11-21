@@ -6,6 +6,7 @@ import dataclasses
 import json
 from typing import Any
 
+import numpy as np
 import pytest
 
 from petrify.cli import _build_parser
@@ -19,6 +20,7 @@ from petrify.core import (
     TrackerConfig,
     mode_options_from,
 )
+from petrify.detectors.tracker import IouTracker
 from petrify.server.control import config_to_dict
 
 OPTIONS = (("labels", ("a", "b")), ("radius", 7), ("ratio", 0.5), ("solid", True), ("tint", "red"))
@@ -347,3 +349,130 @@ def test_config_to_dict_existing_fields_unchanged() -> None:
     assert data["background_diff"] == {
         "pixel_threshold": 25, "area_threshold": 200, "downsample": 0.5,
     }
+
+
+# ---------------------------------------------------------------------------
+# Strict types and upper bounds in the new sections
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cls", "name", "value"),
+    [
+        (FaceYuNetConfig, "top_k", True),
+        (FaceYuNetConfig, "top_k", 1.5),
+        (FaceYuNetConfig, "top_k", float("inf")),
+        (FaceYuNetConfig, "top_k", "5"),
+        (FaceYuNetConfig, "top_k", 100_001),
+        (TrackerConfig, "hold_frames", float("nan")),
+        (TrackerConfig, "hold_frames", 2.5),
+        (TrackerConfig, "hold_frames", 10**12),
+        (TrackerConfig, "hold_frames", True),
+        (TrackerConfig, "hold_frames", 10_001),
+        (TrackerConfig, "max_tracks", float("inf")),
+        (TrackerConfig, "max_tracks", True),
+        (TrackerConfig, "max_tracks", "5"),
+        (TrackerConfig, "max_tracks", 10_001),
+        (SegmentConfig, "dilate_px", float("nan")),
+        (SegmentConfig, "dilate_px", 1.5),
+        (SegmentConfig, "dilate_px", 10**9),
+        (SegmentConfig, "dilate_px", True),
+        (SegmentConfig, "dilate_px", 513),
+    ],
+)
+def test_int_fields_reject_non_ints_and_huge_values(cls: type, name: str, value: Any) -> None:
+    with pytest.raises(ValueError, match=f"{cls.__name__}.{name}"):
+        cls(**{name: value})
+
+
+@pytest.mark.parametrize(
+    ("cls", "name", "value"),
+    [
+        (FaceYuNetConfig, "top_k", 100_000),
+        (TrackerConfig, "hold_frames", 10_000),
+        (TrackerConfig, "max_tracks", 10_000),
+        (SegmentConfig, "dilate_px", 512),
+    ],
+)
+def test_int_fields_accept_their_upper_bound(cls: type, name: str, value: int) -> None:
+    assert getattr(cls(**{name: value}), name) == value
+
+
+FLOAT_FIELDS = [
+    (FaceYuNetConfig, "score_threshold"),
+    (FaceYuNetConfig, "nms_threshold"),
+    (PersonDnnConfig, "score_threshold"),
+    (PersonDnnConfig, "nms_threshold"),
+    (SegmentConfig, "threshold"),
+    (SegmentConfig, "min_area_share"),
+    (TrackerConfig, "iou_threshold"),
+]
+
+
+@pytest.mark.parametrize(("cls", "name"), FLOAT_FIELDS)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True, "0.5", None])
+def test_float_fields_reject_nan_bool_and_non_numbers(
+    cls: type, name: str, value: Any
+) -> None:
+    with pytest.raises(ValueError, match=f"{cls.__name__}.{name}"):
+        cls(**{name: value})
+
+
+class _LyingStr(str):
+    """A str subclass whose ordering always claims to be in order."""
+
+    __hash__ = str.__hash__
+
+    def __le__(self, other: object) -> bool:
+        return False
+
+
+def test_mode_options_reject_str_subclass_names() -> None:
+    options = ((_LyingStr("radius"), 1), (_LyingStr("radius"), 2))
+    with pytest.raises(ValueError, match="name"):
+        PetrifyConfig(mode_options=options)
+    with pytest.raises(ValueError, match="name"):
+        mode_options_from({_LyingStr("radius"): 1})
+
+
+def test_mode_rejects_str_subclass() -> None:
+    with pytest.raises(ValueError, match="PetrifyConfig.mode"):
+        PetrifyConfig(mode=_LyingStr("erase"))
+
+
+@pytest.mark.parametrize(
+    "value", [np.str_("red"), _LyingStr("red"), (np.str_("a"),), ("a", _LyingStr("b"))]
+)
+def test_mode_options_reject_str_subclass_values(value: Any) -> None:
+    with pytest.raises(ValueError, match="radius"):
+        PetrifyConfig(mode_options=(("radius", value),))
+
+
+def test_sample_checkers_reject_str_subclass() -> None:
+    with pytest.raises(ValueError, match="one of"):
+        BackgroundConfig(sample_checkers=(np.str_("hog"),))
+
+
+@pytest.mark.parametrize("value", ["   ", "\t\n", "models/face\x00.onnx", "\x00"])
+@pytest.mark.parametrize(
+    ("cls", "name"),
+    [
+        (FaceYuNetConfig, "model_path"),
+        (PersonDnnConfig, "model_path"),
+        (SegmentConfig, "model_path"),
+        (ModelConfig, "dir"),
+    ],
+)
+def test_model_paths_reject_blank_and_nul(cls: type, name: str, value: str) -> None:
+    with pytest.raises(ValueError, match=f"{cls.__name__}.{name}"):
+        cls(**{name: value})
+
+
+def test_tracker_defaults_are_accepted_by_iou_tracker() -> None:
+    config = TrackerConfig()
+    tracker = IouTracker(
+        iou_threshold=config.iou_threshold,
+        hold_frames=config.hold_frames,
+        max_tracks=config.max_tracks,
+    )
+    assert tracker.hold_frames == 15
