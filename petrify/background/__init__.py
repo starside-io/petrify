@@ -21,12 +21,13 @@ from __future__ import annotations
 from petrify.background.calibrate import CalibratedBackground, frames_for
 from petrify.background.locked import LockedBackground, find_clean_background, locked_background
 from petrify.background.running import RunningBackground
-from petrify.background.vetting import person_free
+from petrify.background.vetting import any_person, person_free
 
 __all__ = [
     "CalibratedBackground",
     "LockedBackground",
     "RunningBackground",
+    "any_person",
     "find_clean_background",
     "frames_for",
     "locked_background",

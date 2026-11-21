@@ -33,6 +33,10 @@ seated person framed from the chest up (the typical webcam view), partial bodies
 and people far from the camera, and every miss is accepted as a clean sample. A
 stronger detector is planned.
 
+:func:`any_person` combines several checks into one: a sample is flagged as
+containing a person as soon as any check fires, so a person missed by one
+detector can still be caught by another.
+
 Cost: the filter runs on the thread that calls the model's ``update``, once per
 candidate sample for ``RunningBackground`` and once per frame until calibration
 completes for ``CalibratedBackground``.
@@ -40,7 +44,7 @@ completes for ``CalibratedBackground``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 import numpy as np
@@ -63,3 +67,37 @@ def person_free(detector: PersonCheck) -> Callable[[np.ndarray], bool]:
         return not detector.is_person(image)
 
     return _filter
+
+
+class _AnyPerson:
+    """A :class:`PersonCheck` that fires when any of its checks fires."""
+
+    def __init__(self, checks: Sequence[PersonCheck]) -> None:
+        self._checks: tuple[PersonCheck, ...] = tuple(checks)
+        if not self._checks:
+            raise ValueError("any_person needs at least one check")
+
+    def is_person(self, frame: np.ndarray) -> bool:
+        for check in self._checks:
+            if check.is_person(frame):
+                return True
+        return False
+
+    def __repr__(self) -> str:
+        inner = ", ".join(repr(check) for check in self._checks)
+        return f"any_person([{inner}])"
+
+
+def any_person(checks: Sequence[PersonCheck]) -> PersonCheck:
+    """Return a check that finds a person when any of ``checks`` finds one.
+
+    The checks run in the given order and stop at the first that returns True;
+    the result is False only when every check returned False. An exception raised
+    by a check before any check returned True propagates, so that a sample filter
+    built on the result rejects the sample. ``checks`` is copied, so later changes
+    to the caller's sequence have no effect.
+
+    Raises ``ValueError`` when ``checks`` is empty, because a combinator with no
+    checks would approve every sample.
+    """
+    return _AnyPerson(checks)
