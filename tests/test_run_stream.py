@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import shutil
 import signal
 import subprocess
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from unittest import mock
 
 import cv2
@@ -17,6 +18,8 @@ import pytest
 
 import petrify.cli
 import petrify.pipeline as pipeline
+import petrify.sinks.file
+import petrify.sources
 from petrify.core import (
     BackgroundConfig,
     EncodeConfig,
@@ -29,9 +32,26 @@ from petrify.core import (
     RoiConfig,
     SourceInfo,
 )
-from petrify.pipeline import OutputConfig, RunReport, run_file, run_stream
+from petrify.pipeline import (
+    NO_BACKGROUND_CHECK_WARNING,
+    NO_BG_DIFF_LIVE_WARNING,
+    ONLINE_BACKGROUND_WARNING,
+    FfmpegNotFoundError,
+    NoFramesError,
+    OutputConfig,
+    RunReport,
+    run_file,
+    run_stream,
+)
 from petrify.sinks import FfmpegPipeSink, PreviewSink, ThreadedSink, VirtualCamSink
-from petrify.sources import FileSource
+from petrify.sources import FileSource, ImageFolderSource
+
+T = TypeVar("T")
+
+NEEDS_FFMPEG = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="needs ffmpeg and ffprobe",
+)
 
 # Frames stay at least 320x256 so a 0.5 HOG downsample never goes below the 64x128 window.
 W, H = 320, 256
@@ -287,7 +307,7 @@ def test_live_auto_roi_pastes_nothing_before_lock() -> None:
         FPS,
         12.0,
         {"min_freq": 0.7, "margin": 4, "max_area_frac": 0.2, "edge_threshold": 70.0,
-         "edge_gap_tolerance": 20, "n_edge_samples": 5},
+         "edge_gap_tolerance": 20, "n_edge_samples": 5, "max_roi_area_frac": 0.15},
     )
     assert report.roi == _FakeWarmupDetector.roi_box
     x, y, w, h = _FakeWarmupDetector.roi_box
@@ -385,10 +405,31 @@ def test_preview_stop_request_ends_run() -> None:
     assert src.closed == 1
 
 
+def _no_interrupt(call: Callable[[], T]) -> T:
+    """Run ``call``; an escaped KeyboardInterrupt fails the test instead of ending pytest."""
+    try:
+        return call()
+    except KeyboardInterrupt:
+        pytest.fail("KeyboardInterrupt escaped the code under test", pytrace=False)
+
+
+@pytest.fixture
+def sigint_restored() -> Iterator[None]:
+    """Restore the SIGINT handler after the test, even if the code under test does not."""
+    previous = signal.getsignal(signal.SIGINT)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+@pytest.mark.usefixtures("sigint_restored")
 def test_keyboard_interrupt_from_live_source_finishes_cleanly() -> None:
     src = FakeSource(interrupt_at=100, dropped=7)
     sink = ListSink()
-    report = run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    report = _no_interrupt(
+        lambda: run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    )
     assert isinstance(report, RunReport)
     assert report.interrupted is True
     assert report.dropped_frames == 7
@@ -397,6 +438,7 @@ def test_keyboard_interrupt_from_live_source_finishes_cleanly() -> None:
     assert src.closed == 1
 
 
+@pytest.mark.usefixtures("sigint_restored")
 def test_keyboard_interrupt_on_non_live_source_aborts() -> None:
     src = FakeSource(live=False, interrupt_at=100)
     sink = ListSink()
@@ -410,6 +452,7 @@ def _default_sigint() -> bool:
     return signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
 
+@pytest.mark.usefixtures("sigint_restored")
 @pytest.mark.skipif(not _default_sigint(), reason="needs the default SIGINT handler")
 def test_sigint_inside_a_live_step_is_deferred() -> None:
     def interrupt(n: int) -> None:
@@ -418,7 +461,9 @@ def test_sigint_inside_a_live_step_is_deferred() -> None:
 
     src = FakeSource()
     sink = ListSink(on_write=interrupt)
-    report = run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    report = _no_interrupt(
+        lambda: run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    )
     assert report.interrupted is True
     assert len(sink.images) == report.stats.frames == len(src.yielded)
     assert len(src.yielded) < src.scene.total
@@ -426,6 +471,7 @@ def test_sigint_inside_a_live_step_is_deferred() -> None:
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler  # Restored.
 
 
+@pytest.mark.usefixtures("sigint_restored")
 @pytest.mark.skipif(not _default_sigint(), reason="needs the default SIGINT handler")
 def test_second_sigint_inside_a_live_step_aborts() -> None:
     def interrupt(n: int) -> None:
@@ -442,6 +488,7 @@ def test_second_sigint_inside_a_live_step_aborts() -> None:
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
 
+@pytest.mark.usefixtures("sigint_restored")
 @pytest.mark.skipif(not _default_sigint(), reason="needs the default SIGINT handler")
 def test_sigint_inside_a_non_live_step_aborts() -> None:
     def interrupt(n: int) -> None:
@@ -483,7 +530,7 @@ def test_critical_sink_failure_propagates() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_sinks_for_live_source(tmp_path: Path) -> None:
+def test_d2_sinks_for_live_source_are_not_threaded(tmp_path: Path) -> None:
     src = FakeSource()
     config = _live_config("running")
     with (
@@ -498,9 +545,8 @@ def test_sinks_for_live_source(tmp_path: Path) -> None:
     pipe.assert_called_once_with(tmp_path / "o.mp4", ENCODE, audio_source=None,
                                  wallclock_timestamps=True)
     cam.assert_called_once_with(device="dev")
-    assert [type(s) for s in sinks] == [ThreadedSink, ThreadedSink, PreviewSink]
-    assert isinstance(sinks[0].sink, FfmpegPipeSink)  # type: ignore[attr-defined]
-    assert isinstance(sinks[1].sink, VirtualCamSink)  # type: ignore[attr-defined]
+    assert [type(s) for s in sinks] == [FfmpegPipeSink, VirtualCamSink, PreviewSink]
+    assert not any(isinstance(s, ThreadedSink) for s in sinks)
 
 
 @pytest.fixture(scope="module")
@@ -623,3 +669,300 @@ def test_cli_run_with_real_ffmpeg(clip: Path, tmp_path: Path) -> None:
     fields = dict(line.split("=", 1) for line in probe.split())
     assert fields == {"width": str(W), "height": str(H), "avg_frame_rate": "25/1",
                       "nb_read_frames": "100"}
+
+
+# ---------------------------------------------------------------------------
+# P2-9c: live privacy defaults, data loss and robustness
+# ---------------------------------------------------------------------------
+
+# A "person" in view from the first frame, standing still, who leaves at frame 150.
+PERSON_FROM_START = Scene(total=300, enter=0, stand=0, leave=150, gone=160)
+
+
+def _fake_person_free(detector: Any) -> Callable[[np.ndarray], bool]:
+    """Stand-in for the HOG person check: a sample is clean when no subject pixel shows."""
+    return lambda image: not _shows_subject(image)
+
+
+def _without_sample_check(config: PetrifyConfig) -> PetrifyConfig:
+    return dataclasses.replace(
+        config, background=dataclasses.replace(config.background, sample_check=False)
+    )
+
+
+@pytest.mark.parametrize("strategy", ["running", "calibrate"])
+def test_l1_person_present_while_background_builds_is_never_shown(strategy: str) -> None:
+    src = FakeSource(PERSON_FROM_START)
+    sink = ListSink()
+    traces: list[FrameTrace] = []
+    with mock.patch.object(pipeline, "person_free", side_effect=_fake_person_free) as check:
+        report = run_stream(src, _live_config(strategy), OutputConfig(), sinks=[sink],
+                            observer=traces.append)
+    check.assert_called_once()
+    assert len(sink.images) == report.stats.frames == PERSON_FROM_START.total
+    assert not any(_shows_subject(o) for o in sink.images)
+    # The run recovers once the person has left: the last frames pass through.
+    kinds = [_kind(t) for t in traces]
+    assert all(kind == "pass" for kind in kinds[-30:])
+
+
+@pytest.mark.parametrize("strategy", ["running", "calibrate"])
+def test_l1_without_sample_check_the_known_leak_reproduces(strategy: str) -> None:
+    # Documents what --no-background-check turns off: the person learned into the
+    # background is shown on frozen frames after they leave.
+    src = FakeSource(PERSON_FROM_START)
+    sink = ListSink()
+    with mock.patch.object(pipeline, "person_free", side_effect=_fake_person_free) as check:
+        run_stream(src, _without_sample_check(_live_config(strategy)), OutputConfig(),
+                   sinks=[sink])
+    check.assert_not_called()
+    leaked = [k for k, o in enumerate(sink.images) if _shows_subject(o)]
+    assert any(k >= PERSON_FROM_START.gone for k in leaked)
+
+
+@pytest.mark.parametrize("strategy", ["running", "calibrate"])
+def test_l1_online_models_get_the_prescan_person_check(strategy: str) -> None:
+    config = _live_config(strategy, person=PersonHogConfig(min_confidence=0.9))
+    detector = object()
+    sample_filter = object()
+    with (
+        mock.patch.object(pipeline.PersonDetector, "from_config", return_value=detector) as build,
+        mock.patch.object(pipeline, "person_free", return_value=sample_filter) as check,
+        mock.patch.object(pipeline, "RunningBackground") as running,
+        mock.patch.object(pipeline, "CalibratedBackground") as calibrated,
+    ):
+        pipeline._background_for(FakeSource(), config)
+    build.assert_called_once_with(config.background_scan_person_config())
+    check.assert_called_once_with(detector)
+    model = running if strategy == "running" else calibrated
+    assert model.call_args.kwargs["sample_filter"] is sample_filter
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_l1_startup_warnings(caplog: pytest.LogCaptureFixture) -> None:
+    with (
+        caplog.at_level(logging.WARNING, logger="petrify.pipeline"),
+        mock.patch.object(pipeline, "person_free", side_effect=_fake_person_free),
+    ):
+        run_stream(FakeSource(Scene(total=30)), _live_config("running"), OutputConfig(),
+                   sinks=[ListSink()])
+    assert _warnings(caplog).count(ONLINE_BACKGROUND_WARNING) == 1
+    assert NO_BACKGROUND_CHECK_WARNING not in _warnings(caplog)
+    assert "seated person" in ONLINE_BACKGROUND_WARNING
+    assert "Start with the scene empty" in ONLINE_BACKGROUND_WARNING
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="petrify.pipeline"):
+        run_stream(FakeSource(Scene(total=30)), _without_sample_check(_live_config("calibrate")),
+                   OutputConfig(), sinks=[ListSink()])
+    assert ONLINE_BACKGROUND_WARNING in _warnings(caplog)
+    assert NO_BACKGROUND_CHECK_WARNING in _warnings(caplog)
+
+
+def test_l1_no_online_warning_for_locked_background(
+    clip: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="petrify.pipeline"):
+        run_stream(FileSource(clip), PetrifyConfig(encode=ENCODE), OutputConfig(),
+                   sinks=[ListSink()])
+    assert ONLINE_BACKGROUND_WARNING not in caplog.text
+
+
+def test_l2_warmup_detector_gets_the_area_cap() -> None:
+    _FakeWarmupDetector.instances.clear()
+    config = _live_config("calibrate", roi=RoiConfig(mode="auto", max_area_cap=0.05))
+    with mock.patch.object(pipeline, "WarmupRoiDetector", _FakeWarmupDetector):
+        pipeline._roi_stage(FakeSource(), config)
+    (detector,) = _FakeWarmupDetector.instances
+    assert detector.args[2]["max_roi_area_frac"] == 0.05
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_l4_no_bg_diff_on_live_source_warns(live: bool, caplog: pytest.LogCaptureFixture) -> None:
+    config = _live_config("running", background_diff=None)
+    with caplog.at_level(logging.WARNING, logger="petrify.pipeline"):
+        run_stream(FakeSource(Scene(total=30), live=live), config, OutputConfig(),
+                   sinks=[ListSink()])
+    assert (NO_BG_DIFF_LIVE_WARNING in _warnings(caplog)) is live
+
+
+class FailingSource(FakeSource):
+    """A fake source whose iteration raises ``OSError`` at frame ``fail_at``."""
+
+    def __init__(self, scene: Scene | None = None, *, fail_at: int, live: bool = True) -> None:
+        super().__init__(scene, live=live)
+        self.fail_at = fail_at
+
+    def __iter__(self) -> Iterator[Frame]:
+        for i in range(self.scene.total):
+            if i == self.fail_at:
+                raise OSError("camera unplugged")
+            img = self.scene.image(i)
+            self.yielded.append(img)
+            yield Frame(image=img, index=i, timestamp=i / FPS, source=self.info)
+
+
+class CloseFailingSink(ListSink):
+    def close(self) -> None:
+        super().close()
+        raise OSError("close failed too")
+
+
+@pytest.mark.parametrize("fail_at", [135, 200])  # While the subject is in view, and after.
+def test_d1_live_source_error_keeps_the_processed_recording(
+    fail_at: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    src = FailingSource(fail_at=fail_at)
+    sink = ListSink()
+    traces: list[FrameTrace] = []
+    with (
+        caplog.at_level(logging.ERROR, logger="petrify.pipeline"),
+        pytest.raises(OSError, match="camera unplugged"),
+    ):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink],
+                   observer=traces.append)
+    assert (sink.opened, sink.closed, sink.aborted) == (1, 1, 0)
+    assert src.closed == 1
+    # Every frame read before the error was written (lookahead tail included) ...
+    assert len(sink.images) == len(traces) == len(src.yielded) == fail_at
+    assert [m.index for m in sink.metas] == list(range(fail_at))
+    # ... and each one is exactly what the mode approved: black, the background, or the
+    # unchanged frame when nothing was detected. Nothing is written unprocessed.
+    for k, (trace, out, inp) in enumerate(zip(traces, sink.images, src.yielded)):
+        expected = {"black": np.zeros_like(inp), "frozen": BACKGROUND, "pass": inp}[_kind(trace)]
+        assert np.array_equal(out, expected), k
+    assert not any(_shows_subject(o) for o in sink.images)
+    assert "the recording up to that point was kept" in caplog.text
+
+
+def test_d1_close_failure_after_live_error_aborts_and_raises_the_original() -> None:
+    src = FailingSource(fail_at=100)
+    sink = CloseFailingSink()
+    with pytest.raises(OSError, match="camera unplugged"):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert (sink.closed, sink.aborted) == (1, 1)
+    assert src.closed == 1
+
+
+def test_d1_non_live_source_error_still_aborts() -> None:
+    src = FailingSource(fail_at=100, live=False)
+    sink = ListSink()
+    with pytest.raises(OSError, match="camera unplugged"):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert (sink.closed, sink.aborted) == (0, 1)
+
+
+def test_d1_cli_exits_1_when_a_live_run_fails() -> None:
+    sink = ListSink()
+    with (
+        mock.patch.object(petrify.sources, "open_source",
+                          return_value=FailingSource(Scene(total=80), fail_at=60)),
+        mock.patch.object(pipeline, "person_free", side_effect=_fake_person_free),
+        mock.patch.object(pipeline, "_build_sinks", return_value=[sink]),
+    ):
+        assert petrify.cli.main(["run", "--source", "camera:0", "--preview"]) == 1
+    assert (len(sink.images), sink.closed, sink.aborted) == (60, 1, 0)
+
+
+def _write_images(folder: Path, count: int = 3) -> list[Path]:
+    paths = []
+    for i in range(count):
+        path = folder / f"frame{i:02d}.png"
+        assert cv2.imwrite(str(path), BACKGROUND)
+        paths.append(path)
+    return paths
+
+
+def test_d3_run_stream_rejects_output_equal_to_input(clip: Path, tmp_path: Path) -> None:
+    before = clip.read_bytes()
+    src = FileSource(clip)
+    with pytest.raises(ValueError, match="output file is the input"):
+        run_stream(src, PetrifyConfig(encode=ENCODE), OutputConfig(file=clip))
+    assert clip.read_bytes() == before
+    # Another spelling of the same path is rejected too.
+    spelled = clip.parent / "." / clip.name
+    with pytest.raises(ValueError, match="output file is the input"):
+        run_stream(FileSource(clip), PetrifyConfig(encode=ENCODE), OutputConfig(file=spelled))
+
+    images = _write_images(tmp_path)
+    with pytest.raises(ValueError, match="output file is the input"):
+        run_stream(ImageFolderSource(tmp_path), PetrifyConfig(encode=ENCODE),
+                   OutputConfig(file=images[1]))
+    # Inside the folder but not one of its images: allowed.
+    assert not pipeline.output_overwrites_input(ImageFolderSource(tmp_path),
+                                                tmp_path / "out.mp4")
+
+
+def test_d3_cli_rejects_output_equal_to_input(
+    clip: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = clip.read_bytes()
+    with pytest.raises(SystemExit) as excinfo:
+        petrify.cli.main(["run", "--source", str(clip), "--output", str(clip)])
+    assert excinfo.value.code == 2
+    assert "--output is the input file" in capsys.readouterr().err
+    assert clip.read_bytes() == before
+
+    images = _write_images(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        petrify.cli.main(["run", "--source", str(tmp_path), "--output", str(images[0])])
+    assert excinfo.value.code == 2
+    assert "--output is one of the input files" in capsys.readouterr().err
+    assert np.array_equal(cv2.imread(str(images[0])), BACKGROUND)
+
+
+@NEEDS_FFMPEG
+def test_d4_source_with_no_frames_is_a_clear_error(tmp_path: Path) -> None:
+    out = tmp_path / "empty.mp4"
+    with pytest.raises(NoFramesError, match="source delivered no frames"):
+        run_stream(FakeSource(Scene(total=0)), _live_config("running"), OutputConfig(file=out))
+    assert list(tmp_path.iterdir()) == []
+
+
+@NEEDS_FFMPEG
+def test_d4_cli_exits_1_for_a_source_with_no_frames(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    out = tmp_path / "empty.mp4"
+    with mock.patch.object(petrify.sources, "open_source",
+                           return_value=FakeSource(Scene(total=0))):
+        code = petrify.cli.main(["run", "--source", "camera:0", "--output", str(out)])
+    assert code == 1
+    assert "Fatal error: The source delivered no frames; no output was written" in caplog.text
+    assert "Traceback" not in caplog.text
+    assert list(tmp_path.iterdir()) == []
+
+
+_NO_FFMPEG = FileNotFoundError(
+    "ffmpeg binary not found on PATH. Install FFmpeg: https://ffmpeg.org/download.html"
+)
+
+
+def test_d5_missing_ffmpeg_fails_before_processing(tmp_path: Path) -> None:
+    src = FakeSource()
+    with (
+        mock.patch.object(petrify.sinks.file, "find_ffmpeg", side_effect=_NO_FFMPEG),
+        mock.patch.object(pipeline, "_background_for") as background,
+        pytest.raises(FfmpegNotFoundError, match="Install FFmpeg"),
+    ):
+        run_stream(src, _live_config("running"), OutputConfig(file=tmp_path / "o.mp4"))
+    background.assert_not_called()
+    assert src.yielded == []
+    assert src.closed == 1
+
+
+def test_d5_cli_exits_1_for_missing_ffmpeg_and_2_for_missing_input(
+    clip: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with mock.patch.object(petrify.sinks.file, "find_ffmpeg", side_effect=_NO_FFMPEG):
+        code = petrify.cli.main(["run", "--source", str(clip), "--output",
+                                 str(tmp_path / "o.mp4")])
+        assert code == 1
+        assert "Install FFmpeg" in caplog.text
+        missing = tmp_path / "missing.mp4"
+        assert petrify.cli.main(["run", "--source", str(missing), "--output",
+                                 str(tmp_path / "o.mp4")]) == 2
+    assert list(tmp_path.iterdir()) == []

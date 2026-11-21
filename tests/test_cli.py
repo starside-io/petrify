@@ -213,10 +213,18 @@ def test_file_form_namespace_and_config_unchanged() -> None:
     assert PetrifyConfig.from_namespace(_build_parser().parse_args([IN, OUT])) == PetrifyConfig()
 
 
-def test_first_argument_run_selects_run_form(run_file: mock.MagicMock) -> None:
+def test_k1_run_without_source_is_the_file_form(
+    run_file: mock.MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # "run" with no --source is an INPUT named run: the file form's usage applies.
     with pytest.raises(SystemExit) as excinfo:
-        main(["run"])  # --source is required in the run form.
+        main(["run"])
     assert excinfo.value.code == 2
+    assert "INPUT OUTPUT" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run", "--output", OUT])
+    assert excinfo.value.code == 2
+    assert "unrecognized arguments: --output" in capsys.readouterr().err
     run_file.assert_not_called()
 
 
@@ -258,21 +266,24 @@ def image_dir(tmp_path: Path) -> str:
 
 
 @pytest.mark.parametrize(
-    ("spec", "background", "lookahead"),
+    ("spec", "background", "lookahead", "roi_mode"),
     [
-        ("clip.mp4", "locked", 10),
-        ("frames/*.png", "locked", 10),
-        ("camera:0", "running", 3),
-        ("rtsp://cam.example/live", "running", 3),
-        ("https://cam.example/mjpeg", "running", 3),
+        ("clip.mp4", "locked", 10, "auto"),
+        ("frames/*.png", "locked", 10, "auto"),
+        ("camera:0", "running", 3, "disabled"),
+        ("rtsp://cam.example/live", "running", 10, "auto"),
+        ("https://cam.example/mjpeg", "running", 10, "auto"),
     ],
 )
-def test_run_defaults_per_source_kind(spec: str, background: str, lookahead: int) -> None:
+def test_run_defaults_per_source_kind(
+    spec: str, background: str, lookahead: int, roi_mode: str
+) -> None:
     config, outputs = _resolved(["--source", spec, "--output", OUT])
     assert config.background.strategy == background
+    assert config.background.sample_check is True
     assert config.engine.lookahead == lookahead
     assert config.engine.frame_budget_ms is None
-    assert config.roi == RoiConfig()
+    assert config.roi == RoiConfig(mode=roi_mode)  # type: ignore[arg-type]
     assert outputs == OutputConfig(file=Path(OUT))
 
 
@@ -298,13 +309,17 @@ def test_run_options_reach_the_config(image_dir: str) -> None:
     config, outputs = _resolved([
         "--source", "camera:1", "--virtualcam", "--virtualcam-device", "OBS", "--preview",
         "--output", OUT, "--background", "calibrate", "--calibrate-seconds", "4.5",
-        "--lookahead", "0", "--frame-budget-ms", "40", "--roi-warmup", "6",
+        "--lookahead", "0", "--frame-budget-ms", "40", "--roi-auto", "--roi-warmup", "6",
+        "--roi-max-area", "0.05", "--no-background-check",
     ])
     assert config.background.strategy == "calibrate"
     assert config.background.calibrate_seconds == 4.5
     assert config.engine.lookahead == 0
     assert config.engine.frame_budget_ms == 40.0
+    assert config.roi.mode == "auto"
     assert config.roi.warmup_seconds == 6.0
+    assert config.roi.max_area_cap == 0.05
+    assert config.background.sample_check is False
     assert outputs == OutputConfig(file=Path(OUT), virtualcam=True, virtualcam_device="OBS",
                                    preview=True)
     config, _ = _resolved(["--source", "clip.mp4", "--output", OUT, "--background", "running"])
@@ -342,7 +357,6 @@ def test_run_options_reach_the_config(image_dir: str) -> None:
         (["--source", "camera:x", "--output", OUT], "camera:N"),
         (["--source", f"ftp://u:{SECRET}@h/x", "--output", OUT], "supported schemes"),
         (["--source", IN, "--output", OUT, "--mode", "shadow"], "invalid choice"),
-        (["--output", OUT], "--source"),
     ],
 )
 def test_run_usage_errors(
@@ -453,3 +467,193 @@ def test_run_logs_the_redacted_source_uri(caplog: pytest.LogCaptureFixture) -> N
         assert main(["run", "--source", SECRET_URL, "--preview"]) == 0
     assert "rtsp://***@cam.example:554" in caplog.text
     assert SECRET not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# P2-9c
+# ---------------------------------------------------------------------------
+
+C1_SECRET = "Zq9MistypedSecret"
+C1_SPECS = [
+    f"camera:rtsp://u:{C1_SECRET}@h/x",
+    f"rtsp:/u:{C1_SECRET}@h/x",
+    f"u:{C1_SECRET}@h:554/x",
+    f"rtsp://u:{C1_SECRET}@h/x",
+]
+
+
+def _main_text(
+    argv: list[str], capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> tuple[int | str | None, str]:
+    """Run the real CLI; return the exit code and everything it printed or logged."""
+    caplog.clear()
+    try:
+        code: int | str | None = main(argv)
+        exc_text = ""
+    except SystemExit as exc:
+        code, exc_text = exc.code, str(exc)
+    captured = capsys.readouterr()
+    return code, captured.err + captured.out + caplog.text + exc_text
+
+
+@pytest.mark.parametrize("verbose", [[], ["--verbose"]], ids=["quiet", "verbose"])
+@pytest.mark.parametrize("spec", C1_SPECS)
+def test_c1_mistyped_specs_never_show_the_password_in_the_run_form(
+    spec: str,
+    verbose: list[str],
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG):
+        code, text = _main_text(["run", "--source", spec, "--output", OUT, *verbose],
+                                capsys, caplog)
+    assert code in (1, 2)
+    assert C1_SECRET not in text
+    assert "<redacted>" in text or "://" in text
+
+
+@pytest.mark.parametrize("verbose", [[], ["--verbose"]], ids=["quiet", "verbose"])
+@pytest.mark.parametrize("spec", C1_SPECS)
+def test_c1_mistyped_specs_never_show_the_password_in_the_file_form(
+    spec: str,
+    verbose: list[str],
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG):
+        code, text = _main_text([spec, OUT, *verbose], capsys, caplog)
+    assert code == 2
+    assert "Input file not found" in text
+    assert C1_SECRET not in text
+    # The exception the file form handles holds no secret either.
+    with pytest.raises(FileNotFoundError) as excinfo:
+        petrify.pipeline.run_file(spec, OUT, PetrifyConfig())
+    assert C1_SECRET not in str(excinfo.value)
+
+
+def test_c1_plain_missing_input_is_shown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    missing = str(tmp_path / "plain.mp4")
+    code, text = _main_text([missing, OUT], capsys, caplog)
+    assert code == 2
+    assert f"Input file not found: {missing}" in text
+
+
+def test_l2_camera_roi_is_disabled_unless_asked() -> None:
+    assert _resolved(["--source", "camera:0", "--preview"])[0].roi.mode == "disabled"
+    assert _resolved(["--source", "camera:0", "--preview", "--roi-auto"])[0].roi.mode == "auto"
+    config, _ = _resolved(["--source", "camera:0", "--preview", "--roi", "1", "2", "3", "4"])
+    assert (config.roi.mode, config.roi.box) == ("manual", (1, 2, 3, 4))
+    for spec in ("rtsp://cam.example/live", "frames/*.png", IN):
+        assert _resolved(["--source", spec, "--preview"])[0].roi.mode == "auto"
+    config, _ = _resolved(["--source", "rtsp://cam.example/live", "--preview",
+                           "--roi-max-area", "0.3", "--roi-warmup", "4"])
+    assert (config.roi.max_area_cap, config.roi.warmup_seconds) == (0.3, 4.0)
+    assert _resolved(["--source", IN, "--preview"])[0].roi.max_area_cap == 0.15
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--source", IN, "--roi-auto", "--no-roi"], "cannot be combined"),
+        (["--source", IN, "--roi-auto", "--roi", "1", "2", "3", "4"], "cannot be combined"),
+        (["--source", IN, "--no-roi", "--roi", "1", "2", "3", "4"], "cannot be combined"),
+        (["--source", IN, "--no-roi", "--roi-warmup", "3"], "--roi-warmup needs ROI auto"),
+        (["--source", IN, "--roi", "1", "2", "3", "4", "--roi-max-area", "0.2"],
+         "--roi-max-area needs ROI auto"),
+        (["--source", "camera:0", "--roi-warmup", "3"], "add --roi-auto"),
+        (["--source", "camera:0", "--roi-max-area", "0.2"], "add --roi-auto"),
+        (["--source", "camera:0", "--roi-auto", "--roi-max-area", "0"],
+         "--roi-max-area must be in (0, 1]"),
+        (["--source", IN, "--roi-max-area", "1.5"], "--roi-max-area must be in (0, 1]"),
+    ],
+)
+def test_l2_roi_usage_errors(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str], argv: list[str], message: str
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run", *argv, "--preview"])
+    assert excinfo.value.code == 2
+    assert message in capsys.readouterr().err
+    run_stream.assert_not_called()
+
+
+def test_l3_lookahead_defaults_and_cap(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _resolved(["--source", "rtsp://cam.example/live", "--preview"])[0].engine.lookahead == 10
+    assert _resolved(["--source", "camera:0", "--preview"])[0].engine.lookahead == 3
+    assert _resolved(["--source", IN, "--preview", "--lookahead", "600"])[0].engine.lookahead == 600
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run", "--source", IN, "--preview", "--lookahead", "601"])
+    assert excinfo.value.code == 2
+    assert "--lookahead must be <= 600" in capsys.readouterr().err
+    run_stream.assert_not_called()
+    help_text = " ".join(_build_run_parser().format_help().split())
+    assert "A smaller lookahead lowers the latency but lets more of a slowly entering" in help_text
+
+
+def test_l1_no_background_check_flag_reaches_the_config() -> None:
+    assert _resolved(["--source", "camera:0", "--preview"])[0].background.sample_check is True
+    config, _ = _resolved(["--source", "camera:0", "--preview", "--no-background-check"])
+    assert config.background.sample_check is False
+    help_text = " ".join(_build_run_parser().format_help().split())
+    assert "--no-background-check UNSAFE" in help_text
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--verbose", "run", "--source", IN, "--output", OUT],
+        ["-v", "--crf", "18", "run", "--source", IN, "--output", OUT],
+        ["run", "--output", OUT, "--source", IN],
+        ["--roi", "1", "2", "3", "4", "run", f"--source={IN}", "--output", OUT],
+    ],
+)
+def test_k1_options_before_run_select_the_run_form(
+    run_stream: mock.MagicMock, run_file: mock.MagicMock, argv: list[str]
+) -> None:
+    assert main(argv) == 0
+    run_stream.assert_called_once()
+    run_file.assert_not_called()
+    _, config, outputs = run_stream.call_args.args
+    assert outputs == OutputConfig(file=Path(OUT))
+    if "--crf" in argv:
+        assert config.encode.crf == 18
+    if "--roi" in argv:
+        assert config.roi.box == (1, 2, 3, 4)
+
+
+def test_k1_a_file_named_run_is_the_file_form(
+    run_stream: mock.MagicMock, run_file: mock.MagicMock
+) -> None:
+    assert main(["run", OUT]) == 0
+    assert main(["--verbose", "run", OUT]) == 0
+    assert [c.args[:2] for c in run_file.call_args_list] == [("run", OUT), ("run", OUT)]
+    run_stream.assert_not_called()
+
+
+def test_k1_dispatch_rule_is_in_the_top_level_help(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "The run form is used when the first argument that is not an option is 'run'" in out
+    assert "petrify run out.mp4" in out
+
+
+def _hwaccel_help(parser: object) -> str:
+    (action,) = [a for a in parser._actions if "--hwaccel" in a.option_strings]  # type: ignore[attr-defined]
+    return str(action.help)
+
+
+def test_k2_run_hwaccel_help_is_accurate() -> None:
+    file_help = _hwaccel_help(_build_parser())
+    run_help = _hwaccel_help(_build_run_parser())
+    assert file_help == (
+        "FFmpeg -hwaccel value for hardware-accelerated *decoding* of the "
+        "intermediate file.  Examples: cuda, videotoolbox, dxva2.  "
+        "Pair with a matching hardware encoder via --codec.  Default: None."
+    )
+    assert "intermediate file" not in run_help
+    assert "raw frames" in run_help and "--codec" in run_help

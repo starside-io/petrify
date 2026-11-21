@@ -122,6 +122,46 @@ def test_missing_file(tmp_path: Path) -> None:
         FileSource(missing)
 
 
+SECRET = "Zq9FileSourceSecret"
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        f"rtsp://u:{SECRET}@h/x",
+        f"rtsp:/u:{SECRET}@h/x",
+        f"u:{SECRET}@h:554/x",
+        f"rtsp://h/x?token={SECRET}",
+    ],
+)
+def test_c1_missing_file_message_hides_credentials(spec: str) -> None:
+    with pytest.raises(FileNotFoundError) as excinfo:
+        FileSource(spec)
+    assert SECRET not in str(excinfo.value)
+    assert "Input file not found" in str(excinfo.value)
+
+
+def test_c1_unreadable_file_message_hides_credentials(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    bad = tmp_path / f"u@{SECRET}.mp4"
+    bad.write_bytes(b"not a video at all")
+    with pytest.raises(OSError, match="Cannot open video file") as excinfo:
+        FileSource(str(bad))
+    assert SECRET not in str(excinfo.value)
+    assert SECRET not in caplog.text
+
+
+def test_c1_input_log_line_hides_credentials(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    clip = _write_clip(tmp_path / f"u@{SECRET}.mp4")
+    with caplog.at_level("INFO", logger="petrify.sources.file"):
+        FileSource(str(clip)).close()
+    assert "Input: " in caplog.text
+    assert SECRET not in caplog.text
+
+
 def test_unreadable_file(tmp_path: Path) -> None:
     bad = tmp_path / "bad.mp4"
     bad.write_bytes(b"not a video at all")

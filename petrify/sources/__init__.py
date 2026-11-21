@@ -25,7 +25,7 @@ from typing import Any, Literal
 
 from petrify.core.plugin import Source
 from petrify.sources.camera import CameraSource
-from petrify.sources.file import FileSource
+from petrify.sources.file import FileSource, display_spec
 from petrify.sources.images import ImageFolderSource
 from petrify.sources.push import PushSession
 from petrify.sources.stream import StreamSource, redact_url
@@ -37,6 +37,7 @@ __all__ = [
     "PushSession",
     "SourceKind",
     "StreamSource",
+    "display_spec",
     "open_source",
     "source_kind",
 ]
@@ -60,12 +61,14 @@ def source_kind(spec: str) -> SourceKind:
     camera index.
 
     Raises ``ValueError`` for a malformed ``camera:`` spec or a URL whose scheme
-    is not supported; the message holds only the redacted URL.
+    is not supported; the message holds the spec only as :func:`display_spec` shows it.
     """
     if spec.startswith("camera:"):
         if _CAMERA.fullmatch(spec) is None:
+            shown = display_spec(spec)
             raise ValueError(
-                f"Invalid camera source {spec!r}: use camera:N with N a non-negative integer"
+                f"Invalid camera source {shown if shown != spec else repr(spec)}: "
+                "use camera:N with N a non-negative integer"
             )
         return "camera"
     scheme = _URL_SCHEME.match(spec.strip())
@@ -95,7 +98,8 @@ def open_source(
     ``fps`` sets the frame rate of an image folder (default 25). ``capture_factory``
     replaces ``cv2.VideoCapture`` for the live sources (tests). A missing video
     file raises ``FileNotFoundError``; for a bare integer the message suggests
-    ``camera:N``. No error message holds an unredacted URL.
+    ``camera:N``. No error message holds a spec with ``@`` or ``://`` other than
+    as :func:`display_spec` shows it.
     """
     kind = source_kind(spec)
     live_kwargs: dict[str, Any] = {}
@@ -106,7 +110,14 @@ def open_source(
     if kind == "stream":
         return StreamSource(spec, **live_kwargs)
     if kind == "images":
-        return ImageFolderSource(spec) if fps is None else ImageFolderSource(spec, fps=fps)
+        try:
+            return ImageFolderSource(spec) if fps is None else ImageFolderSource(spec, fps=fps)
+        except (OSError, ValueError) as exc:
+            shown = display_spec(spec)
+            if shown == spec:
+                raise
+            # The message may hold the spec or one of its paths: replace it whole.
+            raise type(exc)(f"Cannot open image source {shown}") from None
     if spec.strip().isdigit() and not Path(spec).exists():
         raise FileNotFoundError(
             f"Input file not found: {spec} (for a webcam, use camera:{spec.strip()})"

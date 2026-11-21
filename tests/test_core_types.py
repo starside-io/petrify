@@ -323,6 +323,20 @@ def test_roi_warmup_seconds_default_and_validation() -> None:
             RoiConfig(warmup_seconds=bad)
 
 
+def test_l2_roi_max_area_cap_default_and_validation() -> None:
+    assert RoiConfig().max_area_cap == 0.15
+    assert RoiConfig(max_area_cap=1.0).max_area_cap == 1.0
+    for bad in (0.0, -0.1, 1.5, float("nan")):
+        with pytest.raises(ValueError, match="max_area_cap"):
+            RoiConfig(max_area_cap=bad)
+
+
+def test_l1_background_sample_check_defaults_on() -> None:
+    assert BackgroundConfig().sample_check is True
+    assert BackgroundConfig(sample_check=False).sample_check is False
+    assert _config().background.sample_check is True
+
+
 def test_negative_lookahead_rejected() -> None:
     with pytest.raises(ValueError):
         EngineConfig(lookahead=-1)

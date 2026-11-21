@@ -37,6 +37,7 @@ from tqdm import tqdm
 from petrify.background.calibrate import CalibratedBackground, frames_for
 from petrify.background.locked import locked_background
 from petrify.background.running import RunningBackground
+from petrify.background.vetting import person_free
 from petrify.core.config import PetrifyConfig
 from petrify.core.engine import Engine, EngineStats, FrameTrace
 from petrify.core.plugin import BackgroundModel, Detector, Sink, Source, Stage
@@ -46,11 +47,12 @@ from petrify.detectors.person_hog import PersonDetector
 from petrify.encoder import ffmpeg_encode
 from petrify.modes.erase import EraseMode
 from petrify.roi_detect import WarmupRoiDetector, auto_detect_roi
+from petrify.sinks import file as file_sinks
 from petrify.sinks.file import FfmpegPipeSink, FileSink
 from petrify.sinks.preview import PreviewSink
-from petrify.sinks.threaded import ThreadedSink
 from petrify.sinks.virtualcam import VirtualCamSink
 from petrify.sources.file import FileSource
+from petrify.sources.images import ImageFolderSource
 from petrify.stages.roi_overlay import Compositor, RoiOverlay, WarmupRoiOverlay
 
 logger = logging.getLogger(__name__)
@@ -592,6 +594,51 @@ def run_file(
 # Streaming engine runner for any source
 # ---------------------------------------------------------------------------
 
+ONLINE_BACKGROUND_WARNING = (
+    "Background limitation: the clean background is learned from the first seconds "
+    "of the source. A person in view during that time can be absorbed into it and is "
+    "then shown on frozen frames after they leave. The person check reduces this but "
+    "does not eliminate it (it can miss a seated person framed from the chest up). "
+    "Start with the scene empty."
+)
+NO_BACKGROUND_CHECK_WARNING = (
+    "Background person check disabled (--no-background-check): this is unsafe. "
+    "Nothing checks the frames the background is learned from, so a person in view "
+    "while it is built is absorbed into it and shown after they leave."
+)
+NO_BG_DIFF_LIVE_WARNING = (
+    "Background differ disabled (--no-bg-diff) on a live source: a subject who stops "
+    "moving is no longer detected and can be shown. The differ is the only protection "
+    "against that."
+)
+
+
+class NoFramesError(RuntimeError):
+    """The source delivered no frames, so no output could be written."""
+
+
+class FfmpegNotFoundError(RuntimeError):
+    """FFmpeg is needed for the file output and was not found."""
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """True when ``b`` exists and is the same file as ``a``."""
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def output_overwrites_input(source: Source, output: str | Path) -> bool:
+    """True when ``output`` is the file source itself or one of an image folder's images."""
+    out = Path(output)
+    if isinstance(source, FileSource) and source.info.uri:
+        return _same_file(Path(source.info.uri), out)
+    if isinstance(source, ImageFolderSource):
+        return any(_same_file(p, out) for p in source.paths)
+    return False
+
+
 @dataclass(frozen=True)
 class OutputConfig:
     """Where :func:`run_stream` writes: a video file, a virtual camera, a preview window."""
@@ -614,26 +661,28 @@ class OutputConfig:
 def _build_sinks(source: Source, config: PetrifyConfig, outputs: OutputConfig) -> list[Sink]:
     """Build the sinks ``outputs`` selects.
 
-    On a live source the file and virtual camera sinks run on their own thread
-    (``ThreadedSink``, which blocks rather than drops for these critical sinks) so a
-    slow encoder does not stall capture. The preview always stays on the calling
-    thread: GUI calls must run there.
+    Every sink runs on the calling thread, for every source kind. A live source
+    already decouples capture from processing (its capture thread keeps only the
+    latest frame), so the file and virtual camera sinks are not wrapped in a
+    ``ThreadedSink``: the wrapper delivered frames to FFmpeg in bursts and its write
+    timeout could end a run. The preview must stay on the calling thread anyway, as
+    GUI calls must run there.
     """
     info = source.info
     live = info.live
     sinks: list[Sink] = []
     if outputs.file is not None:
         audio = Path(info.uri) if isinstance(source, FileSource) and info.uri else None
-        pipe = FfmpegPipeSink(
-            outputs.file,
-            config.encode,
-            audio_source=audio,
-            wallclock_timestamps=live,
+        sinks.append(
+            FfmpegPipeSink(
+                outputs.file,
+                config.encode,
+                audio_source=audio,
+                wallclock_timestamps=live,
+            )
         )
-        sinks.append(ThreadedSink(pipe) if live else pipe)
     if outputs.virtualcam:
-        cam = VirtualCamSink(device=outputs.virtualcam_device)
-        sinks.append(ThreadedSink(cam) if live else cam)
+        sinks.append(VirtualCamSink(device=outputs.virtualcam_device))
     if outputs.preview:
         sinks.append(PreviewSink())
     return sinks
@@ -642,7 +691,12 @@ def _build_sinks(source: Source, config: PetrifyConfig, outputs: OutputConfig) -
 def _background_for(
     source: Source, config: PetrifyConfig
 ) -> tuple[np.ndarray | BackgroundModel, int | None]:
-    """Return the locked image and its index, or an online model and None."""
+    """Return the locked image and its index, or an online model and None.
+
+    The online models get a person check on their samples (the HOG settings of the
+    locked pre-scan) unless ``config.background.sample_check`` is False. Every run
+    with an online model logs :data:`ONLINE_BACKGROUND_WARNING`.
+    """
     bg_cfg = config.background
     info = source.info
     if bg_cfg.strategy == "locked":
@@ -656,12 +710,21 @@ def _background_for(
             bg_cfg,
             config.background_scan_person_config(),
         )
+    logger.warning(ONLINE_BACKGROUND_WARNING)
+    sample_filter: Callable[[np.ndarray], bool] | None = None
+    if bg_cfg.sample_check:
+        sample_filter = person_free(
+            PersonDetector.from_config(config.background_scan_person_config())
+        )
+    else:
+        logger.warning(NO_BACKGROUND_CHECK_WARNING)
     if bg_cfg.strategy == "running":
         model: BackgroundModel = RunningBackground(
             bg_cfg.running_window,
             bg_cfg.running_interval,
             bg_cfg.running_min_samples,
             recompute_in_background=info.live,
+            sample_filter=sample_filter,
         )
         logger.info(
             "Background: running median (window=%d interval=%d min_samples=%d)",
@@ -676,7 +739,7 @@ def _background_for(
         frames,
         bg_cfg.calibrate_seconds,
     )
-    return CalibratedBackground(frames), None
+    return CalibratedBackground(frames, sample_filter=sample_filter), None
 
 
 def _roi_stage(source: Source, config: PetrifyConfig) -> RoiOverlay | WarmupRoiOverlay:
@@ -694,6 +757,7 @@ def _roi_stage(source: Source, config: PetrifyConfig) -> RoiOverlay | WarmupRoiO
         edge_threshold=roi_cfg.scan_edge_threshold,
         edge_gap_tolerance=roi_cfg.scan_edge_gap_tolerance,
         n_edge_samples=roi_cfg.scan_edge_samples,
+        max_roi_area_frac=roi_cfg.max_area_cap,
     )
     return WarmupRoiOverlay(detector)
 
@@ -754,16 +818,27 @@ def _drive(
     On a live source a ``KeyboardInterrupt`` ends the run: reading stops and the
     engine is closed normally, so the outputs are finalized. If the interrupt
     landed inside a step that already aborted the engine, or on a non-live source,
-    it propagates. Any other exception aborts the engine and propagates. The
-    interrupt guard is removed before the close, so a second Ctrl-C there aborts.
+    it propagates. The interrupt guard is removed before the close, so a second
+    Ctrl-C there aborts.
+
+    Any other exception (not ``SystemExit``) that ends a live run while the engine
+    is still open finalizes the outputs too: everything written so far is processed
+    footage, so it is kept, an error is logged, and the exception propagates. If
+    that close fails as well, the engine is aborted and the original exception
+    propagates. An error inside a step has already aborted the engine (nothing is
+    left to finalize); on a non-live source any error aborts the engine. When the
+    source delivered no frame and closing fails, :class:`NoFramesError` is raised.
     """
     live = source.info.live
     interrupted = False
+    failure: Exception | None = None
+    delivered = 0
     try:
         engine.open(source.info)
         with _InterruptGuard(enabled=live) as guard:
             try:
                 for frame in source:
+                    delivered += 1
                     guard.in_step = True
                     engine.step(frame)
                     guard.in_step = False
@@ -777,12 +852,43 @@ def _drive(
                 if not live or not engine.is_open:
                     raise
                 interrupted = True
+            except Exception as exc:
+                if not live or not engine.is_open:
+                    raise
+                failure = exc
+        if failure is not None:
+            _finalize_after_error(engine, failure)
         if interrupted:
             logger.info("Interrupted by user; finishing the outputs (Ctrl-C again to abort)")
-        return engine.close(), interrupted
+        try:
+            stats = engine.close()
+        except Exception as exc:
+            if delivered == 0:
+                raise NoFramesError(
+                    "The source delivered no frames; no output was written"
+                ) from exc
+            raise
+        return stats, interrupted
     except BaseException:
         engine.abort()
         raise
+
+
+def _finalize_after_error(engine: Engine, failure: Exception) -> None:
+    """Close the engine after a live run failed, keeping the outputs; always raise ``failure``."""
+    try:
+        engine.close()
+    except Exception:
+        logger.exception("Finalizing the outputs after the error failed too; nothing was kept")
+        engine.abort()
+        raise failure from None
+    logger.error(
+        "The run ended early because of an error (%s: %s); the recording up to that "
+        "point was kept",
+        type(failure).__name__,
+        failure,
+    )
+    raise failure
 
 
 def run_stream(
@@ -804,10 +910,23 @@ def run_stream(
     The run stops at the end of the source, when ``stop()`` returns True or a
     preview window asks to stop (both checked after each frame), or on Ctrl-C for a
     live source; the lookahead tail is still written and the outputs are
-    finalized. A ``KeyboardInterrupt`` on a non-live source, or any other error,
-    aborts the outputs and propagates. The source is always closed.
+    finalized. A ``KeyboardInterrupt`` on a non-live source aborts the outputs and
+    propagates. Any other error aborts the outputs and propagates, except on a live
+    source where the outputs written so far are finalized first (see :func:`_drive`).
+    The source is always closed.
+
+    Raises ``ValueError`` when ``outputs.file`` is the input file, or one of the
+    images of an image folder source, and :class:`FfmpegNotFoundError` before any
+    processing when the file output is built here and FFmpeg is missing.
     """
     try:
+        if outputs.file is not None and output_overwrites_input(source, outputs.file):
+            raise ValueError("The output file is the input; choose another output path")
+        if sinks is None and outputs.file is not None:
+            try:
+                file_sinks.find_ffmpeg()
+            except FileNotFoundError as exc:
+                raise FfmpegNotFoundError(str(exc)) from exc
         if sinks is not None:
             sink_list = list(sinks)
         else:
@@ -842,6 +961,8 @@ def run_stream(
                 bg_differ.pixel_threshold,
                 bg_differ.area_threshold,
             )
+        elif source.info.live:
+            logger.warning(NO_BG_DIFF_LIVE_WARNING)
         mode = EraseMode(background, require_background_diff=model_backed)
 
         def should_stop() -> bool:

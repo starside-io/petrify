@@ -73,6 +73,9 @@ class RoiConfig:
     scan_edge_samples: int = 3
     # Auto mode on a source that cannot be scanned in advance: seconds of warmup.
     warmup_seconds: float = 10.0
+    # Warmup detection only: a final box larger than this fraction of the frame is
+    # discarded as too large to be a timestamp.
+    max_area_cap: float = 0.15
 
     def __post_init__(self) -> None:
         if self.mode not in ("manual", "auto", "disabled"):
@@ -85,6 +88,10 @@ class RoiConfig:
             raise ValueError(
                 f"RoiConfig.warmup_seconds must be > 0, got {self.warmup_seconds}"
             )
+        if not 0 < self.max_area_cap <= 1:
+            raise ValueError(
+                f"RoiConfig.max_area_cap must be in (0, 1], got {self.max_area_cap}"
+            )
 
 
 @dataclass(frozen=True)
@@ -94,6 +101,8 @@ class BackgroundConfig:
     ``locked`` pre-scans a file source for one clean frame. ``running`` keeps a
     rolling median of recent frames classified as clean. ``calibrate`` builds the
     background from the first ``calibrate_seconds`` while the user is out of frame.
+    ``sample_check`` (running and calibrate only) rejects background samples in
+    which the HOG person detector finds a person; turning it off is unsafe.
     """
 
     strategy: Literal["locked", "running", "calibrate"] = "locked"
@@ -103,6 +112,7 @@ class BackgroundConfig:
     running_interval: int = 5
     running_min_samples: int = 5
     calibrate_seconds: float = 3.0
+    sample_check: bool = True
 
     def __post_init__(self) -> None:
         if self.strategy not in ("locked", "running", "calibrate"):

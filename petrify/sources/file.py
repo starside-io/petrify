@@ -27,8 +27,22 @@ import cv2
 import numpy as np
 
 from petrify.core.frame import Frame, SourceInfo
+from petrify.sources.stream import redact_url
 
 logger = logging.getLogger(__name__)
+
+
+def display_spec(spec: str | Path) -> str:
+    """Return ``spec`` as it may be shown in messages and logs.
+
+    A spec or path whose text holds ``@`` or ``://`` may be a mistyped stream URL
+    with credentials, so it is shown as ``redact_url(spec)``; anything else is
+    shown unchanged.
+    """
+    text = str(spec)
+    if "@" in text or "://" in text:
+        return redact_url(text)
+    return text
 
 
 class FileSource:
@@ -41,14 +55,17 @@ class FileSource:
     """
 
     def __init__(self, path: str | Path) -> None:
+        # Redaction looks at the text as given: Path() would fold "rtsp://" into "rtsp:/".
+        raw = str(path)
         path = Path(path)
+        shown = str(path) if display_spec(raw) == raw else display_spec(raw)
         if not path.exists():
-            raise FileNotFoundError(f"Input file not found: {path}")
+            raise FileNotFoundError(f"Input file not found: {shown}")
 
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
             cap.release()
-            raise OSError(f"Cannot open video file: {path}")
+            raise OSError(f"Cannot open video file: {shown}")
 
         self._path = path
         self._cap: cv2.VideoCapture | None = cap
@@ -63,7 +80,7 @@ class FileSource:
         )
         logger.info(
             "Input: %s  |  %dx%d @ %.2f fps  |  ~%d frames",
-            path,
+            shown,
             self.info.width,
             self.info.height,
             self.info.fps,

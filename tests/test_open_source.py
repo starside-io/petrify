@@ -210,3 +210,50 @@ def test_bare_integer_naming_an_existing_file_is_opened_as_a_file(
     with pytest.raises(OSError, match="Cannot open video file"):
         open_source("0", capture_factory=factory)
     assert factory.captures == []
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        f"camera:rtsp://u:{SECRET}@h/x",
+        f"camera:u:{SECRET}@h",
+    ],
+)
+def test_c1_malformed_camera_spec_hides_credentials(spec: str) -> None:
+    with pytest.raises(ValueError, match="camera:N") as excinfo:
+        source_kind(spec)
+    assert SECRET not in str(excinfo.value)
+    with pytest.raises(ValueError) as excinfo:
+        open_source(spec, capture_factory=Factory())
+    assert SECRET not in str(excinfo.value)
+
+
+def test_c1_malformed_camera_spec_without_credentials_is_shown() -> None:
+    with pytest.raises(ValueError, match="'camera:x'"):
+        source_kind("camera:x")
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [f"rtsp:/u:{SECRET}@h/x", f"u:{SECRET}@h:554/x", f"rtsp:/h/x/token={SECRET}://"],
+)
+def test_c1_mistyped_stream_spec_as_missing_file_hides_credentials(spec: str) -> None:
+    assert source_kind(spec) == "file"
+    with pytest.raises(FileNotFoundError) as excinfo:
+        open_source(spec, capture_factory=Factory())
+    assert SECRET not in str(excinfo.value)
+
+
+def test_c1_image_glob_with_credentials_hides_them(tmp_path: Path) -> None:
+    spec = str(tmp_path / f"u:{SECRET}@h" / "*.png")
+    assert source_kind(spec) == "images"
+    with pytest.raises(ValueError) as excinfo:
+        open_source(spec)
+    assert SECRET not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None and excinfo.value.__suppress_context__
+
+
+def test_c1_plain_missing_path_is_shown_unchanged(tmp_path: Path) -> None:
+    missing = tmp_path / "plain_missing.mp4"
+    with pytest.raises(FileNotFoundError, match=f"Input file not found: {missing}"):
+        open_source(str(missing))
