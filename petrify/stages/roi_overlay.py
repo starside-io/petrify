@@ -23,6 +23,7 @@ import logging
 import numpy as np
 
 from petrify.core.frame import Frame
+from petrify.roi_detect import WarmupRoiDetector
 
 logger = logging.getLogger(__name__)
 
@@ -172,3 +173,54 @@ class RoiOverlay:
     def apply(self, frame: Frame, image: np.ndarray) -> np.ndarray:
         """Return *image* with the ROI region taken from ``frame.image``."""
         return self._compositor.compose(image, self._compositor.extract_roi(frame.image))
+
+
+class WarmupRoiOverlay:
+    """Stage that detects the ROI on a warmup window, then behaves like :class:`RoiOverlay`.
+
+    While the detector is not done, every frame's image is fed to it and the mode's
+    output is returned unchanged: nothing from the live frame is pasted during
+    warmup, so a frozen frame shows the frozen timestamp. That is the safe
+    direction, since pasting an unverified region could expose part of a person.
+    Once the detector is done the stage locks onto ``RoiOverlay(detector.roi)``
+    (identity when the ROI is None), starting with the frame that completed it.
+
+    Stages see frames in release order after the lookahead, which is still stream
+    order, so feeding the detector from here is valid.
+    """
+
+    def __init__(self, detector: WarmupRoiDetector) -> None:
+        self._detector = detector
+        self._overlay: RoiOverlay | None = None
+
+    @property
+    def locked(self) -> bool:
+        """True once the detector is done and the ROI is fixed."""
+        return self._overlay is not None
+
+    @property
+    def roi(self) -> tuple[int, int, int, int] | None:
+        """The locked ROI, or None while warming up or when nothing was found."""
+        return None if self._overlay is None else self._overlay.roi
+
+    def apply(self, frame: Frame, image: np.ndarray) -> np.ndarray:
+        """Feed the detector during warmup (returning *image*), then paste the live ROI."""
+        overlay = self._overlay
+        if overlay is None:
+            detector = self._detector
+            if not detector.done:
+                detector.update(frame.image)
+                if not detector.done:
+                    return image
+            overlay = self._lock(detector.roi)
+        return overlay.apply(frame, image)
+
+    def _lock(self, roi: tuple[int, int, int, int] | None) -> RoiOverlay:
+        """Create the overlay for *roi* and log it once."""
+        overlay = RoiOverlay(roi)
+        self._overlay = overlay
+        if roi is None:
+            logger.info("Warmup ROI detection found nothing; the ROI overlay is disabled.")
+        else:
+            logger.info("Auto ROI detected: x=%d y=%d w=%d h=%d", *roi)
+        return overlay

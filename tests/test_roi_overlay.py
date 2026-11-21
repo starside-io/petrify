@@ -74,3 +74,78 @@ def test_inputs_not_mutated() -> None:
     RoiOverlay((10, 10, 30, 30)).apply(_frame(live), mode_image)
     assert np.array_equal(live, live_before)
     assert np.array_equal(mode_image, mode_before)
+
+
+# ---------------------------------------------------------------------------
+# WarmupRoiOverlay
+# ---------------------------------------------------------------------------
+
+
+def _warmup_stage(warmup_seconds: float = 3.0, **scene_kwargs):
+    """A WarmupRoiOverlay on a real detector plus the synthetic scene it will see."""
+    from petrify.roi_detect import WarmupRoiDetector
+    from petrify.stages import WarmupRoiOverlay
+    from tests.test_roi_warmup import FPS, scene
+
+    detector = WarmupRoiDetector(FPS, warmup_seconds)
+    frames = [scene(i, **scene_kwargs) for i in range(detector.warmup_frames + 5)]
+    return WarmupRoiOverlay(detector), detector, frames
+
+
+def _scene_frame(image: np.ndarray, index: int) -> Frame:
+    h, w = image.shape[:2]
+    info = SourceInfo(fps=4.0, width=w, height=h, frame_count=None, seekable=False, live=True)
+    return Frame(image=image, index=index, timestamp=index / 4.0, source=info)
+
+
+def test_warmup_overlay_satisfies_stage() -> None:
+    stage, _, _ = _warmup_stage()
+    assert isinstance(stage, Stage)
+
+
+def test_warmup_overlay_is_identity_during_warmup() -> None:
+    stage, detector, frames = _warmup_stage()
+    for i in range(detector.warmup_frames - 1):
+        mode_image = np.full_like(frames[i], 7)
+        before = mode_image.copy()
+        out = stage.apply(_scene_frame(frames[i], i), mode_image)
+        assert out is mode_image
+        assert np.array_equal(out, before)  # Nothing from frame.image was pasted in.
+        assert not stage.locked
+        assert stage.roi is None
+
+
+def test_warmup_overlay_matches_roi_overlay_after_lock() -> None:
+    stage, detector, frames = _warmup_stage()
+    for i, image in enumerate(frames):
+        mode_image = np.full_like(image, 7)
+        out = stage.apply(_scene_frame(image, i), mode_image)
+        if i >= detector.warmup_frames - 1:
+            assert stage.locked
+            assert stage.roi == detector.roi is not None
+            expected = RoiOverlay(stage.roi).apply(_scene_frame(image, i), mode_image)
+            assert np.array_equal(out, expected)
+            assert not np.array_equal(out, mode_image)
+
+
+def test_warmup_overlay_none_roi_is_identity_forever() -> None:
+    stage, detector, frames = _warmup_stage(clock=None)
+    for i, image in enumerate(frames):
+        mode_image = np.full_like(image, 7)
+        assert stage.apply(_scene_frame(image, i), mode_image) is mode_image
+    assert detector.done
+    assert stage.locked
+    assert stage.roi is None
+
+
+def test_warmup_overlay_locks_once(caplog) -> None:
+    stage, detector, frames = _warmup_stage()
+    with caplog.at_level("INFO", logger="petrify.stages.roi_overlay"):
+        for i, image in enumerate(frames):
+            stage.apply(_scene_frame(image, i), np.full_like(image, 7))
+    locks = [r for r in caplog.records if r.getMessage().startswith("Auto ROI detected:")]
+    assert len(locks) == 1
+    x, y, w, h = detector.roi
+    assert locks[0].getMessage() == f"Auto ROI detected: x={x} y={y} w={w} h={h}"
+    # Later frames no longer reach the detector.
+    assert detector.frames_seen == detector.warmup_frames

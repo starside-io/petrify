@@ -18,6 +18,6 @@
 
 from __future__ import annotations
 
-from petrify.stages.roi_overlay import Compositor, RoiOverlay
+from petrify.stages.roi_overlay import Compositor, RoiOverlay, WarmupRoiOverlay
 
-__all__ = ["Compositor", "RoiOverlay"]
+__all__ = ["Compositor", "RoiOverlay", "WarmupRoiOverlay"]
