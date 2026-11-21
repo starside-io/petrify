@@ -30,7 +30,7 @@ The detectors themselves already process one frame at a time, so they survive th
 ## Core idea: one streaming engine
 
 ```
-Source ──▶ Detectors (lazy) ──▶ Lookahead buffer ──▶ Mode (stage chain) ──▶ Sinks (fan-out)
+Source ──▶ Detectors (lazy) ──▶ Lookahead buffer ──▶ Mode (stage chain) ──▶ Sinks (in order)
                                    (K frames)          erase | shadow | ...
 ```
 
@@ -64,7 +64,8 @@ If a detector raises, or the per-frame time budget is exceeded, the output frame
 
 - Live sources: a capture thread keeps only the latest frame (older frames are dropped) so latency never accumulates.
 - File sources: no frames are dropped.
-- Sinks run as a fan-out so a slow sink does not stall processing.
+- Sinks are written one after another, in order, on the engine thread. `petrify run` wraps none of them. A library caller can isolate a slow sink by wrapping it in `ThreadedSink`, which writes on a worker thread through a bounded queue (a full queue drops the oldest frame for a non-critical sink and blocks, with a timeout, for a critical one).
+- A non-critical sink that fails is aborted, dropped, and counted in `sink_failures` while the run continues; if no sink is left the engine aborts. A critical sink that fails aborts the engine: every active sink is aborted, pending frames are discarded, and the error propagates.
 
 ## Proposed structure
 
@@ -81,7 +82,7 @@ petrify/
     camera.py        # webcam by index (AVFoundation / V4L2 / DirectShow)
     stream.py        # RTSP, HTTP MJPEG (IP cameras, ESP32-CAM, Raspberry Pi)
     images.py        # folder or glob of still images
-    push.py          # library API: engine.push(frame) -> frame
+    push.py          # library API: PushSession(engine, w, h).push(image) -> image | None
   detectors/
     motion.py        # existing MOG2
     bgdiff.py        # existing, extended to return a mask
@@ -154,7 +155,7 @@ Profiles are presets of defaults, not code forks. Every value can be overridden.
 - FastAPI + uvicorn, one static HTML page with vanilla JS. No build step.
 - Output preview as an MJPEG `<img>` stream.
 - Raw side-by-side preview is opt-in, so the unprocessed feed is not exposed by default.
-- Controls: mode, style, strength, box padding, hold frames, lookahead, debug overlay (boxes and landmarks). Changes are sent over REST or WebSocket and applied live at the next frame boundary.
+- Controls: mode, style, strength, box padding, hold frames, lookahead, debug overlay (boxes and landmarks). Changes are sent over REST and applied live at the next frame boundary.
 - Stats: fps, per-stage timing, dropped frames, fail-closed events.
 - Binds to `127.0.0.1` only.
 

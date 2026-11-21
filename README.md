@@ -25,7 +25,7 @@ Security footage is relentlessly honest. It records everything: every arrival, e
 
 `petrify` comes from the idea of turning a scene to stone: immovable, unchanging, as if the world held its breath. The motion is real. The stillness is manufactured. Only the time is true.
 
-It uses [OpenCV's MOG2](https://docs.opencv.org/4.x/d7/d7b/classcv_1_1BackgroundSubtractorMOG2.html) background subtractor, a [HOG person detector](https://docs.opencv.org/4.x/d5/d33/structcv_1_1HOGDescriptor.html), and a static background differ. Three complementary signals that together catch every subject: one moving fast, one standing still, one barely visible at the edge of the frame.
+It uses [OpenCV's MOG2](https://docs.opencv.org/4.x/d7/d7b/classcv_1_1BackgroundSubtractorMOG2.html) background subtractor, a [HOG person detector](https://docs.opencv.org/4.x/d5/d33/structcv_1_1HOGDescriptor.html), and a static background differ. Three complementary signals, each aimed at a different kind of subject: one moving fast, one standing still, one barely visible at the edge of the frame.
 
 ---
 
@@ -305,7 +305,7 @@ Known limitations, in particular for live use:
 
 ## How it works: three-detector pipeline
 
-Both command forms run the same streaming engine. `petrify INPUT OUTPUT` writes an intermediate file and re-encodes it with FFmpeg, as shown below; `petrify run --output` pipes frames to FFmpeg in one pass instead. petrify uses three complementary signals that together cover every failure mode:
+Both command forms run the same streaming engine. `petrify INPUT OUTPUT` writes an intermediate file and re-encodes it with FFmpeg, as shown below; `petrify run --output` pipes frames to FFmpeg in one pass instead. petrify uses three complementary signals, each aimed at a different kind of subject:
 
 ```
 input video
