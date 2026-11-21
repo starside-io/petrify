@@ -1,6 +1,6 @@
 # petrify refactor plan: real-time core + plugin modes
 
-Status: phases 0 and 1 are done. Phases 2 to 6 are planned and not implemented yet.
+Status: phases 0 to 3 are done. Phases 4 to 6 are planned and not implemented yet.
 
 ## Goals
 
@@ -158,14 +158,26 @@ Profiles are presets of defaults, not code forks. Every value can be overridden.
 - Stats: fps, per-stage timing, dropped frames, fail-closed events.
 - Binds to `127.0.0.1` only.
 
+Implemented in phase 3 (`petrify run --web`): the processed MJPEG feed, the opt-in raw preview (`--web-raw-preview`), run stats and per-stage timings, a stop button, and controls for the erase settings only (detector, detector thresholds, background differ, lookahead, frame budget, ROI), with a list of weakened protections. Changes are sent over REST only (the page polls the state); there is no WebSocket. Mode, style, strength, box padding, hold frames, and the debug overlay belong to later phases.
+
+## Findings from phases 2 and 3
+
+Design points that later phases must address:
+
+- The lookahead smooths a boolean (subject present or not), so gap-filled frames carry no boxes. Modes that need boxes on those frames (shadow, tracker hold) need another way to fill them.
+- The detector short-circuit (the detectors after MOG2 stop at the first hit) is an erase policy. Modes that need every detection, such as boxes from all detectors, cannot use it.
+- Online backgrounds (`running`, `calibrate`) need a stronger person or face detector for their sample check. HOG often misses a seated person framed from the chest up, the usual webcam view.
+- A lasting lighting change freezes the output of an online background, which keeps showing the old background.
+- The live paths (webcams, streams, virtual camera, preview) were developed against test doubles and still need verification on real hardware.
+
 ## Phases
 
 | # | Phase | Done when |
 |---|---|---|
 | 0 | Golden tests (done) | Per-frame classification of the current pipeline on the demo clips is captured as test fixtures. |
 | 1 | Core engine refactor (done) | `petrify in.mp4 out.mp4` matches the golden output through the new engine. |
-| 2 | Live sources + sinks | Webcam, RTSP, image folder, and push API inputs; preview, ffmpeg pipe, and virtual cam outputs. Erase mode runs live. |
-| 3 | Webapp | Live feed visible in the browser; erase config tweakable live. |
+| 2 | Live sources + sinks (done) | Webcam, RTSP, image folder, and push API inputs; preview, ffmpeg pipe, and virtual cam outputs. Erase mode runs live. |
+| 3 | Webapp (done) | Live feed visible in the browser; erase config tweakable live. |
 | 4 | Plugin API + new detectors | YuNet, segmentation, DNN person detector, tracker. Entry-point loading works. |
 | 5 | `petrify-shadow` plugin | All styles implemented and stackable. |
 | 6 | CCTV hardening | Head-from-body fallback, multi-camera, performance budgets, fail-closed tests. |

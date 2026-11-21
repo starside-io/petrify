@@ -105,6 +105,18 @@ Or with plain pip into a virtualenv:
 pip install petrify
 ```
 
+### 3. Optional extras (for `petrify run`)
+
+Some outputs of [`petrify run`](#petrify-run-cameras-streams-and-image-folders) need extra packages. The `petrify INPUT OUTPUT` form needs none of them.
+
+| Output | Install | Notes |
+|---|---|---|
+| `--web` (local web page) | `pip install 'petrify[web]'` | Installs FastAPI and uvicorn |
+| `--virtualcam` (virtual camera) | `pip install 'petrify[virtualcam]'` | Installs pyvirtualcam. On macOS it also needs OBS 30 or newer, whose virtual camera is the device pyvirtualcam drives |
+| `--preview` (local window) | `pip uninstall opencv-python-headless && pip install opencv-python` | petrify depends on the headless OpenCV build, which has no GUI support |
+
+With pipx, add the extras to the install: `pipx install 'petrify[web,virtualcam]'`.
+
 ---
 
 ## Quick start
@@ -169,9 +181,131 @@ Petrify: 100%|██████████| 655/655 [00:02<00:00, 308.86fr/s]
 
 ---
 
+## `petrify run`: cameras, streams, and image folders
+
+`petrify INPUT OUTPUT` is unchanged. A second command form, `petrify run --source SPEC`, reads from more kinds of source and writes to one or more outputs in one streaming pass. Run `petrify run --help` for every option.
+
+> The live paths (webcams, stream URLs, the virtual camera, and the preview window) have not been verified on real hardware yet. Read [Before you rely on it](#before-you-rely-on-it) before you depend on them.
+
+```bash
+# Same result as: petrify input.mp4 output.mp4
+petrify run --source input.mp4 --output output.mp4
+
+# Webcam to a virtual camera for video calls, with a preview window
+petrify run --source camera:0 --virtualcam --preview
+
+# IP camera to a file; step out of view for the first 5 seconds
+petrify run --source rtsp://camera.local/stream --output out.mp4 \
+    --background calibrate --calibrate-seconds 5
+
+# Image folder at 10 fps
+petrify run --source 'frames/*.png' --fps 10 --output out.mp4
+```
+
+The run form is selected when the first argument that is not an option is `run` and `--source` is given. Otherwise the arguments are `INPUT OUTPUT`, so a file named `run` still works: `petrify run out.mp4`.
+
+### Sources
+
+| `--source` | Reads |
+|---|---|
+| A file path, such as `input.mp4` | A video file. A bare number such as `0` is a file name, not a camera |
+| A directory, or a glob such as `'frames/*.png'` | Still images in natural name order (`frame2.png` before `frame10.png`), at `--fps` frames per second (default 25) |
+| `camera:N` | Webcam number N |
+| `rtsp://`, `rtsps://`, `http://`, `https://` URL | A network stream (RTSP, HTTP MJPEG) |
+
+On a live source (`camera:N` or a stream URL) a capture thread keeps only the newest frame, so a slow run drops frames instead of falling behind. Stream URLs are redacted in logs and error messages: at most the scheme, host, and port are shown. Credentials are replaced with `***`, and the path and query are dropped.
+
+For library use, `petrify.sources.PushSession` feeds in-memory frames to an engine one by one and returns the processed frames.
+
+### Outputs
+
+At least one is required, and several can be combined.
+
+| Flag | Output |
+|---|---|
+| `--output PATH` | A video file, encoded by FFmpeg in one pass through a pipe (no intermediate file). FFmpeg writes to `<name>.partial<suffix>`, which is moved onto `PATH` only when the encode succeeds, so a failed run never leaves a file at `PATH` and never replaces an existing one. For a video file source its audio is copied |
+| `--virtualcam` | A virtual camera that video call apps can select. `--virtualcam-device NAME` picks the device (default: the first one). Needs `petrify[virtualcam]`, and OBS 30 or newer on macOS |
+| `--preview` | A local window. `q` or Escape ends the run. Needs an OpenCV build with GUI support |
+| `--web` | A local web page to watch the processed feed and change settings while the run is in progress. Needs `petrify[web]`. See [The web page](#the-web-page) |
+
+On a live source the run ends with Ctrl-C (or `q` in the preview window), and the output file is still finalized. A second Ctrl-C while the outputs are being finalized aborts. If a live run fails, the recording up to that point is kept and the error is logged.
+
+### Defaults by source kind
+
+Some defaults depend on the source kind. Every value can be overridden with the flag named in the column.
+
+| Source | `--background` | `--lookahead` | Timestamp ROI |
+|---|---|---|---|
+| Video file | `locked` | 10 | Auto-detected on the whole clip before processing |
+| Image folder or glob | `locked` | 10 | Auto-detected on the first `--roi-warmup` seconds (default 10), then locked |
+| Stream URL | `running` | 10 | Auto-detected on the first `--roi-warmup` seconds (default 10), then locked |
+| `camera:N` | `running` | 3 | Disabled. `--roi-auto` turns warmup detection on |
+
+`--lookahead` is the run form's name for `--gap-fill`: every frame is delayed by this many frames, and every detection is expanded by as many frames on both sides. A smaller value lowers the latency but lets more of a slowly entering subject through before it is detected. It is capped at 600, because the buffered frames are kept uncompressed. `--gap-fill` itself is not accepted by `petrify run`.
+
+During warmup ROI detection nothing is pasted until the region locks. A detected box larger than `--roi-max-area` of the frame (default 0.15) is discarded as too large to be a timestamp, so nothing is pasted. A webcam has no burned-in timestamp and detection there can lock onto a person, which is why the ROI is off for `camera:N` unless `--roi` or `--roi-auto` is given. A manual `--roi` larger than that cap is accepted, with a warning that the region is shown live.
+
+### Background strategies
+
+| `--background` | How the clean background is found |
+|---|---|
+| `locked` | Pre-scan the source for one clean frame (video files and image folders only). `--background-frame N` picks the frame |
+| `running` | Rolling median of recent frames with no subject |
+| `calibrate` | Median of the first `--calibrate-seconds` (default 3), while the scene is empty |
+
+Frames are written black until the background is ready. With `running` or `calibrate`, every frame the background is learned from is first checked with the HOG person detector, and a frame in which it finds a person is not used. `--no-background-check` turns that check off and is unsafe. At startup petrify logs a warning that a person in view while the background is learned can be absorbed into it. The check reduces this but does not eliminate it: start with the scene empty either way. See [Before you rely on it](#before-you-rely-on-it).
+
+### Fail closed
+
+A frame that cannot be processed safely is written black and counted: a detector error, the background not ready yet, or a frame over `--frame-budget-ms` (the per-frame time budget for detection plus rendering; no budget by default). The end-of-run summary reports how many frames failed closed.
+
+### The web page
+
+`--web` serves a page on `127.0.0.1` at `--web-port` (default 8765; 0 picks a free port). At start petrify prints the link to the terminal:
+
+```
+Web page (this link gives control of this run to whoever has it): http://127.0.0.1:PORT/#token=...
+```
+
+The page shows the processed feed (what the outputs receive), the run's status (source, background state, frame counters, frames failed closed and dropped, output frame rate, detect, render, and write timings, the ROI in use, the last error), a settings form, and a button that stops the run and finalizes the outputs. While the run is in progress the page can change:
+
+- the detector (`motion`, `person`, `both`)
+- the motion detector's area and variance thresholds and shadow detection
+- the person detector's minimum confidence, minimum box area, and pyramid scale
+- the background differ (on or off) and its pixel and area thresholds
+- the lookahead and the frame budget
+- the ROI: disabled, or a manual box no larger than the run's `--roi-max-area` of the frame
+
+The values are bounded more tightly than on the command line, so every detector can still fire. The background strategy, the source, the outputs, the mode, the encoding, the MOG2 history, and the downsample factors are fixed for the run. Changes are applied at the next frame boundary, and each one briefly freezes the output: the frames buffered at that moment and at least one lookahead window after them show the background. A change of only the frame budget freezes nothing.
+
+A "Weakened protections" list on the page names every setting in effect that can let a person be shown: the background differ off, the person detector alone with the differ off, a detector threshold more than twice its startup value, a lookahead below its startup value or 0, a manual ROI over 5 percent of the frame, and the raw preview. Each newly weakened protection is also logged as a warning.
+
+`--realtime` processes a video file or image folder no faster than its frame rate, so it can be watched on the page. It changes no output frame and is ignored for live sources.
+
+Security model:
+
+- The server listens on `127.0.0.1` only, and every request must carry a `Host` of exactly `127.0.0.1:PORT`. Use the printed `http://127.0.0.1:PORT/` link: `localhost` is refused on purpose, because the server does not listen on `[::1]`, where another local user could.
+- The link holds a per-run token. Whoever has the link controls the run, so do not share it. The token is never logged, and the server's access log is off.
+- The unprocessed input feed is never served unless the run was started with `--web-raw-preview`, which shows it next to the processed feed and lists it as a weakened protection.
+
+---
+
+## Before you rely on it
+
+Known limitations, in particular for live use:
+
+1. **Live paths are unverified on real hardware.** Webcams (`camera:N`), stream URLs, `--virtualcam`, and `--preview` were developed and tested against test doubles. They have not been verified with real cameras, streams, virtual camera drivers, or windows.
+2. **An online background can absorb a person.** With `--background running` or `calibrate`, a person in view while the background is learned can be absorbed into it and then shown on frozen frames after they leave. The person check on background samples reduces this, but it uses the HOG pedestrian detector, which often misses a seated person framed from the chest up (the usual webcam view). Start with the scene empty. Do not rely on erase mode on a webcam for privacy yet; stronger detectors are planned.
+3. **The timestamp ROI is shown live.** Anything inside the ROI region is not anonymized, by design.
+4. **A slow entry at the frame edge can show through.** A subject entering slowly at the edge of the frame can be partly visible for a few frames before it is detected, more so with a small `--lookahead` (the `camera:N` default is 3).
+5. **A lasting lighting change freezes an online background.** With `running` or `calibrate` and the background differ on (the default), a lasting change in lighting makes every frame differ from the learned background, so the output freezes and keeps showing the old background.
+6. **Golden parity tests need demo clips that are not in the repository.** Without `data/camera.mp4` and `data/camera2.mp4` they are skipped.
+
+---
+
 ## How it works: three-detector pipeline
 
-petrify uses three complementary signals that together cover every failure mode:
+Both command forms run the same streaming engine. `petrify INPUT OUTPUT` writes an intermediate file and re-encodes it with FFmpeg, as shown below; `petrify run --output` pipes frames to FFmpeg in one pass instead. petrify uses three complementary signals that together cover every failure mode:
 
 ```
 input video
@@ -192,7 +326,7 @@ input video
          │              ↓                both detectors miss
          │         subject present = True / False
          │
-         ├── Lookahead buffer: output delayed by --gap-fill frames
+         ├── Lookahead buffer: output delayed by --gap-fill frames (--lookahead in petrify run)
          │         gap-fill ±10 frames  (bridges missed detections mid-sequence)
          │         cold-start freeze    (first 50 frames, MOG2 warmup window)
          │
@@ -244,6 +378,8 @@ petrify scans every 5th frame with the HOG person detector, collects all clean f
 ```
 usage: petrify [options] INPUT OUTPUT
 ```
+
+This section lists the options of the `petrify INPUT OUTPUT` form. `petrify run` accepts the same ROI, detector, background, motion, and encoding options except `--gap-fill` (use `--lookahead`), plus the options described in [`petrify run`](#petrify-run-cameras-streams-and-image-folders). In the run form `--hwaccel` does not speed anything up, because petrify decodes the source itself; choose a hardware encoder with `--codec` instead.
 
 ### Positional
 
@@ -311,7 +447,7 @@ usage: petrify [options] INPUT OUTPUT
 | tqdm | 4.65 | Progress bars |
 | FFmpeg | Any recent | System binary. `brew install ffmpeg` / `apt install ffmpeg` |
 | RAM | 2 GB | 4 GB recommended for 1080p |
-| Storage | Source file size × 2 | Temporary intermediate video file written before the FFmpeg re-encode |
+| Storage | Source file size × 2 | `petrify INPUT OUTPUT` writes a temporary intermediate video file before the FFmpeg re-encode; `petrify run --output` does not |
 
 No GPU required. All detection runs on CPU via OpenCV.
 
@@ -340,7 +476,7 @@ Speed scales with resolution and source frame rate. Low-FPS cameras (6fps) proce
 | 4K | Needs GPU | Recommended | Recommended |
 
 - Use `--downsample 0.25` for 4K to reduce MOG2 cost.
-- The bottleneck for large resolutions is OpenCV's `VideoWriter` (intermediate file I/O). Use a fast SSD or a RAM-backed `/tmp`.
+- With `petrify INPUT OUTPUT`, the bottleneck for large resolutions is OpenCV's `VideoWriter` (intermediate file I/O). Use a fast SSD or a RAM-backed `/tmp`.
 
 ---
 

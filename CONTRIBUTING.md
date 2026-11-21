@@ -66,7 +66,13 @@ source .venv/bin/activate   # macOS / Linux
 pip install -e ".[dev]"
 ```
 
-This installs `pytest`, `pytest-cov`, `ruff`, and `mypy`.
+This installs `pytest`, `pytest-cov`, `ruff`, `mypy`, and `httpx`.
+
+The web page tests (`tests/test_server.py`) also need FastAPI and uvicorn, from the `web` extra; without them they are skipped:
+
+```bash
+pip install -e ".[dev,web]"
+```
 
 ### Verify the install
 
@@ -96,6 +102,8 @@ pytest -m golden
 ```
 
 Tests live in the `tests/` directory, one file per module (for example `tests/test_engine.py` covers `petrify/core/engine.py`). If you add a new feature, please add tests.
+
+Tests must never open a real camera, network stream, window, or virtual camera. The live sources and the preview and virtual camera sinks take injected fakes for this (for example `capture_factory`, `camera_factory`, `gui`); use them.
 
 ### Golden tests
 

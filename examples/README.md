@@ -134,6 +134,69 @@ The log will show:
 
 ---
 
+## `petrify run`: other sources and outputs
+
+`petrify run --source SPEC` reads a video file, an image folder or glob, a
+webcam (`camera:N`), or an RTSP or HTTP stream, and writes to one or more
+outputs. See `petrify run --help` and the README for the options and the
+defaults per source kind.
+
+Note: the live paths (`camera:N`, stream URLs, `--virtualcam`, `--preview`)
+have not been verified on real hardware yet. See "Before you rely on it" in
+the README.
+
+### Video file
+
+```bash
+petrify run --source input.mp4 --output output.mp4
+```
+
+Processes the same frames as `petrify input.mp4 output.mp4`, but FFmpeg
+encodes them in one pass through a pipe instead of from an intermediate file.
+
+### Image folder
+
+```bash
+petrify run --source 'frames/*.png' --fps 10 --output out.mp4
+```
+
+Reads the images in natural name order (`frame2.png` before `frame10.png`) as
+a 10 fps video; the timestamp ROI is detected on the first 10 seconds, then locked.
+
+### Webcam to a virtual camera
+
+```bash
+petrify run --source camera:0 --virtualcam --preview
+```
+
+Needs `pip install 'petrify[virtualcam]'` (and OBS 30 or newer on macOS) and,
+for `--preview`, an OpenCV build with GUI support. Frames are black until the
+running background is ready; start with the scene empty. Ctrl-C, or `q` in
+the preview window, ends the run.
+
+### IP camera stream to a file
+
+```bash
+petrify run --source rtsp://camera.local/stream --output out.mp4 \
+    --background calibrate --calibrate-seconds 5
+```
+
+The first seconds are black while the background is calibrated: stay out of
+view. Ctrl-C ends the run and `out.mp4` is still finalized. The URL is shown
+redacted in the log.
+
+### Watch and tune on the local web page
+
+```bash
+petrify run --source input.mp4 --output output.mp4 --web --realtime
+```
+
+Needs `pip install 'petrify[web]'`. Prints a `http://127.0.0.1:8765/#token=...`
+link: open that exact link (not `localhost`), and do not share it, since it
+gives control of the run. `--realtime` plays the file at its own frame rate.
+
+---
+
 ## Docker / cloud batch processing
 
 ```bash
