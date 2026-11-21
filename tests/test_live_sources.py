@@ -20,7 +20,12 @@ from __future__ import annotations
 
 import logging
 import math
+import random
+import re
 import threading
+import time
+import traceback
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -269,7 +274,7 @@ def test_read_exception_surfaces_in_consumer() -> None:
     src = stream_source(fake)
     it = iter(src)
     assert int(next(it).image[0, 0, 0]) == 1
-    with pytest.raises(RuntimeError, match="decoder exploded"):
+    with pytest.raises(OSError, match="RuntimeError"):
         next(it)
     src.close()
     assert fake.release_count == 1
@@ -458,15 +463,15 @@ def test_camera_open_failure_raises_and_releases() -> None:
 @pytest.mark.parametrize(
     ("url", "expected"),
     [
-        ("rtsp://user:secret@host:554/path?token=abc", "rtsp://***@host:554/path"),
-        ("rtsps://user:secret@host/path", "rtsps://***@host/path"),
-        ("http://user@cam.local/video.mjpg", "http://***@cam.local/video.mjpg"),
-        ("https://u:p@cam.local:8443/stream?auth=xyz#frag", "https://***@cam.local:8443/stream"),
-        ("rtsp://host:554/path", "rtsp://host:554/path"),
-        ("http://192.168.1.20:81/stream", "http://192.168.1.20:81/stream"),
-        ("https://cam.local/stream?token=abc", "https://cam.local/stream"),
+        ("rtsp://user:secret@host:554/path?token=abc", "rtsp://***@host:554"),
+        ("rtsps://user:secret@host/path", "rtsps://***@host"),
+        ("http://user@cam.local/video.mjpg", "http://***@cam.local"),
+        ("https://u:p@cam.local:8443/stream?auth=xyz#frag", "https://***@cam.local:8443"),
+        ("rtsp://host:554/path", "rtsp://host:554"),
+        ("http://192.168.1.20:81/stream", "http://192.168.1.20:81"),
+        ("https://cam.local/stream?token=abc", "https://cam.local"),
         ("rtsp://host", "rtsp://host"),
-        ("rtsp://user:p@ss@host/path", "rtsp://***@host/path"),
+        ("rtsp://user:p@ss@host/path", "rtsp://***@host"),
         ("not a url", "not a url"),
         ("/dev/video0", "/dev/video0"),
         ("", ""),
@@ -474,6 +479,138 @@ def test_camera_open_failure_raises_and_releases() -> None:
 )
 def test_redact_url(url: str, expected: str) -> None:
     assert redact_url(url) == expected
+
+
+REDACTED = "<redacted>"
+SCHEME_REDACTED = "rtsp://<redacted>"
+
+
+# (url, expected, secret substrings that must not survive)
+_REDACTION_TABLE: list[tuple[str, str, tuple[str, ...]]] = [
+    # S1 confirmed leaks.
+    ("rtsp://admin:pa/ss@cam/live", SCHEME_REDACTED, ("pa/ss", "admin", "cam")),
+    ("rtsp://admin:pa?ss@cam", SCHEME_REDACTED, ("pa?ss", "admin", "cam")),
+    ("rtsp://admin:pa#ss@cam", SCHEME_REDACTED, ("pa#ss", "admin", "cam")),
+    ("admin:secret@cam:554/live", REDACTED, ("secret", "admin")),
+    ("//admin:secret@cam/live", REDACTED, ("secret", "admin")),
+    ("rtsp:/admin:secret@cam", REDACTED, ("secret", "admin")),
+    ("rtsp:admin:secret@cam", REDACTED, ("secret", "admin")),
+    ("rtsp://cam/live;user=admin;password=secret", "rtsp://cam", ("secret", "admin")),
+    ("http://cam/stream/tok_SECRET/video", "http://cam", ("tok_SECRET",)),
+    # An "@" at or after the first delimiter is ambiguous: the host is hidden, not guessed.
+    ("http://cam/a@tok_SECRET/video", "http://<redacted>", ("tok_SECRET",)),
+    ("rtsp://admin:pw@cam/live?mail=a@b.com", SCHEME_REDACTED, ("admin", "pw", "b.com")),
+    ("http://cam/live#frag@evil", "http://<redacted>", ("frag", "evil")),
+    ("rtsp://cam\\x@secret", SCHEME_REDACTED, ("secret",)),
+    # Cases that already worked.
+    ("rtsp://user:p@ss@host/path", "rtsp://***@host", ("p@ss", "user")),
+    ("rtsp://us%40er:pa%2Fss%3A@cam.local:554/live", "rtsp://***@cam.local:554", ("pa%2Fss",)),
+    ("RTSP://admin:secret@Cam.Local:554/live", "rtsp://***@Cam.Local:554", ("secret",)),
+    ("  rtsp://admin:secret@cam:554/live \n", "rtsp://***@cam:554", ("secret",)),
+    ("rtsp://admin:secret@[fe80::1]:554/live", "rtsp://***@[fe80::1]:554", ("secret",)),
+    ("rtsp://admin:secret@[2001:db8::7]/live", "rtsp://***@[2001:db8::7]", ("secret",)),
+    ("rtsp://[::1]:8554/live?token=secret", "rtsp://[::1]:8554", ("secret",)),
+    ("rtsp://[::1]", "rtsp://[::1]", ()),
+    ("rtsp://cam.local:554", "rtsp://cam.local:554", ()),
+    ("rtsp://cam.local", "rtsp://cam.local", ()),
+    ("http://cam.local/?token=secret#frag", "http://cam.local", ("secret",)),
+    # Cannot be parsed confidently: reveal nothing.
+    ("rtsp://admin:secret", REDACTED, ("secret",)),
+    ("rtsp://admin:secret@", REDACTED, ("secret",)),
+    ("rtsp://", REDACTED, ()),
+    ("bad scheme://admin:secret@cam", REDACTED, ("secret",)),
+    ("rtsp://cam;password=secret", REDACTED, ("secret",)),
+    # No scheme separator and no "@": returned unchanged.
+    ("/dev/video0", "/dev/video0", ()),
+    ("clip.mp4", "clip.mp4", ()),
+    ("", "", ()),
+]
+
+
+@pytest.mark.parametrize(("url", "expected", "secrets"), _REDACTION_TABLE)
+def test_redact_url_s1_table(url: str, expected: str, secrets: tuple[str, ...]) -> None:
+    result = redact_url(url)
+    assert result == expected
+    for secret in secrets:
+        assert secret not in result
+
+
+@pytest.mark.parametrize("value", [None, 42, b"rtsp://admin:secret@cam"])
+def test_redact_url_s1_never_raises(value: Any) -> None:
+    assert redact_url(value) == REDACTED
+
+
+_STRICT_HOST = r"(?:\[[0-9A-Fa-f:.]+(?:%[A-Za-z0-9._~%-]+)?\]|[A-Za-z0-9._~%-]+)"
+_HOST_SHAPE = re.compile(
+    r"(?P<scheme>[a-z][a-z0-9+.-]*)://"
+    r"(?:<redacted>|(?:\*\*\*@)?" + _STRICT_HOST + r"(?::[0-9]{1,5})?)"
+)
+
+
+def _redaction_shape(url: str, result: str) -> str:
+    """Name which of exactly four shapes ``result`` has; fail when it has none."""
+    if result == url and "://" not in url and "@" not in url:
+        return "unchanged"
+    if result == REDACTED:
+        return "redacted"
+    match = _HOST_SHAPE.fullmatch(result)
+    assert match is not None, (url, result)
+    assert match["scheme"] == url.strip().partition("://")[0].lower(), (url, result)
+    return "scheme_redacted" if result.endswith("://<redacted>") else "host"
+
+
+def test_redact_url_s1_randomized_no_marker_survives() -> None:
+    rng = random.Random(20260811)
+    # Every secret-bearing part may hold any printable ASCII, "@" and delimiters included.
+    any_chars = [chr(c) for c in range(0x20, 0x7F)]
+    schemes = ["rtsp", "rtsps", "http", "https", "RTSP", "rtmp", "srt", "bad scheme", "1rtsp"]
+    hosts = ["cam", "cam.example", "192.168.1.20", "[::1]", "[fe80::1]", "Host-7.local"]
+    shapes: Counter[str] = Counter()
+
+    def secret(mark: str) -> str:
+        def chunk() -> str:
+            return "".join(rng.choice(any_chars) for _ in range(rng.randint(0, 6)))
+
+        return chunk() + mark + chunk()
+
+    for i in range(1000):
+        marks = [f"MK{i:04d}{k}X" for k in "upamqf"]
+        user, password, path, params, query, fragment = marks
+        url = rng.choice(schemes) + "://"
+        kind = rng.randrange(3)  # 0: user and password, 1: user only, 2: no userinfo.
+        if kind == 0:
+            url += f"{secret(user)}:{secret(password)}@"
+        elif kind == 1:
+            url += secret(user) + "@"
+        url += rng.choice(hosts)
+        if rng.random() < 0.6:
+            url += f":{rng.randint(1, 65535)}"
+        if rng.random() < 0.7:
+            url += "/" + secret(path)
+            if rng.random() < 0.5:
+                url += ";" + secret(params)
+        if rng.random() < 0.5:
+            url += "?" + secret(query)
+        if rng.random() < 0.4:
+            url += "#" + secret(fragment)
+
+        result = redact_url(url)
+        for mark in marks:
+            assert mark not in result, (url, result)
+        shape = _redaction_shape(url, result)
+        if shape == "host":
+            shape += " with userinfo" if "***@" in result else " without userinfo"
+        shapes[shape] += 1
+
+    # Every reachable shape was exercised, so the assertions above are not vacuous.
+    expected = {"redacted", "scheme_redacted", "host with userinfo", "host without userinfo"}
+    assert set(shapes) == expected, shapes
+    assert min(shapes.values()) >= 20, shapes
+
+
+@pytest.mark.parametrize(("url", "expected", "secrets"), _REDACTION_TABLE)
+def test_redact_url_s1_table_shape(url: str, expected: str, secrets: tuple[str, ...]) -> None:
+    _redaction_shape(url, redact_url(url))
 
 
 def test_stream_never_exposes_credentials(caplog: pytest.LogCaptureFixture) -> None:
@@ -490,7 +627,7 @@ def test_stream_never_exposes_credentials(caplog: pytest.LogCaptureFixture) -> N
         src.close()
 
     assert received == [SECRET_URL]  # The real URL reaches the capture factory only.
-    assert src.info.uri == "rtsp://***@cam.example:554/live/ch1"
+    assert src.info.uri == "rtsp://***@cam.example:554"
     public = {k: v for k, v in vars(src).items() if not k.startswith("_")}
     exposed = [repr(src.info), repr(public), repr(frames[0].source), caplog.text]
     exposed += [r.getMessage() for r in caplog.records]
@@ -506,7 +643,7 @@ def test_stream_open_failure_message_is_redacted(caplog: pytest.LogCaptureFixtur
         StreamSource(SECRET_URL, capture_factory=lambda _url: fake)
 
     message = str(excinfo.value)
-    assert "rtsp://***@cam.example:554/live/ch1" in message
+    assert "rtsp://***@cam.example:554" in message
     for text in (message, repr(excinfo.value), caplog.text):
         assert SECRET not in text
         assert TOKEN not in text
@@ -526,3 +663,280 @@ def test_stream_uses_reported_fps_and_size() -> None:
     src = stream_source(fake)
     assert (src.info.width, src.info.height, src.info.fps) == (800, 600, 12.5)
     src.close()
+
+
+# --- S2: exception text is redacted -------------------------------------------------------
+
+
+class _OpenedRaises(FakeCapture):
+    def isOpened(self) -> bool:  # noqa: N802 (mirrors the OpenCV API)
+        raise RuntimeError(f"probe failed for {SECRET_URL}")
+
+
+def _assert_no_secret(exc: BaseException, caplog: pytest.LogCaptureFixture) -> None:
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    for text in (str(exc), repr(exc), formatted, caplog.text):
+        assert SECRET not in text
+        assert TOKEN not in text
+
+
+def test_s2_stream_factory_error_is_redacted(caplog: pytest.LogCaptureFixture) -> None:
+    def factory(url: str) -> FakeCapture:
+        raise RuntimeError(f"could not connect to {url}")
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(OSError) as excinfo:
+        StreamSource(SECRET_URL, capture_factory=factory)
+    assert type(excinfo.value) is OSError
+    assert "rtsp://***@cam.example:554" in str(excinfo.value)
+    assert "RuntimeError" in str(excinfo.value)
+    _assert_no_secret(excinfo.value, caplog)
+
+
+def test_s2_stream_is_opened_error_is_redacted_and_released(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = _OpenedRaises()
+    with caplog.at_level(logging.DEBUG), pytest.raises(OSError) as excinfo:
+        StreamSource(SECRET_URL, capture_factory=lambda _url: fake)
+    assert "RuntimeError" in str(excinfo.value)
+    _assert_no_secret(excinfo.value, caplog)
+    assert fake.release_count == 1
+
+
+def test_s2_stream_read_error_is_redacted(caplog: pytest.LogCaptureFixture) -> None:
+    fake = FakeCapture([make_image(1), ValueError(f"demux error on {SECRET_URL}")])
+    with caplog.at_level(logging.DEBUG):
+        src = StreamSource(SECRET_URL, capture_factory=lambda _url: fake)
+        it = iter(src)
+        next(it)
+        with pytest.raises(OSError) as excinfo:
+            next(it)
+        src.close()
+    assert type(excinfo.value) is OSError
+    assert "rtsp://***@cam.example:554" in str(excinfo.value)
+    assert "ValueError" in str(excinfo.value)
+    _assert_no_secret(excinfo.value, caplog)
+    assert fake.release_count == 1
+
+
+def test_s2_camera_errors_are_wrapped() -> None:
+    def factory(index: int) -> FakeCapture:
+        raise RuntimeError("driver exploded")
+
+    with pytest.raises(OSError, match=r"Cannot open camera 0.*RuntimeError") as excinfo:
+        CameraSource(capture_factory=factory)
+    assert excinfo.value.__context__ is None
+    assert "driver exploded" not in str(excinfo.value)
+
+    fake = FakeCapture([RuntimeError("driver exploded")])
+    src = camera_source(fake)
+    with pytest.raises(OSError, match=r"camera:0.*RuntimeError") as read_info:
+        list(src)
+    assert read_info.value.__context__ is None
+    assert "driver exploded" not in str(read_info.value)
+    src.close()
+
+
+@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit])
+def test_s2_interrupts_pass_through_untouched(exc_type: type[BaseException]) -> None:
+    raised = exc_type("stop")
+
+    def factory(url: str) -> FakeCapture:
+        raise raised
+
+    with pytest.raises(exc_type) as excinfo:
+        StreamSource(SECRET_URL, capture_factory=factory)
+    assert excinfo.value is raised
+
+    fake = FakeCapture([raised])
+    src = stream_source(fake)
+    with pytest.raises(exc_type) as read_info:
+        list(src)
+    assert read_info.value is raised
+    src.close()
+
+
+# --- S3: close() wakes a consumer while read() is stuck -----------------------------------
+
+
+class _StuckCapture(FakeCapture):
+    """A capture whose ``read`` blocks until ``unblock`` is set, like a dead RTSP stream."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.unblock = threading.Event()
+        self.reading = False
+        self.released_while_reading = False
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        self.reading = True
+        self.entered.set()
+        self.unblock.wait()
+        self.reading = False
+        return False, None
+
+    def release(self) -> None:
+        if self.reading:
+            self.released_while_reading = True
+        super().release()
+
+
+@pytest.mark.parametrize("factory", [stream_source, camera_source])
+def test_s3_close_ends_consumer_while_read_is_stuck(factory: Any) -> None:
+    fake = _StuckCapture()
+    src = factory(fake, max_read_failures=10**9, _join_timeout=0.01)
+    result: list[Any] = []
+    consumer = threading.Thread(target=lambda: result.append(list(src)))
+    try:
+        consumer.start()
+        assert fake.entered.wait(WAIT)
+        (capture_thread,) = capture_threads()
+
+        started = time.monotonic()
+        src.close()  # Returns after the join timeout even though read() never returns.
+        assert time.monotonic() - started < WAIT
+        consumer.join(WAIT)
+        assert not consumer.is_alive()
+        assert result == [[]]
+
+        assert capture_thread.is_alive()
+        assert fake.release_count == 0  # Not released while read() is still running.
+    finally:
+        fake.unblock.set()
+        consumer.join(WAIT)
+    capture_thread.join(WAIT)
+    assert not capture_thread.is_alive()
+    assert fake.release_count == 1
+    assert not fake.released_while_reading
+    src.close()
+    assert fake.release_count == 1
+
+
+# --- S4: device reporting 0x0 until the first frame ---------------------------------------
+
+
+@pytest.mark.parametrize("factory", [stream_source, camera_source])
+@pytest.mark.parametrize(("width", "height"), [(0, 0), (0, HEIGHT), (WIDTH, 0), (-1, -1)])
+def test_s4_size_probed_from_first_frame(factory: Any, width: float, height: float) -> None:
+    script = [None, make_image(1, 8, 6), make_image(2, 8, 6)]
+    fake = FakeCapture(script, width=width, height=height, gated=True)
+    fake.allow(2)
+    src = factory(fake, max_read_failures=3)
+    assert (src.info.width, src.info.height) == (8, 6)
+    assert fake.reads_entered == 2
+    it = iter(src)
+    fake.allow(1)
+    frame = next(it)
+    assert int(frame.image[0, 0, 0]) == 2  # The probe frame was discarded.
+    assert frame.index == 0
+    shutdown(src, fake)
+    assert fake.release_count == 1
+
+
+@pytest.mark.parametrize("factory", [stream_source, camera_source])
+def test_s4_probe_failure_raises_and_releases(factory: Any) -> None:
+    fake = FakeCapture(width=0, height=0)  # Every read fails.
+    with pytest.raises(OSError, match="frame size"):
+        factory(fake, max_read_failures=3)
+    assert fake.reads_entered == 3
+    assert fake.release_count == 1
+    assert capture_threads() == []
+
+
+def test_s4_probe_failure_message_is_redacted(caplog: pytest.LogCaptureFixture) -> None:
+    fake = FakeCapture([RuntimeError(f"bad {SECRET_URL}")], width=0, height=0)
+    with caplog.at_level(logging.DEBUG), pytest.raises(OSError) as excinfo:
+        StreamSource(SECRET_URL, capture_factory=lambda _url: fake)
+    assert "rtsp://***@cam.example:554" in str(excinfo.value)
+    _assert_no_secret(excinfo.value, caplog)
+    assert fake.release_count == 1
+
+
+def test_s4_positive_size_is_trusted_without_probing() -> None:
+    fake = FakeCapture([make_image(1)], width=WIDTH, height=HEIGHT)
+    src = stream_source(fake)
+    assert fake.reads_entered == 0
+    src.close()
+
+
+def test_s4_probed_non_color_frame_still_raises_on_iteration() -> None:
+    gray = np.zeros((6, 8), dtype=np.uint8)
+    fake = FakeCapture([gray, gray.copy()], width=0, height=0, gated=True)
+    fake.allow(1)
+    src = stream_source(fake, max_read_failures=3)
+    assert (src.info.width, src.info.height) == (8, 6)
+    it = iter(src)
+    fake.allow(1)
+    with pytest.raises(ValueError, match="shape"):
+        next(it)
+    shutdown(src, fake)
+
+
+# --- release() that raises ----------------------------------------------------------------
+
+
+class _ReleaseRaises(FakeCapture):
+    def release(self) -> None:
+        super().release()
+        raise RuntimeError(f"release failed for {SECRET_URL}")
+
+
+class _StuckReleaseRaises(_StuckCapture):
+    def release(self) -> None:
+        super().release()
+        raise RuntimeError(f"release failed for {SECRET_URL}")
+
+
+def _assert_release_warning(caplog: pytest.LogCaptureFixture) -> None:
+    warnings = [r.getMessage() for r in caplog.records if "releasing the capture" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "RuntimeError" in warnings[0]
+    assert SECRET not in caplog.text
+    assert TOKEN not in caplog.text
+
+
+@pytest.mark.parametrize("iterate", [False, True])
+def test_release_error_does_not_escape_close(
+    caplog: pytest.LogCaptureFixture, iterate: bool
+) -> None:
+    fake = _ReleaseRaises([make_image(1)])
+    with caplog.at_level(logging.WARNING):
+        src = StreamSource(SECRET_URL, max_read_failures=2, capture_factory=lambda _url: fake)
+        if iterate:
+            assert len(list(src)) == 1
+        src.close()
+        src.close()
+    assert fake.release_count == 1
+    _assert_release_warning(caplog)
+
+
+def test_release_error_does_not_escape_capture_thread(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    escaped: list[Any] = []
+    monkeypatch.setattr(threading, "excepthook", escaped.append)
+    fake = _StuckReleaseRaises()
+    with caplog.at_level(logging.WARNING):
+        src = StreamSource(
+            SECRET_URL,
+            max_read_failures=10**9,
+            capture_factory=lambda _url: fake,
+            _join_timeout=0.01,
+        )
+        it = iter(src)
+        try:
+            assert fake.entered.wait(WAIT)
+            (capture_thread,) = capture_threads()
+            src.close()  # Gives up joining; the thread releases the capture on exit.
+            assert fake.release_count == 0
+        finally:
+            fake.unblock.set()
+        capture_thread.join(WAIT)
+        assert not capture_thread.is_alive()
+    assert list(it) == []
+    assert escaped == []
+    assert fake.release_count == 1
+    _assert_release_warning(caplog)

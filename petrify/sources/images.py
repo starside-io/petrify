@@ -35,20 +35,25 @@ logger = logging.getLogger(__name__)
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"})
 
 _GLOB_CHARS = ("*", "?", "[")
-_RUNS = re.compile(r"(\d+)")
+_RUNS = re.compile(r"([0-9]+)")  # ASCII digits only: other digit characters are text.
+_DIGITS = re.compile(r"[0-9]+")
 
 
-def _natural_key(path: Path) -> tuple[tuple[tuple[int, int, str], ...], str]:
-    """Sort key: digit runs compared as integers, other runs as plain text, then the name."""
+def _natural_key(path: Path) -> tuple[tuple[tuple[int, int, str], ...], str, str]:
+    """Sort key: the name's natural runs, then the plain name, then the full path."""
     name = path.name
     parts = tuple(
-        (0, int(run), "") if run.isdigit() else (1, 0, run) for run in _RUNS.split(name) if run
+        (0, int(run), "") if _DIGITS.fullmatch(run) else (1, 0, run)
+        for run in _RUNS.split(name)
+        if run
     )
-    return parts, name
+    return parts, name, str(path)
 
 
 def _is_image(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    return (
+        not path.name.startswith(".") and path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    )
 
 
 class ImageFolderSource:
@@ -57,14 +62,17 @@ class ImageFolderSource:
     ``location`` is a directory (its direct children, not recursive) or a glob
     pattern (any string containing ``*``, ``?`` or ``[`` that is not an existing
     directory). Only files whose suffix, case-insensitive, is one of
-    ``IMAGE_SUFFIXES`` are kept.
+    ``IMAGE_SUFFIXES`` are kept. In both forms, files whose name starts with a
+    dot (hidden files, such as macOS ``._f1.png`` AppleDouble files) are ignored.
 
-    Order is a natural sort on the file name: the name is split into digit and
-    non-digit runs, digit runs compare as integers and non-digit runs as plain
-    (case-sensitive) text, a digit run sorts before a text run at the same
-    position, and ties (for example ``f01`` and ``f1``) are broken by the plain
-    name. So ``frame2.png`` comes before ``frame10.png``. The order depends only
-    on the names, never on the filesystem listing order.
+    Order is a natural sort on the file name: the name is split into runs of
+    ASCII digits ``0-9`` and runs of anything else, digit runs compare as
+    integers and the other runs as plain (case-sensitive) text, and a digit run
+    sorts before a text run at the same position. Ties are broken by the plain
+    name (for example ``f01`` before ``f1``), then by the full path string (for
+    example ``a/f1.png`` before ``b/f1.png`` from a glob). So ``frame2.png``
+    comes before ``frame10.png``. The order depends only on the paths, never on
+    the filesystem listing order.
 
     Every image is read with ``cv2.IMREAD_COLOR``: frames are always BGR uint8
     with 3 channels, grayscale is expanded, an alpha channel is discarded, and

@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import threading
 import time
 from collections.abc import Callable, Iterator
 from types import TracebackType
-from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from typing import Any, TypeVar
 
 import cv2
 import numpy as np
@@ -37,24 +37,136 @@ logger = logging.getLogger(__name__)
 _RETRY_DELAY = 0.005  # Seconds to wait after a failed read before retrying.
 _JOIN_TIMEOUT = 2.0  # Seconds close() waits for the capture thread to exit.
 
+REDACTED = "<redacted>"
+_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*")
+_HOST_PORT = re.compile(
+    r"(?P<host>\[[0-9A-Fa-f:.]+(?:%[A-Za-z0-9._~%-]+)?\]|[A-Za-z0-9._~%-]+)"
+    r"(?::(?P<port>[0-9]{1,5})?)?"
+)
+_AUTHORITY_END = re.compile(r"[/?#\\]")
+
+_T = TypeVar("_T")
+
 
 def redact_url(url: str) -> str:
-    """Return ``url`` with userinfo replaced by ``***`` and the query and fragment dropped.
+    """Return a form of ``url`` that identifies only its scheme, host and port.
 
-    ``rtsp://user:secret@host:554/path?token=abc`` becomes ``rtsp://***@host:554/path``.
-    A string without a scheme and network location (not a URL) is returned unchanged.
+    ``rtsp://user:secret@host:554/path?token=abc`` becomes ``rtsp://***@host:554``.
+    The path, parameters, query and fragment are always dropped, since they can
+    carry tokens, and ``***@`` marks that userinfo was present. The authority
+    ends at the first ``/``, ``?``, ``#`` or ``\\`` after ``scheme://``. When
+    every ``@`` lies before that point, the host follows the last ``@`` (so a
+    password may contain ``@``). When any ``@`` lies at or after it, the input
+    is ambiguous (a password with an unencoded delimiter, or an ``@`` in the
+    path, query or fragment) and the result is ``scheme://<redacted>``: the host
+    is hidden, never guessed. The scheme is lowercased and surrounding
+    whitespace is stripped.
+
+    A string without ``://`` and without ``@`` (a device path, a file name) is
+    returned unchanged. Anything else that cannot be parsed confidently becomes
+    ``"<redacted>"``. Never raises.
     """
     try:
-        parts = urlsplit(url)
-    except ValueError:
-        # Malformed URL: it may still carry credentials, so reveal nothing.
-        return "<unparseable url>"
-    if not parts.scheme or not parts.netloc:
-        return url
-    netloc = parts.netloc
-    if "@" in netloc:
-        netloc = "***@" + netloc.rsplit("@", 1)[1]
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+        return _redact(url)
+    except Exception:
+        return REDACTED
+
+
+def _redact(url: str) -> str:
+    text = url.strip()
+    scheme, sep, rest = text.partition("://")
+    if not sep:
+        return REDACTED if "@" in text else text
+    if not _SCHEME.fullmatch(scheme):
+        return REDACTED
+    end = _AUTHORITY_END.search(rest)
+    d = end.start() if end else len(rest)
+    last_at = rest.rfind("@")
+    if last_at >= d:
+        # Ambiguous: a password holding a delimiter, or an "@" in the path, query or
+        # fragment. Guessing the host could publish secret text, so hide it.
+        return f"{scheme.lower()}://{REDACTED}"
+    authority = rest[last_at + 1 : d]
+    match = _HOST_PORT.fullmatch(authority)
+    if match is None:
+        return REDACTED
+    result = f"{scheme.lower()}://"
+    if last_at >= 0:
+        result += "***@"
+    result += match["host"]
+    if match["port"]:
+        result += f":{match['port']}"
+    return result
+
+
+def _guarded(action: Callable[[], _T], message: str) -> _T:
+    """Run ``action``; turn an ``Exception`` into ``OSError`` that names only its type.
+
+    The original exception is neither the cause nor the context of the
+    ``OSError``, so its message (which may hold a credential-bearing URL) is not
+    reachable from it. ``KeyboardInterrupt`` and ``SystemExit`` pass through.
+    """
+    failure = ""
+    try:
+        return action()
+    except Exception as exc:
+        failure = type(exc).__name__
+    # Raised outside the except block so the original is not attached as context.
+    raise OSError(f"{message} ({failure})") from None
+
+
+def _release_quietly(capture: Any, label: str) -> None:
+    failure = ""
+    try:
+        capture.release()
+    except Exception as exc:
+        failure = type(exc).__name__
+    if failure:
+        logger.warning("%s: releasing the capture failed (%s)", label, failure)
+
+
+def _open_live(
+    open_capture: Callable[[], Any],
+    *,
+    label: str,
+    open_message: str,
+    max_read_failures: int,
+    configure: Callable[[Any], None] | None = None,
+) -> tuple[Any, float, int, int]:
+    """Open a live capture and return it with its reported fps, width and height.
+
+    Every error is an ``OSError`` built by ``_guarded``. When the reported width
+    or height is not positive, frames are read (up to ``max_read_failures``
+    failed reads) until one succeeds and the size is taken from it; that probe
+    frame is discarded. The capture is released when anything here fails.
+    """
+    cap = _guarded(open_capture, open_message)
+    try:
+        if not _guarded(cap.isOpened, open_message):
+            raise OSError(open_message)
+        if configure is not None:
+            _guarded(lambda: configure(cap), open_message)
+        fps = float(_guarded(lambda: cap.get(cv2.CAP_PROP_FPS), open_message))
+        width = int(_guarded(lambda: cap.get(cv2.CAP_PROP_FRAME_WIDTH), open_message))
+        height = int(_guarded(lambda: cap.get(cv2.CAP_PROP_FRAME_HEIGHT), open_message))
+        if width <= 0 or height <= 0:
+            height, width = _probe_size(cap, label=label, max_read_failures=max_read_failures)
+    except BaseException:
+        _release_quietly(cap, label)
+        raise
+    return cap, fps, width, height
+
+
+def _probe_size(cap: Any, *, label: str, max_read_failures: int) -> tuple[int, int]:
+    """Read until a frame arrives and return its (height, width); the frame is discarded."""
+    message = f"{label}: cannot read a frame to determine the frame size"
+    for attempt in range(max_read_failures):
+        if attempt:
+            time.sleep(_RETRY_DELAY)
+        ok, image = _guarded(cap.read, message)
+        if ok and image is not None and getattr(image, "ndim", 0) >= 2:
+            return int(image.shape[0]), int(image.shape[1])
+    raise OSError(f"{message} after {max_read_failures} failed reads")
 
 
 def _usable_fps(value: float) -> bool:
@@ -79,18 +191,24 @@ class _LatestFrameReader:
         label: str,
         max_read_failures: int,
         clock: Callable[[], float],
+        join_timeout: float = _JOIN_TIMEOUT,
     ) -> None:
         self._capture = capture
         self._info = info
         self._label = label
         self._max_read_failures = max_read_failures
         self._clock = clock
+        self._join_timeout = join_timeout
 
         self._cond = threading.Condition()
         # State below is guarded by _cond.
         self._latest: tuple[np.ndarray, float] | None = None
         self._stopped = False  # Capture thread finished (end of stream or error).
         self._closed = False
+        # A read error is kept as its message only, never the original exception,
+        # whose text may hold the URL. KeyboardInterrupt and SystemExit are kept
+        # as is and re-raised untouched.
+        self._error_message: str | None = None
         self._error: BaseException | None = None
         self._dropped = 0
         self._iterating = False
@@ -138,7 +256,13 @@ class _LatestFrameReader:
             while not self._closing.is_set():
                 try:
                     ok, image = self._capture.read()
-                except BaseException as exc:  # Surfaced in the consumer.
+                except Exception as exc:  # Surfaced in the consumer, by type name only.
+                    with self._cond:
+                        self._error_message = f"{self._label}: read failed ({type(exc).__name__})"
+                        self._stopped = True
+                        self._cond.notify_all()
+                    return
+                except BaseException as exc:  # KeyboardInterrupt, SystemExit: surfaced as is.
                     with self._cond:
                         self._error = exc
                         self._stopped = True
@@ -190,6 +314,8 @@ class _LatestFrameReader:
                 return item
             if self._error is not None:
                 raise self._error
+            if self._error_message is not None:
+                raise OSError(self._error_message) from None
             return None
 
     def _next_frame(self) -> Frame | None:
@@ -220,7 +346,8 @@ class _LatestFrameReader:
             if self._released:
                 return
             self._released = True
-        self._capture.release()
+        # A failing release() must not escape the capture thread or close().
+        _release_quietly(self._capture, self._label)
 
     def close(self) -> None:
         """Stop the thread, release the capture once, and end any waiting iteration."""
@@ -238,12 +365,12 @@ class _LatestFrameReader:
             self._release()
             return
         if thread is not threading.current_thread():
-            thread.join(_JOIN_TIMEOUT)
+            thread.join(self._join_timeout)
         if thread.is_alive():
             logger.warning(
                 "%s: capture thread did not stop within %.1f s; it releases the capture on exit",
                 self._label,
-                _JOIN_TIMEOUT,
+                self._join_timeout,
             )
             return
         self._release()
@@ -286,8 +413,20 @@ class StreamSource:
     """Live frames from a network stream (RTSP, HTTP MJPEG) via ``cv2.VideoCapture``.
 
     A capture thread keeps only the newest frame; frames the consumer is too slow
-    to take are dropped and counted in ``dropped``. Credentials in ``url`` never
-    appear in ``info``, logs, or exception messages.
+    to take are dropped and counted in ``dropped``.
+
+    The full ``url`` is passed to ``capture_factory`` and kept nowhere else.
+    ``info.uri``, the messages this module logs, and the exceptions this class
+    raises carry only ``redact_url(url)``. An error while opening or reading
+    the stream is raised as ``OSError`` whose message holds the redacted URL and
+    the original exception's type name; the original exception is not attached
+    as cause or context. ``KeyboardInterrupt`` and ``SystemExit`` pass through
+    untouched. OpenCV and FFmpeg may print the URL to stderr themselves, which
+    this class cannot prevent.
+
+    When the backend reports a width or height that is not positive, frames are
+    read during construction until one arrives and its size is used; that frame
+    is discarded.
     """
 
     def __init__(
@@ -296,20 +435,23 @@ class StreamSource:
         max_read_failures: int = 30,
         capture_factory: Callable[[str], Any] = cv2.VideoCapture,
         clock: Callable[[], float] = time.monotonic,
+        *,
+        _join_timeout: float = _JOIN_TIMEOUT,
     ) -> None:
         if max_read_failures < 1:
             raise ValueError("max_read_failures must be at least 1")
         redacted = redact_url(url)
-        cap = capture_factory(url)
-        if not cap.isOpened():
-            cap.release()
-            raise OSError(f"Cannot open stream {redacted}")
-
-        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        label = f"stream {redacted}"
+        cap, fps, width, height = _open_live(
+            lambda: capture_factory(url),
+            label=label,
+            open_message=f"Cannot open stream {redacted}",
+            max_read_failures=max_read_failures,
+        )
         self.info = SourceInfo(
             fps=fps if _usable_fps(fps) else 25.0,
-            width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-            height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            width=width,
+            height=height,
             frame_count=None,
             seekable=False,
             live=True,
@@ -318,9 +460,10 @@ class StreamSource:
         self._reader = _LatestFrameReader(
             cap,
             self.info,
-            label=f"stream {redacted}",
+            label=label,
             max_read_failures=max_read_failures,
             clock=clock,
+            join_timeout=_join_timeout,
         )
         logger.info(
             "Input: %s  |  %dx%d @ %.2f fps  |  live",

@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 
 from petrify.core import Source
+from petrify.sources import images as images_module
 from petrify.sources.images import ImageFolderSource
 
 WIDTH, HEIGHT, FPS = 32, 24, 10.0
@@ -277,3 +278,56 @@ def test_close_is_idempotent(folder: tuple[Path, list[np.ndarray]]) -> None:
     src = ImageFolderSource(path)
     src.close()
     src.close()
+
+
+def test_i1_unicode_digits_are_plain_text(tmp_path: Path) -> None:
+    # Superscript two passes str.isdigit() but int() rejects it; Arabic-Indic digits
+    # are accepted by int(). Only ASCII 0-9 form numeric runs.
+    for name in ("f1²2.png", "f1.png", "f١٠.png", "f2.png"):
+        _write(tmp_path / name, _image(0))
+    with ImageFolderSource(tmp_path) as src:
+        assert [p.name for p in src.paths] == [
+            "f1.png",
+            "f1²2.png",
+            "f2.png",
+            "f١٠.png",
+        ]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_i2_glob_order_is_independent_of_listing_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reverse: bool
+) -> None:
+    for sub in ("a", "b"):
+        (tmp_path / sub).mkdir()
+        _write(tmp_path / sub / "f1.png", _image(0))
+        _write(tmp_path / sub / "f2.png", _image(1))
+    real_glob = images_module.glob.glob
+
+    def listing(pattern: str) -> list[str]:
+        return sorted(real_glob(pattern), reverse=reverse)
+
+    monkeypatch.setattr(images_module.glob, "glob", listing)
+    with ImageFolderSource(str(tmp_path / "*" / "f*.png")) as src:
+        assert [p.relative_to(tmp_path).as_posix() for p in src.paths] == [
+            "a/f1.png",
+            "b/f1.png",
+            "a/f2.png",
+            "b/f2.png",
+        ]
+
+
+def test_i3_directory_mode_ignores_dotfiles(tmp_path: Path) -> None:
+    _write(tmp_path / "f1.png", _image(0))
+    (tmp_path / "._f1.png").write_bytes(b"AppleDouble metadata, not an image")
+    _write(tmp_path / ".hidden.png", _image(1))
+    with ImageFolderSource(tmp_path) as src:
+        assert [p.name for p in src.paths] == ["f1.png"]
+        assert len(list(src)) == 1
+
+
+def test_i3_glob_mode_ignores_dotfiles(tmp_path: Path) -> None:
+    _write(tmp_path / ".f1.png", _image(0))
+    (tmp_path / "._f2.png").write_bytes(b"AppleDouble metadata, not an image")
+    with pytest.raises(ValueError, match="No image files"):
+        ImageFolderSource(str(tmp_path / ".*.png"))

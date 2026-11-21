@@ -27,7 +27,7 @@ from typing import Any
 import cv2
 
 from petrify.core.frame import Frame, SourceInfo
-from petrify.sources.stream import _LatestFrameReader, _usable_fps
+from petrify.sources.stream import _JOIN_TIMEOUT, _LatestFrameReader, _open_live, _usable_fps
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,12 @@ class CameraSource:
     ``info`` reports what the driver actually delivers. A capture thread keeps
     only the newest frame; frames the consumer is too slow to take are dropped
     and counted in ``dropped``.
+
+    An error while opening or reading the device is raised as ``OSError`` that
+    names the original exception's type, as ``StreamSource`` does. When the
+    driver reports a width or height that is not positive, frames are read
+    during construction until one arrives and its size is used; that frame is
+    discarded.
     """
 
     def __init__(
@@ -50,30 +56,35 @@ class CameraSource:
         max_read_failures: int = 30,
         capture_factory: Callable[[int], Any] = cv2.VideoCapture,
         clock: Callable[[], float] = time.monotonic,
+        *,
+        _join_timeout: float = _JOIN_TIMEOUT,
     ) -> None:
         if max_read_failures < 1:
             raise ValueError("max_read_failures must be at least 1")
-        cap = capture_factory(index)
-        if not cap.isOpened():
-            cap.release()
-            raise OSError(f"Cannot open camera {index}")
 
-        if width is not None:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        if height is not None:
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        if fps is not None:
-            cap.set(cv2.CAP_PROP_FPS, fps)
+        def configure(cap: Any) -> None:
+            if width is not None:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            if height is not None:
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            if fps is not None:
+                cap.set(cv2.CAP_PROP_FPS, fps)
 
+        uri = f"camera:{index}"
         # Drivers silently ignore requests they cannot satisfy: trust the read-back.
-        actual_fps = float(cap.get(cv2.CAP_PROP_FPS))
+        cap, actual_fps, actual_width, actual_height = _open_live(
+            lambda: capture_factory(index),
+            label=uri,
+            open_message=f"Cannot open camera {index}",
+            max_read_failures=max_read_failures,
+            configure=configure,
+        )
         if not _usable_fps(actual_fps):
             actual_fps = fps if fps is not None and _usable_fps(fps) else 30.0
-        uri = f"camera:{index}"
         self.info = SourceInfo(
             fps=actual_fps,
-            width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-            height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            width=actual_width,
+            height=actual_height,
             frame_count=None,
             seekable=False,
             live=True,
@@ -85,6 +96,7 @@ class CameraSource:
             label=uri,
             max_read_failures=max_read_failures,
             clock=clock,
+            join_timeout=_join_timeout,
         )
         logger.info(
             "Input: %s  |  %dx%d @ %.2f fps  |  live",
