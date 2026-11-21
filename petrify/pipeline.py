@@ -749,9 +749,32 @@ def _background_for(
     return CalibratedBackground(frames, sample_filter=sample_filter), None
 
 
+def _warn_large_manual_roi(box: tuple[int, int, int, int], cap: float, source: Source) -> None:
+    """Warn when a manual ROI box covers more than ``cap`` of the source's frame."""
+    frame_area = source.info.width * source.info.height
+    if frame_area <= 0:
+        return
+    share = box[2] * box[3] / frame_area
+    if share > cap:
+        logger.warning(
+            "The manual ROI %d %d %d %d covers %.1f percent of the frame, more than the "
+            "%g percent cap for auto-detection: that region is shown live (not anonymized) "
+            "on every output frame.",
+            *box,
+            share * 100,
+            cap * 100,
+        )
+
+
 def _roi_stage(source: Source, config: PetrifyConfig) -> RoiOverlay | WarmupRoiOverlay:
-    """Return the ROI stage: manual box, disabled, whole-clip scan, or warmup detection."""
+    """Return the ROI stage: manual box, disabled, whole-clip scan, or warmup detection.
+
+    A manual box over ``roi.max_area_cap`` of the frame is allowed (an explicit
+    choice at startup) but logged as a warning: its region is shown live.
+    """
     roi_cfg = config.roi
+    if roi_cfg.mode == "manual" and roi_cfg.box is not None:
+        _warn_large_manual_roi(roi_cfg.box, roi_cfg.max_area_cap, source)
     if roi_cfg.mode != "auto" or (isinstance(source, FileSource) and source.info.seekable):
         return RoiOverlay(_resolve_roi(source, config))  # type: ignore[arg-type]
     logger.info("ROI: auto-detect on the first %.1f s, then locked", roi_cfg.warmup_seconds)

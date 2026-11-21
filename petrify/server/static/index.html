@@ -15,6 +15,11 @@
 </header>
 
 <main>
+  <section id="weakened" class="notice notice-warning weakened" role="alert" aria-labelledby="weakened-title" hidden>
+    <h2 id="weakened-title">Weakened protections</h2>
+    <p>These settings can let a person be shown in the processed feed and the outputs:</p>
+    <ul id="weakened-list"></ul>
+  </section>
   <p id="token-missing" class="notice notice-error" hidden>
     No access token found. Open the full link printed in the terminal when the run started.
   </p>
@@ -41,6 +46,7 @@
       <dt>Background</dt><dd id="st-background">-</dd>
       <dt>Frames</dt><dd id="st-frames">-</dd>
       <dt>Frozen</dt><dd id="st-frozen">-</dd>
+      <dt>Passed through (shown live)</dt><dd id="st-passed">-</dd>
       <dt>Failed closed (black)</dt><dd id="st-failed">-</dd>
       <dt>Over budget</dt><dd id="st-over-budget">-</dd>
       <dt>Dropped by the source</dt><dd id="st-dropped">-</dd>
@@ -78,14 +84,14 @@
       <fieldset>
         <legend>Motion detector</legend>
         <div class="field">
-          <label for="ctl-motion-threshold">Motion area threshold (px, 0 to 10000000)</label>
-          <input id="ctl-motion-threshold" data-field="motion.threshold" data-type="int" type="number" min="0" max="10000000" step="1" inputmode="numeric" aria-describedby="err-ctl-motion-threshold">
+          <label for="ctl-motion-threshold">Motion area threshold (px in the downsampled frame, at most 25 percent of it)</label>
+          <input id="ctl-motion-threshold" data-field="motion.threshold" data-type="int" type="number" min="0" step="1" inputmode="numeric" aria-describedby="err-ctl-motion-threshold">
           <span class="applied" id="applied-ctl-motion-threshold"></span>
           <span class="error" id="err-ctl-motion-threshold" aria-live="polite"></span>
         </div>
         <div class="field">
-          <label for="ctl-motion-var-threshold">MOG2 variance threshold (above 0, at most 1000)</label>
-          <input id="ctl-motion-var-threshold" data-field="motion.var_threshold" data-type="float" type="number" min="0" max="1000" step="any" inputmode="decimal" aria-describedby="err-ctl-motion-var-threshold">
+          <label for="ctl-motion-var-threshold">MOG2 variance threshold (above 0, at most 100)</label>
+          <input id="ctl-motion-var-threshold" data-field="motion.var_threshold" data-type="float" type="number" min="0" max="100" step="any" inputmode="decimal" aria-describedby="err-ctl-motion-var-threshold">
           <span class="applied" id="applied-ctl-motion-var-threshold"></span>
           <span class="error" id="err-ctl-motion-var-threshold" aria-live="polite"></span>
         </div>
@@ -100,20 +106,20 @@
       <fieldset>
         <legend>Person detector</legend>
         <div class="field">
-          <label for="ctl-person-min-confidence">Minimum confidence (0 to 10)</label>
-          <input id="ctl-person-min-confidence" data-field="person.min_confidence" data-type="float" type="number" min="0" max="10" step="any" inputmode="decimal" aria-describedby="err-ctl-person-min-confidence">
+          <label for="ctl-person-min-confidence">Minimum confidence (0 to 2)</label>
+          <input id="ctl-person-min-confidence" data-field="person.min_confidence" data-type="float" type="number" min="0" max="2" step="any" inputmode="decimal" aria-describedby="err-ctl-person-min-confidence">
           <span class="applied" id="applied-ctl-person-min-confidence"></span>
           <span class="error" id="err-ctl-person-min-confidence" aria-live="polite"></span>
         </div>
         <div class="field">
-          <label for="ctl-person-min-box-area">Minimum box area (px, 0 to 10000000)</label>
-          <input id="ctl-person-min-box-area" data-field="person.min_box_area" data-type="int" type="number" min="0" max="10000000" step="1" inputmode="numeric" aria-describedby="err-ctl-person-min-box-area">
+          <label for="ctl-person-min-box-area">Minimum box area (px in the downsampled frame, at most 25 percent of it)</label>
+          <input id="ctl-person-min-box-area" data-field="person.min_box_area" data-type="int" type="number" min="0" step="1" inputmode="numeric" aria-describedby="err-ctl-person-min-box-area">
           <span class="applied" id="applied-ctl-person-min-box-area"></span>
           <span class="error" id="err-ctl-person-min-box-area" aria-live="polite"></span>
         </div>
         <div class="field">
-          <label for="ctl-person-scale">Pyramid scale (above 1, at most 2)</label>
-          <input id="ctl-person-scale" data-field="person.scale" data-type="float" type="number" min="1" max="2" step="any" inputmode="decimal" aria-describedby="err-ctl-person-scale">
+          <label for="ctl-person-scale">Pyramid scale (above 1, at most 1.5)</label>
+          <input id="ctl-person-scale" data-field="person.scale" data-type="float" type="number" min="1" max="1.5" step="any" inputmode="decimal" aria-describedby="err-ctl-person-scale">
           <span class="applied" id="applied-ctl-person-scale"></span>
           <span class="error" id="err-ctl-person-scale" aria-live="polite"></span>
         </div>
@@ -122,24 +128,20 @@
       <fieldset>
         <legend>Background differ</legend>
         <div class="field field-check">
-          <input id="ctl-background-diff-enabled" data-field="background_diff.enabled" data-type="bool" type="checkbox" aria-describedby="err-ctl-background-diff-enabled bg-diff-warning">
+          <input id="ctl-background-diff-enabled" data-field="background_diff.enabled" data-type="bool" type="checkbox" aria-describedby="err-ctl-background-diff-enabled">
           <label for="ctl-background-diff-enabled">Background differ on</label>
           <span class="applied" id="applied-ctl-background-diff-enabled"></span>
           <span class="error" id="err-ctl-background-diff-enabled" aria-live="polite"></span>
         </div>
-        <p id="bg-diff-warning" class="notice notice-warning" hidden>
-          Warning: the background differ is off on a live source. A person who stops moving
-          is no longer detected and can be shown. The differ is the only protection against that.
-        </p>
         <div class="field">
-          <label for="ctl-background-diff-pixel-threshold">Pixel threshold (0 to 255)</label>
-          <input id="ctl-background-diff-pixel-threshold" data-field="background_diff.pixel_threshold" data-type="int" type="number" min="0" max="255" step="1" inputmode="numeric" aria-describedby="err-ctl-background-diff-pixel-threshold">
+          <label for="ctl-background-diff-pixel-threshold">Pixel threshold (0 to 128)</label>
+          <input id="ctl-background-diff-pixel-threshold" data-field="background_diff.pixel_threshold" data-type="int" type="number" min="0" max="128" step="1" inputmode="numeric" aria-describedby="err-ctl-background-diff-pixel-threshold">
           <span class="applied" id="applied-ctl-background-diff-pixel-threshold"></span>
           <span class="error" id="err-ctl-background-diff-pixel-threshold" aria-live="polite"></span>
         </div>
         <div class="field">
-          <label for="ctl-background-diff-area-threshold">Area threshold (px, 0 to 10000000)</label>
-          <input id="ctl-background-diff-area-threshold" data-field="background_diff.area_threshold" data-type="int" type="number" min="0" max="10000000" step="1" inputmode="numeric" aria-describedby="err-ctl-background-diff-area-threshold">
+          <label for="ctl-background-diff-area-threshold">Area threshold (px in the downsampled frame, at most 25 percent of it)</label>
+          <input id="ctl-background-diff-area-threshold" data-field="background_diff.area_threshold" data-type="int" type="number" min="0" step="1" inputmode="numeric" aria-describedby="err-ctl-background-diff-area-threshold">
           <span class="applied" id="applied-ctl-background-diff-area-threshold"></span>
           <span class="error" id="err-ctl-background-diff-area-threshold" aria-live="polite"></span>
         </div>
@@ -164,7 +166,7 @@
       <fieldset>
         <legend>Timestamp ROI</legend>
         <div class="field">
-          <label for="ctl-roi">ROI</label>
+          <label for="ctl-roi">ROI (a manual box is shown live and may cover at most the run's ROI area cap of the frame)</label>
           <select id="ctl-roi" data-field="roi" data-type="roi" aria-describedby="err-ctl-roi">
             <option value="auto" disabled>Automatic (as started)</option>
             <option value="disabled">Disabled</option>

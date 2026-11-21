@@ -30,7 +30,6 @@ from petrify.core import FrameMeta, PetrifyConfig, SourceInfo  # noqa: E402
 from petrify.server import app as server_app  # noqa: E402
 from petrify.server.app import (  # noqa: E402
     MAX_BODY_BYTES,
-    SECURITY_HEADERS,
     WEB_EXTRA_MESSAGE,
     create_app,
     require_web,
@@ -191,7 +190,7 @@ def test_no_other_routes(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("host", [f"127.0.0.1:{PORT}", f"localhost:{PORT}", f"LOCALHOST:{PORT}"])
+@pytest.mark.parametrize("host", [f"127.0.0.1:{PORT}"])
 def test_accepted_hosts(client: TestClient, host: str) -> None:
     assert client.get("/", headers={"host": host}).status_code == 200
     assert client.get("/api/state", headers={"host": host, **AUTH}).status_code == 200
@@ -203,6 +202,8 @@ def test_accepted_hosts(client: TestClient, host: str) -> None:
         "evil.example",
         f"evil.example:{PORT}",
         f"localhost.evil.example:{PORT}",
+        f"localhost:{PORT}",
+        f"LOCALHOST:{PORT}",
         f"127.0.0.1.nip.io:{PORT}",
         "127.0.0.1",
         "localhost",
@@ -227,7 +228,7 @@ def test_rejected_hosts(client: TestClient, host: str, method: str, path: str) -
     [
         (None, 200),
         (f"http://127.0.0.1:{PORT}", 200),
-        (f"http://localhost:{PORT}", 200),
+        (f"http://localhost:{PORT}", 403),
         ("http://evil.example", 403),
         (f"http://evil.example:{PORT}", 403),
         (f"https://127.0.0.1:{PORT}", 403),
@@ -348,7 +349,7 @@ def test_state_shape(control: RunControl) -> None:
     with _client(app) as c:
         data = c.get("/api/state", headers=AUTH).json()
     assert set(data) == {"config", "stats", "timings", "source", "background", "roi",
-                         "running", "ended", "last_error", "raw_preview"}
+                         "running", "ended", "last_error", "weakened", "raw_preview"}
     assert set(data["stats"]) == {"frames", "frozen", "passed_through", "failed_closed",
                                   "over_budget", "sink_failures", "reconfigurations"}
     assert set(data["timings"]) == {"detect_mean_ms", "detect_last_ms", "render_mean_ms",
@@ -358,6 +359,7 @@ def test_state_shape(control: RunControl) -> None:
     assert data["running"] is True and data["ended"] is False
     assert data["roi"] == [1, 2, 3, 4]
     assert data["raw_preview"] is False
+    assert data["weakened"] == []
     assert data["config"] == config_to_dict(control.applied)
 
 
@@ -461,12 +463,28 @@ def _all_kinds_of_responses(c: TestClient) -> list[httpx.Response]:
     ]
 
 
+# Literal values (T1): a header removed from, or weakened in, SECURITY_HEADERS fails here.
+EXPECTED_SECURITY_HEADERS = {
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "x-frame-options": "DENY",
+    "content-security-policy": (
+        "default-src 'self'; img-src 'self'; frame-ancestors 'none'; "
+        "base-uri 'none'; form-action 'none'"
+    ),
+    "cross-origin-resource-policy": "same-origin",
+    "cross-origin-opener-policy": "same-origin",
+}
+
+
 def test_security_headers_on_every_response_and_no_cors(client: TestClient) -> None:
     responses = _all_kinds_of_responses(client)
     assert {r.status_code for r in responses} >= {200, 400, 401, 403, 404, 405, 413, 415, 422}
     for response in responses:
-        for name, value in SECURITY_HEADERS.items():
+        for name, value in EXPECTED_SECURITY_HEADERS.items():
             assert response.headers.get(name) == value, (response.request.url, name)
+            assert len(response.headers.get_list(name)) == 1, (response.request.url, name)
         assert not [k for k in response.headers if k.lower().startswith("access-control-")]
         assert "server" not in response.headers
 
@@ -492,7 +510,7 @@ def test_unexpected_error_is_a_minimal_500(control: RunControl, all_logs: Any) -
     assert response.json() == {"error": "Internal error"}
     assert TOKEN not in response.text and "internal" not in response.text.lower().replace(
         "internal error", "")
-    for name, value in SECURITY_HEADERS.items():
+    for name, value in EXPECTED_SECURITY_HEADERS.items():
         assert response.headers.get(name) == value
     logged = [r for r in _server_records(all_logs) if r.name == "petrify.server.app"]
     assert [r.getMessage() for r in logged] == ["Web request failed: RuntimeError"]
@@ -768,7 +786,6 @@ def test_every_control_maps_to_a_runtime_field() -> None:
 def test_app_js_uses_the_fragment_token_and_bearer_header() -> None:
     js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
     assert "window.location.hash" in js
-    assert "history.replaceState" in js
     assert '"Authorization": "Bearer " + token' in js
     assert "/stream.mjpg?token=" in js and "/raw.mjpg?token=" in js
     assert "localStorage" not in js and "sessionStorage" not in js and "eval(" not in js
@@ -791,3 +808,213 @@ def test_page_json_contract_matches_the_snapshot() -> None:
                 continue
             assert field in data[{"bg": "background"}.get(key, key)], (key, field)
     json.dumps(data)
+
+
+# ---------------------------------------------------------------------------
+# N1: only 127.0.0.1 in Host and Origin
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", [f"localhost:{PORT}", f"LocalHost:{PORT}"])
+def test_n1_localhost_host_is_rejected(client: TestClient, host: str) -> None:
+    for path, headers in (("/", {}), ("/api/state", AUTH), (f"/stream.mjpg?token={TOKEN}", {})):
+        response = client.get(path, headers={"host": host, **headers})
+        assert response.status_code == 400, path
+        assert response.json() == {"error": "Bad request"}
+
+
+@pytest.mark.parametrize(("method", "path"), [("PATCH", "/api/config"), ("POST", "/api/stop")])
+def test_n1_localhost_origin_is_rejected(control: RunControl, method: str, path: str) -> None:
+    app = create_app(control, ScriptedFeed([]), token=TOKEN, port=PORT)  # type: ignore[arg-type]
+    with _client(app) as c:
+        response = _request(c, method, path, headers={**AUTH, "Origin": f"http://localhost:{PORT}"})
+    assert response.status_code == 403
+    assert control.take_pending() is None and control.stop_requested is False
+
+
+# ---------------------------------------------------------------------------
+# N2: no redirects
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "headers"),
+    [
+        (f"/stream.mjpg/?token={TOKEN}", {}),
+        ("/api/state/", AUTH),
+        ("/static/app.js/", {}),
+        ("/api/stop/", AUTH),
+    ],
+)
+def test_n2_trailing_slash_is_404_without_a_redirect(
+    client: TestClient, path: str, headers: dict[str, str]
+) -> None:
+    method = "POST" if path.startswith("/api/stop") else "GET"
+    response = client.request(method, path, headers=headers, follow_redirects=False)
+    assert response.status_code == 404
+    assert "location" not in response.headers
+    assert response.json() == {"error": "Not found"}
+    assert TOKEN not in response.text
+
+
+# ---------------------------------------------------------------------------
+# N4 and T5: uvicorn settings, no access log
+# ---------------------------------------------------------------------------
+
+
+def test_n4_t5_uvicorn_config(control: RunControl) -> None:
+    app = create_app(control, MjpegSink(), token=TOKEN, port=0)
+    config = server_app._uvicorn_config(app, 1)
+    assert config.access_log is False
+    assert config.host == "127.0.0.1"
+    assert config.limit_concurrency == 64
+    assert config.timeout_keep_alive == 5
+    assert config.proxy_headers is False and config.server_header is False
+
+
+def test_t5_real_server_logs_no_token_at_debug(control: RunControl) -> None:
+    secret = "DISTINCTIVE-Qm8vR2xT6yH4kL0pN3wZ"
+    _ended(control)  # The stream ends at once.
+    app = create_app(control, MjpegSink(max_fps=None), token=secret, port=0)
+    access = logging.getLogger("uvicorn.access")
+    saved_access = (access.propagate, list(access.handlers))
+    # An earlier server in this process may have cut the access logger off the
+    # root already; start from uvicorn's defaults so only this config decides.
+    access.propagate = True
+    collect = _Collect()
+    root = logging.getLogger()
+    root.addHandler(collect)
+    manager = logging.root.manager
+    names = ["", "uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi", *manager.loggerDict]
+    loggers = [logging.getLogger(n) for n in dict.fromkeys(names)]
+    saved = [(lg, lg.level, lg.disabled) for lg in loggers]
+    handle = None
+    try:
+        handle = serve_in_thread(app, 0)
+        # After the server started: uvicorn sets its own logger levels when configured.
+        for lg in loggers:
+            lg.setLevel(logging.DEBUG)
+            lg.disabled = False
+        base = f"http://127.0.0.1:{handle.port}"
+        with httpx.Client(base_url=base, timeout=10.0) as http:
+            assert http.get(f"/stream.mjpg?token={secret}").status_code == 200
+            assert http.get(f"/nothing/here?token={secret}").status_code == 404
+            assert http.get(f"/stream.mjpg/?token={secret}").status_code == 404
+            assert http.get("/api/state", headers={"Authorization": f"Bearer {secret}"}
+                            ).status_code == 200
+    finally:
+        if handle is not None:
+            handle.stop()
+        root.removeHandler(collect)
+        for lg, level, disabled in saved:
+            lg.setLevel(level)
+            lg.disabled = disabled
+        access.propagate, access.handlers = saved_access[0], saved_access[1]
+    assert not handle.thread.is_alive()
+    records = _server_records(collect)
+    leaked = [(r.name, _record_text(r)) for r in records
+              if secret in _record_text(r) or "nothing/here" in _record_text(r)]
+    assert leaked == []  # No token and no access line.
+
+
+# ---------------------------------------------------------------------------
+# W1, W2 through the API
+# ---------------------------------------------------------------------------
+
+
+def test_w1_full_frame_roi_is_rejected(client: TestClient, control: RunControl) -> None:
+    response = client.patch("/api/config", json={"roi": [0, 0, W, H]}, headers=AUTH)
+    assert response.status_code == 422
+    assert "at most 15 percent" in response.json()["error"]
+    assert "shown live" in response.json()["error"]
+    assert control.take_pending() is None
+
+
+def test_w2_threshold_over_the_bound_is_rejected(client: TestClient, control: RunControl) -> None:
+    response = client.patch("/api/config", json={"motion": {"threshold": 10_000_000}},
+                            headers=AUTH)
+    assert response.status_code == 422
+    assert "from 0 to 5120" in response.json()["error"]  # 160 x 128 downsampled, 25 %.
+    assert control.take_pending() is None
+
+
+def test_w2_state_lists_weakened_protections(control: RunControl) -> None:
+    accepted = control.submit({"background_diff": {"enabled": False}})
+    control.take_pending()
+    control.report_applied(accepted)
+    app = create_app(control, ScriptedFeed([]), token=TOKEN,  # type: ignore[arg-type]
+                     raw=ScriptedFeed([]), port=PORT)  # type: ignore[arg-type]
+    with _client(app) as c:
+        data = c.get("/api/state", headers=AUTH).json()
+    assert data["weakened"] == [
+        "The background differ is off: a person who stops moving is no longer detected "
+        "and can be shown.",
+        "The raw preview is on: the unprocessed feed, people included, is shown on this page.",
+    ]
+
+
+def test_w2_page_shows_weakened_protections_and_passed_through() -> None:
+    text = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    tags = {attrs.get("id"): (tag, attrs) for tag, attrs in _page().tags if attrs.get("id")}
+    tag, attrs = tags["weakened"]
+    assert attrs.get("role") == "alert"
+    assert "hidden" in attrs
+    assert attrs.get("aria-labelledby") == "weakened-title"
+    assert re.search(r'<h2 id="weakened-title">Weakened protections</h2>', text)
+    assert tags["weakened-list"][0] == "ul"
+    # At the top: before the video and the status.
+    assert text.index('id="weakened"') < text.index('class="feeds"')
+    assert "bg-diff-warning" not in text  # Replaced by the list.
+    assert tags["st-passed"][0] == "dd"
+    js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "state.weakened" in js
+    assert 'text("st-passed", String(stats.passed_through))' in js
+    assert "bg-diff-warning" not in js
+
+
+# ---------------------------------------------------------------------------
+# T3, T4: static checks on the page script
+# ---------------------------------------------------------------------------
+
+
+def _js_code() -> str:
+    """app.js without its comments, so a commented-out statement does not count."""
+    js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    js = re.sub(r"/\*.*?\*/", "", js, flags=re.S)
+    return re.sub(r"^\s*//.*$", "", js, flags=re.M)
+
+
+@pytest.mark.parametrize(
+    "sink",
+    ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"],
+)
+def test_t3_app_js_has_no_html_or_code_sinks(sink: str) -> None:
+    js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert sink not in js
+
+
+def test_t3_app_js_timers_take_functions_not_strings() -> None:
+    js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert not re.search(r"set(Timeout|Interval)\(\s*[\"'`]", js)
+    for call in re.finditer(r"set(?:Timeout|Interval)\(\s*([^,)\s]+)", js):
+        assert call.group(1) in ("function", "poll"), call.group(0)
+
+
+def test_t3_index_html_has_no_event_handler_attributes() -> None:
+    text = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert not re.search(r"<[^>]*\son[a-z]+\s*=", text, flags=re.I)
+
+
+def test_t4_fragment_is_stripped_from_the_address_bar() -> None:
+    """The token leaves the URL: replaceState with the path and query, no fragment."""
+    statement = re.compile(
+        r"window\.history\.replaceState\(\s*null\s*,\s*\"\"\s*,\s*"
+        r"window\.location\.pathname\s*\+\s*window\.location\.search\s*\)\s*;"
+    )
+    code = _js_code()
+    match = statement.search(code)
+    assert match is not None
+    # It runs inside readToken, after the fragment is read and before the token is returned.
+    body = code[code.index("function readToken()") : code.index("return value;")]
+    assert statement.search(body)
+    assert body.index("window.location.hash") < statement.search(body).start()  # type: ignore[union-attr]

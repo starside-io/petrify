@@ -45,6 +45,7 @@ from petrify.pipeline import (
 )
 from petrify.server.control import RunControl, RunSnapshot
 from petrify.sinks import FfmpegPipeSink, PreviewSink, ThreadedSink, VirtualCamSink
+from petrify.sinks.mjpeg import MjpegSink
 from petrify.sources import FileSource, ImageFolderSource
 
 T = TypeVar("T")
@@ -1510,3 +1511,116 @@ def test_failing_raw_tap_only_turns_itself_off() -> None:
     assert len(raw.images) == 5
     assert len(sink.images) == report.stats.frames == 60
     assert report.stats.sink_failures == 0
+
+
+# ---------------------------------------------------------------------------
+# P3-4: security review fixes
+# ---------------------------------------------------------------------------
+
+CONSTANT = 200
+
+
+class _ConstantMode(pipeline.EraseMode):
+    """An erase mode whose output is always the same flat grey image."""
+
+    def render(self, frame: Frame, detections: Any, subject_present: bool) -> np.ndarray:
+        return np.full_like(frame.image, CONSTANT)
+
+
+class _RecordingMjpegSink(MjpegSink):
+    """A real MJPEG sink that also keeps every JPEG it encoded."""
+
+    def __init__(self) -> None:
+        super().__init__(max_fps=None)
+        self.jpegs: list[bytes] = []
+
+    def write(self, image: np.ndarray, meta: FrameMeta) -> None:
+        super().write(image, meta)
+        latest = self.latest()
+        assert latest is not None
+        self.jpegs.append(latest.jpeg)
+
+
+def _decode(jpeg: bytes) -> np.ndarray:
+    image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert image is not None
+    return image
+
+
+def _jpeg(image: np.ndarray, quality: int) -> bytes:
+    ok, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    assert ok
+    return buffer.tobytes()
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_t2_processed_web_sink_gets_only_engine_output_with_raw_preview_on() -> None:
+    src = FakeSource(Scene(total=60, enter=20, stand=25, leave=40, gone=45))
+    processed = _RecordingMjpegSink()
+    raw = _RecordingMjpegSink()
+    config = _live_config("calibrate")
+    with mock.patch.object(pipeline, "EraseMode", _ConstantMode):
+        report = run_stream(src, config, OutputConfig(), web_sink=processed, raw_preview=raw)
+    assert report.stats.failed_closed == 0  # Every frame came from the mode.
+    assert len(processed.jpegs) == len(raw.jpegs) == len(src.yielded) == 60
+    constant = _decode(_jpeg(np.full((H, W, 3), CONSTANT, dtype=np.uint8), processed.quality))
+    for k, (out, raw_jpeg, inp) in enumerate(zip(processed.jpegs, raw.jpegs, src.yielded)):
+        # JPEG is lossy: compare with the same image encoded at the same quality.
+        expected_input = _decode(_jpeg(inp, raw.quality))
+        assert np.array_equal(_decode(out), constant), k  # The constant image ...
+        assert not np.array_equal(_decode(out), expected_input), k  # ... never the input.
+        assert np.array_equal(_decode(raw_jpeg), expected_input), k  # The raw tap: the input.
+    assert any(_shows_subject(i) for i in src.yielded)
+
+
+def _roi_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [m for m in _warnings(caplog) if "shown live" in m]
+
+
+def test_w1_run_warns_at_startup_for_a_manual_roi_over_the_cap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # 320 x 256 = 81920 px; the default cap of 0.15 is 12288 px.
+    big = _live_config("calibrate", roi=RoiConfig(mode="manual", box=(0, 0, 320, 128)))
+    with caplog.at_level(logging.WARNING, logger="petrify.pipeline"):
+        pipeline._roi_stage(FakeSource(), big)
+    assert _roi_warnings(caplog) == [
+        "The manual ROI 0 0 320 128 covers 50.0 percent of the frame, more than the "
+        "15 percent cap for auto-detection: that region is shown live (not anonymized) "
+        "on every output frame."
+    ]
+    caplog.clear()
+    at_cap = _live_config("calibrate", roi=RoiConfig(mode="manual", box=(0, 0, 256, 48)))
+    with caplog.at_level(logging.WARNING, logger="petrify.pipeline"):
+        pipeline._roi_stage(FakeSource(), at_cap)
+    assert _roi_warnings(caplog) == []
+
+
+def test_w1_file_form_does_not_warn_for_a_large_manual_roi(
+    clip: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = PetrifyConfig(encode=ENCODE, roi=RoiConfig(mode="manual", box=(0, 0, 320, 128)))
+    _RecordingFileSink.instances.clear()
+    with (
+        caplog.at_level(logging.WARNING, logger="petrify.pipeline"),
+        mock.patch.object(pipeline, "FileSink", _RecordingFileSink),
+    ):
+        run_file(clip, tmp_path / "a.mp4", config)
+    assert _roi_warnings(caplog) == []
+
+
+@pytest.mark.usefixtures("fake_person_check")
+def test_w2_applied_change_is_listed_in_the_snapshot_and_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _live_config("calibrate")
+    control = RecordingControl(config)
+    hooks = {60: _submit_at(control, {"background_diff": {"enabled": False}})}
+    with caplog.at_level(logging.WARNING, logger="petrify.server.control"):
+        run_stream(HookSource(Scene(total=100), hooks=hooks), config, OutputConfig(),
+                   sinks=[ListSink()], control=control)
+    sentence = ("The background differ is off: a person who stops moving is no longer "
+                "detected and can be shown.")
+    assert control.snapshot().weakened == (sentence,)
+    logged = [r.getMessage() for r in caplog.records if r.name == "petrify.server.control"]
+    assert logged == [f"Weakened protection: {sentence}"]

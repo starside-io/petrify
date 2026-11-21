@@ -21,11 +21,18 @@ runs on another thread. They share one :class:`RunControl`: the server submits
 validated config changes and stop requests, the loop takes the latest change
 between two frames and publishes a :class:`RunSnapshot` after every frame. This
 module has no web dependencies.
+
+The runtime ranges are narrower than the command line's: they keep every
+detector able to fire (see :func:`apply_patch`), and a manual ROI box may cover
+at most the run's ``roi.max_area_cap`` of the frame, because the ROI region is
+shown live. Settings that still weaken the protection are listed in
+:attr:`RunSnapshot.weakened` (see :func:`weakened_protections`).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 import threading
 from collections.abc import Mapping
@@ -34,6 +41,8 @@ from types import MappingProxyType
 from typing import Any
 
 from petrify.core.config import BackgroundDiffConfig, PetrifyConfig, RoiConfig
+
+logger = logging.getLogger(__name__)
 
 # Every setting the page may change while a run is in progress, as dotted paths
 # into the config. The page has one control per entry.
@@ -55,8 +64,16 @@ RUNTIME_FIELDS: tuple[str, ...] = (
 
 DETECTORS = ("motion", "person", "both")
 MAX_LOOKAHEAD = 600
-MAX_AREA = 10_000_000
 MAX_FRAME_BUDGET_MS = 60_000.0
+# Runtime bounds that keep each detector able to fire. Area thresholds are capped
+# at this share of the downsampled frame the detector works on.
+MAX_AREA_SHARE = 0.25
+MAX_PIXEL_THRESHOLD = 128
+MAX_VAR_THRESHOLD = 100.0
+MAX_MIN_CONFIDENCE = 2.0
+MAX_SCALE = 1.5
+# A manual ROI larger than this share of the frame is listed as weakened.
+ROI_WEAKENED_SHARE = 0.05
 
 # Top-level config keys that exist but are fixed for the whole run.
 _FIXED_SECTIONS = {
@@ -93,6 +110,24 @@ def _float_in(
         bound = f"greater than {low:g}" if low_open else f"at least {low:g}"
         _fail(f"{path} must be a number {bound} and at most {high:g}")
     return float(value)
+
+
+def _downsampled(frame_size: tuple[int, int], downsample: float) -> tuple[int, int]:
+    """The frame size a detector works on, computed as the detectors resize."""
+    width, height = frame_size
+    return max(1, int(width * downsample)), max(1, int(height * downsample))
+
+
+def _area_in(path: str, value: Any, frame_size: tuple[int, int], downsample: float) -> int:
+    """An area threshold: at most :data:`MAX_AREA_SHARE` of the downsampled frame."""
+    width, height = _downsampled(frame_size, downsample)
+    high = int(width * height * MAX_AREA_SHARE)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= high:
+        _fail(
+            f"{path} must be a whole number from 0 to {high}, {MAX_AREA_SHARE * 100:g} percent "
+            f"of the {width}x{height} frame that detector works on"
+        )
+    return int(value)
 
 
 def _bool(path: str, value: Any) -> bool:
@@ -144,6 +179,15 @@ def apply_patch(
 
     Nothing is applied unless every entry is valid. ``differ_defaults`` supplies
     the thresholds when the background differ is turned on without them.
+
+    The ranges keep each detector meaningful: an area threshold is at most
+    :data:`MAX_AREA_SHARE` of the downsampled ``frame_size`` its detector works
+    on, ``background_diff.pixel_threshold`` at most :data:`MAX_PIXEL_THRESHOLD`,
+    ``motion.var_threshold`` at most :data:`MAX_VAR_THRESHOLD`,
+    ``person.min_confidence`` at most :data:`MAX_MIN_CONFIDENCE` and
+    ``person.scale`` at most :data:`MAX_SCALE`. A manual ROI box covers at most
+    ``config.roi.max_area_cap`` of the frame. The command line is not bounded
+    this way: a run may start with any value it accepts.
     """
     if not isinstance(patch, dict):
         _fail("The update must be a JSON object")
@@ -171,10 +215,13 @@ def apply_patch(
         )
         motion: dict[str, Any] = {}
         if "threshold" in section:
-            motion["threshold"] = _int_in("motion.threshold", section["threshold"], 0, MAX_AREA)
+            motion["threshold"] = _area_in(
+                "motion.threshold", section["threshold"], frame_size, config.motion.downsample
+            )
         if "var_threshold" in section:
             motion["var_threshold"] = _float_in(
-                "motion.var_threshold", section["var_threshold"], 0.0, 1000.0, low_open=True
+                "motion.var_threshold", section["var_threshold"], 0.0, MAX_VAR_THRESHOLD,
+                low_open=True,
             )
         if "detect_shadows" in section:
             motion["detect_shadows"] = _bool("motion.detect_shadows", section["detect_shadows"])
@@ -188,14 +235,17 @@ def apply_patch(
         person: dict[str, Any] = {}
         if "min_confidence" in section:
             person["min_confidence"] = _float_in(
-                "person.min_confidence", section["min_confidence"], 0.0, 10.0
+                "person.min_confidence", section["min_confidence"], 0.0, MAX_MIN_CONFIDENCE
             )
         if "min_box_area" in section:
-            person["min_box_area"] = _int_in(
-                "person.min_box_area", section["min_box_area"], 0, MAX_AREA
+            person["min_box_area"] = _area_in(
+                "person.min_box_area", section["min_box_area"], frame_size,
+                config.person.downsample,
             )
         if "scale" in section:
-            person["scale"] = _float_in("person.scale", section["scale"], 1.0, 2.0, low_open=True)
+            person["scale"] = _float_in(
+                "person.scale", section["scale"], 1.0, MAX_SCALE, low_open=True
+            )
         changes["person"] = dataclasses.replace(config.person, **person)
 
     if "background_diff" in patch:
@@ -207,14 +257,17 @@ def apply_patch(
         enabled = current is not None
         if "enabled" in section:
             enabled = _bool("background_diff.enabled", section["enabled"])
+        base = current if current is not None else differ_defaults
         thresholds: dict[str, Any] = {}
         if "pixel_threshold" in section:
             thresholds["pixel_threshold"] = _int_in(
-                "background_diff.pixel_threshold", section["pixel_threshold"], 0, 255
+                "background_diff.pixel_threshold", section["pixel_threshold"], 0,
+                MAX_PIXEL_THRESHOLD,
             )
         if "area_threshold" in section:
-            thresholds["area_threshold"] = _int_in(
-                "background_diff.area_threshold", section["area_threshold"], 0, MAX_AREA
+            thresholds["area_threshold"] = _area_in(
+                "background_diff.area_threshold", section["area_threshold"], frame_size,
+                base.downsample,
             )
         if not enabled:
             if thresholds:
@@ -223,7 +276,6 @@ def apply_patch(
                 )
             changes["background_diff"] = None
         else:
-            base = current if current is not None else differ_defaults
             changes["background_diff"] = dataclasses.replace(base, **thresholds)
 
     if "engine" in patch:
@@ -267,7 +319,111 @@ def _roi(current: RoiConfig, value: Any, frame_size: tuple[int, int]) -> RoiConf
     x, y, w, h = (int(v) for v in value)
     if x < 0 or y < 0 or w < 1 or h < 1 or x + w > width or y + h > height:
         _fail(message)
+    if w * h > current.max_area_cap * width * height:
+        _fail(
+            f"roi box may cover at most {current.max_area_cap * 100:g} percent of the "
+            f"{width}x{height} frame, because the ROI region is shown live (not anonymized)"
+        )
     return dataclasses.replace(current, mode="manual", box=(x, y, w, h))
+
+
+# ---------------------------------------------------------------------------
+# Weakened protections
+# ---------------------------------------------------------------------------
+
+# Thresholds whose higher values make a detector less sensitive, compared with
+# their startup values by :func:`weakened_protections`.
+_THRESHOLDS: tuple[tuple[str, str], ...] = (
+    ("motion", "threshold"),
+    ("motion", "var_threshold"),
+    ("person", "min_confidence"),
+    ("person", "min_box_area"),
+    ("background_diff", "pixel_threshold"),
+    ("background_diff", "area_threshold"),
+)
+
+
+def _num(value: float) -> str:
+    return str(value) if isinstance(value, int) else f"{value:g}"
+
+
+def weakened_protections(
+    config: PetrifyConfig,
+    startup: PetrifyConfig,
+    frame_size: tuple[int, int],
+    *,
+    raw_preview: bool = False,
+    startup_differ: BackgroundDiffConfig | None = None,
+) -> list[tuple[str, str]]:
+    """Return the protections ``config`` weakens, as (key, sentence) pairs.
+
+    Listed whenever they hold, startup included: the background differ off; the
+    person detector alone with the differ off; ``engine.lookahead`` 0; a manual
+    ROI over :data:`ROI_WEAKENED_SHARE` of the frame; the raw preview. Listed
+    relative to ``startup`` (the config the run started with): a threshold more
+    than twice its startup value, and a lookahead below its startup value. The
+    differ thresholds compare with ``startup_differ`` (the startup differ, or the
+    settings it is turned on with when the run started without it). ``key``
+    names the protection, so a value change keeps the same key.
+    """
+    found: list[tuple[str, str]] = []
+    if config.background_diff is None:
+        found.append((
+            "differ_off",
+            "The background differ is off: a person who stops moving is no longer "
+            "detected and can be shown.",
+        ))
+        if config.detector == "person":
+            found.append((
+                "person_only",
+                "The detector is person only and the background differ is off: nothing "
+                "detects a subject the person detector misses.",
+            ))
+    for section, key in _THRESHOLDS:
+        current = getattr(config, section)
+        start = getattr(startup, section)
+        if section == "background_diff":
+            start = startup_differ or start
+        if current is None or start is None:
+            continue
+        value, before = getattr(current, key), getattr(start, key)
+        if value > 2 * before:
+            field = f"{section}.{key}"
+            found.append((
+                f"threshold:{field}",
+                f"{field} is {_num(value)}, more than twice its startup value of "
+                f"{_num(before)}: detection is less sensitive and can miss a person.",
+            ))
+    lookahead, start_lookahead = config.engine.lookahead, startup.engine.lookahead
+    if lookahead < start_lookahead:
+        found.append((
+            "lookahead_below",
+            f"engine.lookahead is {lookahead}, below its startup value of {start_lookahead}: "
+            "fewer frames before a detection are held back and hidden.",
+        ))
+    if lookahead == 0:
+        found.append((
+            "lookahead_zero",
+            "engine.lookahead is 0: no frame is held back, so the frames just before a "
+            "detection can show a person.",
+        ))
+    roi = config.roi
+    if roi.mode == "manual" and roi.box is not None:
+        width, height = frame_size
+        share = roi.box[2] * roi.box[3] / (width * height)
+        if share > ROI_WEAKENED_SHARE:
+            found.append((
+                "roi",
+                f"The manual ROI covers {share * 100:.1f} percent of the frame, and that "
+                "region is shown live (not anonymized).",
+            ))
+    if raw_preview:
+        found.append((
+            "raw_preview",
+            "The raw preview is on: the unprocessed feed, people included, is shown on "
+            "this page.",
+        ))
+    return found
 
 
 def config_to_dict(config: PetrifyConfig) -> dict[str, Any]:
@@ -350,6 +506,8 @@ class RunSnapshot:
     True once the run is over for any reason (both False while the run starts).
     ``last_error`` is the message of the last rejected or failed reconfiguration
     (None until one happens); it stays until another one replaces it.
+    ``weakened`` lists, as plain sentences, the protections the applied config
+    weakens (see :func:`weakened_protections`); :class:`RunControl` fills it in.
     """
 
     config: Mapping[str, Any]
@@ -361,10 +519,12 @@ class RunSnapshot:
     running: bool = False
     ended: bool = False
     last_error: str | None = None
+    weakened: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.config, MappingProxyType):
             object.__setattr__(self, "config", _frozen(self.config))
+        object.__setattr__(self, "weakened", tuple(str(w) for w in self.weakened))
         if self.roi is not None:
             object.__setattr__(self, "roi", tuple(int(v) for v in self.roi))
 
@@ -380,6 +540,7 @@ class RunSnapshot:
             "running": self.running,
             "ended": self.ended,
             "last_error": self.last_error,
+            "weakened": list(self.weakened),
         }
 
 
@@ -390,7 +551,10 @@ class RunControl:
     :meth:`take_pending`, :meth:`report_applied`, :meth:`report_rejected`,
     :meth:`publish`, :attr:`stop_requested`. Only the loop touches the engine.
 
-    ``frame_size`` (width, height) bounds a manual ROI box.
+    ``frame_size`` (width, height) bounds a manual ROI box and the area
+    thresholds. The config the run started with is kept: the weakened
+    protections are computed against it, and each one that a change newly
+    weakens is logged once, at warning level, when that change is applied.
     """
 
     def __init__(self, config: PetrifyConfig, frame_size: tuple[int, int]) -> None:
@@ -405,9 +569,19 @@ class RunControl:
         self._differ_defaults = config.background_diff or BackgroundDiffConfig(
             downsample=config.motion.downsample
         )
+        self._startup = config
+        self._startup_differ = self._differ_defaults
+        self._raw_preview = False
+        self._weakened = self._weakened_for(config)
         self._last_error: str | None = None
         self._stop = threading.Event()
         self._snapshot = RunSnapshot(config=config_to_dict(config))
+
+    def _weakened_for(self, config: PetrifyConfig) -> list[tuple[str, str]]:
+        return weakened_protections(
+            config, self._startup, self._frame_size, raw_preview=self._raw_preview,
+            startup_differ=self._startup_differ,
+        )
 
     # -- server side ----------------------------------------------------
 
@@ -432,14 +606,21 @@ class RunControl:
         """Ask the loop to end the run after the current frame."""
         self._stop.set()
 
+    def mark_raw_preview(self) -> None:
+        """Record that the unprocessed feed is served: it is listed as weakened."""
+        with self._lock:
+            self._raw_preview = True
+            self._weakened = self._weakened_for(self._applied)
+
     def snapshot(self) -> RunSnapshot:
-        """Return the latest published snapshot, with the current ``last_error``."""
+        """Return the latest published snapshot, with the current errors and weakened list."""
         with self._lock:
             snap = self._snapshot
             error = self._last_error
-        if snap.last_error == error:
+            weakened = tuple(sentence for _, sentence in self._weakened)
+        if snap.last_error == error and snap.weakened == weakened:
             return snap
-        return dataclasses.replace(snap, last_error=error)
+        return dataclasses.replace(snap, last_error=error, weakened=weakened)
 
     # -- loop side ------------------------------------------------------
 
@@ -461,13 +642,18 @@ class RunControl:
             return pending
 
     def report_applied(self, config: PetrifyConfig) -> None:
-        """Record that the loop now runs with ``config``."""
+        """Record that the loop now runs with ``config``; log each newly weakened protection."""
         with self._lock:
             self._applied = config
             if self._pending is None:
                 self._target = config
             if config.background_diff is not None:
                 self._differ_defaults = config.background_diff
+            before = {key for key, _ in self._weakened}
+            self._weakened = self._weakened_for(config)
+            new = [sentence for key, sentence in self._weakened if key not in before]
+        for sentence in new:
+            logger.warning("Weakened protection: %s", sentence)
 
     def report_rejected(self, message: str) -> None:
         """Record that the loop could not apply a config; the applied one stays."""

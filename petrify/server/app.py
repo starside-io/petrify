@@ -21,14 +21,30 @@ only when :func:`create_app` or :func:`serve_in_thread` is called.
 
 Security model: this is a local control surface for a privacy tool, and any
 other page open in the user's browser is treated as hostile. The server binds
-to ``127.0.0.1`` only; every request must carry a ``Host`` of
-``127.0.0.1:<port>`` or ``localhost:<port>`` (defeats DNS rebinding); every
-route except the page and its assets needs the per-run token (a Bearer header,
-or a ``token`` query parameter on the two stream routes only); ``PATCH`` and
-``POST`` reject a foreign ``Origin``; ``PATCH`` needs a JSON content type and a
-small body. No CORS headers are sent, and every response carries no-store,
-nosniff, no-referrer, frame-deny and a strict Content-Security-Policy. The
-token is never logged, and uvicorn's access log is off.
+to ``127.0.0.1`` only; every request must carry a ``Host`` of exactly
+``127.0.0.1:<port>`` (defeats DNS rebinding). ``localhost`` is refused: the
+server does not listen on ``[::1]``, where another local user could, so a link
+through ``localhost`` could reach that impostor. Every route except the page
+and its assets needs the per-run token (a Bearer header, or a ``token`` query
+parameter on the two stream routes only); ``PATCH`` and ``POST`` accept no
+``Origin`` other than ``http://127.0.0.1:<port>``; ``PATCH`` needs a JSON
+content type and a small body. There are no redirects (a trailing slash is a
+404, so a token in the query is never echoed in a ``Location``). No CORS
+headers are sent, and every response carries no-store, nosniff, no-referrer,
+frame-deny, same-origin resource and opener policies and a strict
+Content-Security-Policy. The token is never logged, and uvicorn's access log is
+off.
+
+Connections: uvicorn serves at most :data:`LIMIT_CONCURRENCY` connections at
+once (it answers 503 beyond that) and closes an idle keep-alive connection
+after :data:`KEEP_ALIVE_SECONDS`. uvicorn has no timeout for a request whose
+headers never finish, so a local process can still occupy connection slots and
+make the page unreachable for a while; it cannot read or change anything, and
+the processing loop is not affected.
+
+The token holder can change any runtime setting within the ranges of
+:mod:`petrify.server.control`; the settings that weaken the protection are
+listed on the page (``weakened`` in the state).
 """
 
 import json
@@ -52,6 +68,8 @@ logger = logging.getLogger(__name__)
 HOST = "127.0.0.1"
 MAX_BODY_BYTES = 4096
 STREAM_WAIT_SECONDS = 0.5
+LIMIT_CONCURRENCY = 64
+KEEP_ALIVE_SECONDS = 5
 
 WEB_EXTRA_MESSAGE = (
     "The web page needs FastAPI and uvicorn, which are not installed. Install the "
@@ -67,6 +85,8 @@ SECURITY_HEADERS: dict[str, str] = {
         "default-src 'self'; img-src 'self'; frame-ancestors 'none'; "
         "base-uri 'none'; form-action 'none'"
     ),
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cross-Origin-Opener-Policy": "same-origin",
 }
 
 _STATIC_TYPES = {
@@ -108,11 +128,11 @@ class _ServerState:
     port: int
     closing: threading.Event = field(default_factory=threading.Event)
 
-    def allowed_hosts(self) -> tuple[str, str]:
-        return (f"127.0.0.1:{self.port}", f"localhost:{self.port}")
+    def allowed_hosts(self) -> tuple[str]:
+        return (f"127.0.0.1:{self.port}",)
 
-    def allowed_origins(self) -> tuple[str, str]:
-        return (f"http://127.0.0.1:{self.port}", f"http://localhost:{self.port}")
+    def allowed_origins(self) -> tuple[str]:
+        return (f"http://127.0.0.1:{self.port}",)
 
 
 class _SecurityMiddleware:
@@ -194,7 +214,8 @@ def create_app(
     """Build the web app for one run.
 
     ``processed`` is the processed feed and ``raw`` the opt-in unprocessed one
-    (``/raw.mjpg`` does not exist when it is None). ``port`` is the port the
+    (``/raw.mjpg`` does not exist when it is None; when it is given, the control
+    lists the raw preview as a weakened protection). ``port`` is the port the
     browser uses, checked in the ``Host`` and ``Origin`` headers; with 0,
     :func:`serve_in_thread` fills in the bound port. Raises ``RuntimeError`` when
     FastAPI or uvicorn is missing.
@@ -213,7 +234,10 @@ def create_app(
     static_files = {name: _static_bytes(name) for name in _STATIC_TYPES}
     token_bytes = token.encode("utf-8")
 
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    if raw is not None:
+        control.mark_raw_preview()
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
     app.state.petrify = state
     app.add_middleware(_SecurityMiddleware, state=state)
 
@@ -366,6 +390,28 @@ class ServerHandle:
             pass
 
 
+def _uvicorn_config(app: "FastAPI", port: int) -> Any:
+    """The uvicorn settings: loopback, no access log, bounded connections."""
+    import uvicorn  # noqa: PLC0415
+
+    return uvicorn.Config(
+        app,
+        host=HOST,
+        port=port,
+        log_config=None,
+        log_level="warning",
+        access_log=False,
+        lifespan="off",
+        ws="none",
+        proxy_headers=False,
+        server_header=False,
+        date_header=False,
+        limit_concurrency=LIMIT_CONCURRENCY,
+        timeout_keep_alive=KEEP_ALIVE_SECONDS,
+        timeout_graceful_shutdown=2,
+    )
+
+
 def serve_in_thread(app: "FastAPI", port: int, *, start_timeout: float = 10.0) -> ServerHandle:
     """Serve ``app`` with uvicorn on ``127.0.0.1:port`` from a daemon thread.
 
@@ -393,21 +439,7 @@ def serve_in_thread(app: "FastAPI", port: int, *, start_timeout: float = 10.0) -
             raise ValueError(f"The app was created for port {state.port}, not {bound_port}")
         state.port = bound_port
 
-    config = uvicorn.Config(
-        app,
-        host=HOST,
-        port=bound_port,
-        log_config=None,
-        log_level="warning",
-        access_log=False,
-        lifespan="off",
-        ws="none",
-        proxy_headers=False,
-        server_header=False,
-        date_header=False,
-        timeout_graceful_shutdown=2,
-    )
-    server = uvicorn.Server(config)
+    server = uvicorn.Server(_uvicorn_config(app, bound_port))
     failure: list[BaseException] = []
 
     def run() -> None:

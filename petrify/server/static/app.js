@@ -131,7 +131,27 @@
     ["ctl-background-diff-pixel-threshold", "ctl-background-diff-area-threshold"].forEach(function (id) {
       $(id).disabled = differOff || ended;
     });
-    $("bg-diff-warning").hidden = !(differOff && state.source.live);
+  }
+
+  var shownWeakened = null;
+
+  function showWeakened(list) {
+    var items = Array.isArray(list) ? list : [];
+    var key = items.join("\n");
+    if (key === shownWeakened) {
+      return; /* Unchanged: the alert is not announced again. */
+    }
+    shownWeakened = key;
+    var ul = $("weakened-list");
+    while (ul.firstChild) {
+      ul.removeChild(ul.firstChild);
+    }
+    items.forEach(function (sentence) {
+      var li = document.createElement("li");
+      li.textContent = String(sentence);
+      ul.appendChild(li);
+    });
+    $("weakened").hidden = items.length === 0;
   }
 
   function render(state) {
@@ -148,6 +168,7 @@
       (bg.rejected ? " (" + bg.rejected + " samples rejected)" : ""));
     text("st-frames", String(stats.frames));
     text("st-frozen", String(stats.frozen));
+    text("st-passed", String(stats.passed_through));
     text("st-failed", String(stats.failed_closed));
     text("st-over-budget", String(stats.over_budget));
     text("st-dropped", String(source.dropped));
@@ -158,6 +179,7 @@
     text("st-reconfigurations", String(stats.reconfigurations));
     text("st-error", state.last_error ? "Error: " + state.last_error : "None");
     $("raw-figure").hidden = !state.raw_preview;
+    showWeakened(state.weakened);
     showApplied(state.config, state);
     if (!streamsStarted && !state.ended) {
       streamsStarted = true;

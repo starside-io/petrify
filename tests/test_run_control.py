@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import subprocess
 import sys
 import threading
@@ -11,7 +12,13 @@ from typing import Any
 
 import pytest
 
-from petrify.core import BackgroundDiffConfig, EngineConfig, PetrifyConfig
+from petrify.core import (
+    BackgroundDiffConfig,
+    EngineConfig,
+    MotionConfig,
+    PetrifyConfig,
+    RoiConfig,
+)
 from petrify.server.control import (
     RUNTIME_FIELDS,
     RunControl,
@@ -179,8 +186,11 @@ def test_type_and_range_errors(patch: Any) -> None:
 
 
 def test_roi_box_may_touch_the_frame_edges() -> None:
-    accepted = _control().submit({"roi": [0, 0, SIZE[0], SIZE[1]]})
-    assert accepted.roi.box == (0, 0, *SIZE)
+    # Boxes stay under the area cap (W1); each touches two edges of the frame.
+    accepted = _control().submit({"roi": [0, 0, SIZE[0], 38]})
+    assert accepted.roi.box == (0, 0, SIZE[0], 38)
+    corner = (SIZE[0] - 100, SIZE[1] - 50, 100, 50)
+    assert _control().submit({"roi": list(corner)}).roi.box == corner
 
 
 def test_no_partial_application_on_error() -> None:
@@ -307,7 +317,7 @@ def test_concurrent_submit_and_take_lose_nothing_and_apply_the_latest() -> None:
     def writer(w: int) -> None:
         start.wait()
         for i in range(per_writer):
-            control.submit({"motion": {"threshold": w * 10_000 + i}})
+            control.submit({"motion": {"threshold": w * 1_000 + i}})
 
     def taker() -> None:
         start.wait()
@@ -333,7 +343,7 @@ def test_concurrent_submit_and_take_lose_nothing_and_apply_the_latest() -> None:
     assert taken, "the taker saw no config"
     # Every config handed out was a valid accepted one, each at most once.
     assert len({id(c) for c in taken}) == len(taken)
-    values = {w * 10_000 + i for w in range(writers) for i in range(per_writer)}
+    values = {w * 1_000 + i for w in range(writers) for i in range(per_writer)}
     assert all(c.motion.threshold in values for c in taken)
     # After the dust settles nothing is pending and the last one taken is applied.
     assert control.take_pending() is None
@@ -384,3 +394,230 @@ def test_control_imports_without_web_dependencies() -> None:
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          check=True)
     assert out.stdout.strip() == "ok"
+
+
+# ---------------------------------------------------------------------------
+# W1: a manual ROI is capped, because its region is shown live
+# ---------------------------------------------------------------------------
+
+# 320 x 256 = 81920 px; the default cap of 0.15 allows 12288 px.
+
+
+def test_w1_roi_over_the_area_cap_is_rejected_with_the_limit() -> None:
+    control = _control()
+    assert control.submit({"roi": [0, 0, 256, 48]}).roi.box == (0, 0, 256, 48)  # Exactly 15 %.
+    for box in ([0, 0, 256, 49], [0, 0, SIZE[0], SIZE[1]]):
+        with pytest.raises(ValueError) as info:
+            control.submit({"roi": box})
+        message = str(info.value)
+        assert "at most 15 percent" in message
+        assert "shown live" in message
+    assert control.take_pending().roi.box == (0, 0, 256, 48)  # type: ignore[union-attr]
+
+
+def test_w1_roi_cap_is_the_runs_configured_cap() -> None:
+    control = _control(PetrifyConfig(roi=RoiConfig(max_area_cap=0.05)))  # 4096 px.
+    assert control.submit({"roi": [0, 0, 100, 40]}).roi.box == (0, 0, 100, 40)
+    with pytest.raises(ValueError, match="at most 5 percent"):
+        control.submit({"roi": [0, 0, 100, 41]})
+
+
+# ---------------------------------------------------------------------------
+# W2: runtime ranges keep every detector meaningful
+# ---------------------------------------------------------------------------
+
+# Every detector downsamples by 0.5 by default: 160 x 128 = 20480 px, 25 % = 5120.
+BOUNDS: list[tuple[str, str, Any, Any, str]] = [
+    ("motion", "threshold", 5120, 5121, "from 0 to 5120"),
+    ("background_diff", "area_threshold", 5120, 5121, "from 0 to 5120"),
+    ("person", "min_box_area", 5120, 5121, "from 0 to 5120"),
+    ("background_diff", "pixel_threshold", 128, 129, "from 0 to 128"),
+    ("motion", "var_threshold", 100, 100.5, "at most 100"),
+    ("person", "min_confidence", 2, 2.01, "at most 2"),
+    ("person", "scale", 1.5, 1.51, "at most 1.5"),
+]
+
+
+@pytest.mark.parametrize(("section", "key", "highest", "over", "message"), BOUNDS,
+                         ids=[f"{b[0]}.{b[1]}" for b in BOUNDS])
+def test_w2_runtime_bound(section: str, key: str, highest: Any, over: Any, message: str) -> None:
+    control = _control()
+    accepted = control.submit({section: {key: highest}})
+    assert getattr(getattr(accepted, section), key) == highest
+    with pytest.raises(ValueError) as info:
+        control.submit({section: {key: over}})
+    assert f"{section}.{key}" in str(info.value)
+    assert message in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"motion": {"threshold": 10_000_000}},
+        {"background_diff": {"pixel_threshold": 255}},
+        {"background_diff": {"area_threshold": 10_000_000}},
+        {"motion": {"var_threshold": 1000}},
+        {"person": {"min_confidence": 10}},
+        {"person": {"min_box_area": 10_000_000}},
+    ],
+)
+def test_w2_values_from_the_review_are_rejected(patch: dict[str, Any]) -> None:
+    control = _control()
+    with pytest.raises(ValueError):
+        control.submit(patch)
+    assert control.take_pending() is None
+
+
+def test_w2_area_bounds_follow_the_frame_and_the_detector_downsample() -> None:
+    control = RunControl(PetrifyConfig(motion=MotionConfig(downsample=0.25)), (320, 256))
+    # 80 x 64 = 5120 px, 25 % = 1280.
+    assert control.submit({"motion": {"threshold": 1280}}).motion.threshold == 1280
+    with pytest.raises(ValueError) as info:
+        control.submit({"motion": {"threshold": 1281}})
+    assert "from 0 to 1280" in str(info.value) and "25 percent" in str(info.value)
+    assert "80x64" in str(info.value)
+
+
+def test_w2_bounds_apply_to_the_runtime_api_only() -> None:
+    # A run may start with any value the command line accepts.
+    start = PetrifyConfig(motion=MotionConfig(threshold=10_000_000))
+    control = _control(start)
+    assert control.submit({"engine": {"lookahead": 4}}).motion.threshold == 10_000_000
+
+
+# ---------------------------------------------------------------------------
+# W2: weakened protections
+# ---------------------------------------------------------------------------
+
+DIFFER_OFF = ("The background differ is off: a person who stops moving is no longer "
+              "detected and can be shown.")
+PERSON_ONLY = ("The detector is person only and the background differ is off: nothing "
+               "detects a subject the person detector misses.")
+LOOKAHEAD_ZERO = ("engine.lookahead is 0: no frame is held back, so the frames just before "
+                  "a detection can show a person.")
+RAW_PREVIEW = ("The raw preview is on: the unprocessed feed, people included, is shown on "
+               "this page.")
+
+
+def _threshold(field: str, value: str, start: str) -> str:
+    return (f"{field} is {value}, more than twice its startup value of {start}: detection "
+            "is less sensitive and can miss a person.")
+
+
+def _lookahead_below(value: int, start: int) -> str:
+    return (f"engine.lookahead is {value}, below its startup value of {start}: fewer frames "
+            "before a detection are held back and hidden.")
+
+
+def _roi_share(percent: str) -> str:
+    return (f"The manual ROI covers {percent} percent of the frame, and that region is shown "
+            "live (not anonymized).")
+
+
+def _apply(control: RunControl, patch: dict[str, Any]) -> tuple[str, ...]:
+    new = control.submit(patch)
+    assert control.take_pending() is new
+    control.report_applied(new)
+    return control.snapshot().weakened
+
+
+def test_w2_default_run_has_no_weakened_protection() -> None:
+    control = _control()
+    assert control.snapshot().weakened == ()
+    assert control.snapshot().to_dict()["weakened"] == []
+
+
+def test_w2_weakened_differ_off_and_person_only() -> None:
+    control = _control()
+    assert _apply(control, {"detector": "person"}) == ()  # The differ still runs.
+    assert _apply(control, {"background_diff": {"enabled": False}}) == (DIFFER_OFF, PERSON_ONLY)
+    assert control.snapshot().to_dict()["weakened"] == [DIFFER_OFF, PERSON_ONLY]
+    assert _apply(control, {"detector": "both"}) == (DIFFER_OFF,)
+    assert _apply(control, {"background_diff": {"enabled": True}}) == ()
+
+
+@pytest.mark.parametrize(
+    ("patch", "field", "value", "start", "not_listed"),
+    [
+        ({"motion": {"threshold": 1001}}, "motion.threshold", "1001", "500",
+         {"motion": {"threshold": 1000}}),
+        ({"motion": {"var_threshold": 33}}, "motion.var_threshold", "33", "16",
+         {"motion": {"var_threshold": 32}}),
+        ({"person": {"min_confidence": 0.7}}, "person.min_confidence", "0.7", "0.3",
+         {"person": {"min_confidence": 0.6}}),
+        ({"person": {"min_box_area": 3001}}, "person.min_box_area", "3001", "1500",
+         {"person": {"min_box_area": 3000}}),
+        ({"background_diff": {"pixel_threshold": 51}}, "background_diff.pixel_threshold",
+         "51", "25", {"background_diff": {"pixel_threshold": 50}}),
+        ({"background_diff": {"area_threshold": 401}}, "background_diff.area_threshold",
+         "401", "200", {"background_diff": {"area_threshold": 400}}),
+    ],
+)
+def test_w2_weakened_threshold_above_twice_its_startup_value(
+    patch: dict[str, Any], field: str, value: str, start: str, not_listed: dict[str, Any]
+) -> None:
+    control = _control()
+    assert _apply(control, not_listed) == ()
+    assert _apply(control, patch) == (_threshold(field, value, start),)
+
+
+def test_w2_weakened_lookahead() -> None:
+    control = _control()
+    assert _apply(control, {"engine": {"lookahead": 20}}) == ()
+    assert _apply(control, {"engine": {"lookahead": 9}}) == (_lookahead_below(9, 10),)
+    assert _apply(control, {"engine": {"lookahead": 0}}) == (_lookahead_below(0, 10),
+                                                             LOOKAHEAD_ZERO)
+
+
+def test_w2_weakened_manual_roi_share() -> None:
+    control = _control()
+    assert _apply(control, {"roi": [0, 0, 64, 64]}) == ()  # 5.0 %: not more than 5.
+    assert _apply(control, {"roi": [0, 0, 100, 50]}) == (_roi_share("6.1"),)
+    assert _apply(control, {"roi": "disabled"}) == ()
+
+
+def test_w2_weakened_raw_preview() -> None:
+    control = _control()
+    control.mark_raw_preview()
+    assert control.snapshot().weakened == (RAW_PREVIEW,)
+
+
+def test_w2_absolute_conditions_are_listed_at_startup() -> None:
+    start = dataclasses.replace(
+        PetrifyConfig(), detector="person", background_diff=None,
+        engine=EngineConfig(lookahead=0), roi=RoiConfig(mode="manual", box=(0, 0, 320, 256)),
+    )
+    snap = _control(start).snapshot()
+    assert snap.weakened == (DIFFER_OFF, PERSON_ONLY, LOOKAHEAD_ZERO, _roi_share("100.0"))
+
+
+def test_w2_thresholds_compare_with_the_startup_config_not_the_defaults() -> None:
+    control = _control(PetrifyConfig(motion=MotionConfig(threshold=2000)))
+    assert control.snapshot().weakened == ()
+    assert _apply(control, {"motion": {"threshold": 4000}}) == ()
+    assert _apply(control, {"motion": {"threshold": 4001}}) == (
+        _threshold("motion.threshold", "4001", "2000"),)
+
+
+def test_w2_differ_thresholds_compare_with_the_startup_differ_after_a_toggle() -> None:
+    control = _control()
+    _apply(control, {"background_diff": {"enabled": False}})
+    assert _apply(control, {"background_diff": {"enabled": True, "pixel_threshold": 60}}) == (
+        _threshold("background_diff.pixel_threshold", "60", "25"),)
+
+
+def test_w2_each_newly_weakened_protection_is_logged_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    control = _control()
+    with caplog.at_level(logging.WARNING, logger="petrify.server.control"):
+        _control().snapshot()  # Nothing is logged without a change.
+        _apply(control, {"background_diff": {"enabled": False}})
+        _apply(control, {"engine": {"lookahead": 5}})
+        _apply(control, {"engine": {"lookahead": 4}})  # Same protection, still weakened.
+        _apply(control, {"detector": "both"})
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert messages == [
+        f"Weakened protection: {DIFFER_OFF}",
+        f"Weakened protection: {_lookahead_below(5, 10)}",
+    ]

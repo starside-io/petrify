@@ -85,6 +85,15 @@ main {
   border-left-color: var(--warn-fg);
 }
 
+.weakened h2 {
+  margin: 0 0 4px;
+}
+
+.weakened p,
+.weakened ul {
+  margin: 4px 0;
+}
+
 .notice-error {
   color: var(--error-fg);
   border-left-color: var(--error-fg);
