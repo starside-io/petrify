@@ -427,8 +427,13 @@ def weakened_protections(
 
 
 def config_to_dict(config: PetrifyConfig) -> dict[str, Any]:
-    """Return ``config`` as plain JSON-safe values (tuples become lists)."""
-    return _plain(dataclasses.asdict(config))
+    """Return ``config`` as plain JSON-safe values (tuples become lists).
+
+    ``mode_options`` becomes an object from option name to value.
+    """
+    data = dataclasses.asdict(config)
+    data["mode_options"] = config.mode_options_dict()
+    return _plain(data)
 
 
 def _plain(value: Any) -> Any:
