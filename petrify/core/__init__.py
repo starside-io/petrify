@@ -35,7 +35,15 @@ from petrify.core.config import (
     TrackerConfig,
     mode_options_from,
 )
-from petrify.core.detections import Box, DetectionKind, Detections, Face
+from petrify.core.detections import (
+    FIELD_OF,
+    Box,
+    DetectionKind,
+    Detections,
+    Face,
+    MalformedDetections,
+    check_detections,
+)
 from petrify.core.engine import (
     Engine,
     EngineStats,
@@ -56,6 +64,7 @@ from petrify.core.plugin import (
 )
 
 __all__ = [
+    "FIELD_OF",
     "BackgroundConfig",
     "BackgroundDiffConfig",
     "BackgroundModel",
@@ -74,6 +83,7 @@ __all__ = [
     "Frame",
     "FrameMeta",
     "FrameTrace",
+    "MalformedDetections",
     "Mode",
     "ModelConfig",
     "MotionConfig",
@@ -90,5 +100,6 @@ __all__ = [
     "Stage",
     "StageTiming",
     "TrackerConfig",
+    "check_detections",
     "mode_options_from",
 ]
