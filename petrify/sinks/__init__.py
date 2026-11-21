@@ -19,8 +19,17 @@
 from __future__ import annotations
 
 from petrify.sinks.file import FfmpegPipeSink, FileSink
+from petrify.sinks.mjpeg import MjpegFrame, MjpegSink
 from petrify.sinks.preview import PreviewSink
 from petrify.sinks.threaded import ThreadedSink
 from petrify.sinks.virtualcam import VirtualCamSink
 
-__all__ = ["FfmpegPipeSink", "FileSink", "PreviewSink", "ThreadedSink", "VirtualCamSink"]
+__all__ = [
+    "FfmpegPipeSink",
+    "FileSink",
+    "MjpegFrame",
+    "MjpegSink",
+    "PreviewSink",
+    "ThreadedSink",
+    "VirtualCamSink",
+]
