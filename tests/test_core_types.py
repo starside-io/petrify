@@ -269,31 +269,69 @@ def test_field_of_covers_every_kind() -> None:
             assert FIELD_OF[kind] == kind.value
 
 
+def test_field_of_is_immutable() -> None:
+    with pytest.raises(TypeError):
+        FIELD_OF[DetectionKind.LANDMARKS] = "landmarks"  # type: ignore[index]
+    assert FIELD_OF[DetectionKind.LANDMARKS] == "faces"
+
+
 _ALL = frozenset(DetectionKind)
+_NO_LANDMARKS = _ALL - {DetectionKind.LANDMARKS}
 _SHAPE = (2, 4, 3)
 
 
-def test_check_detections_accepts_well_formed_and_returns_same_object() -> None:
+def _fields(d: Detections) -> tuple[object, ...]:
+    return tuple(getattr(d, f.name) for f in dataclasses.fields(Detections))
+
+
+def _assert_same(out: Detections, expected: Detections) -> None:
+    """``out`` equals ``expected`` field by field (masks compared by value)."""
+    assert type(out) is Detections
+    for f in dataclasses.fields(Detections):
+        got, want = getattr(out, f.name), getattr(expected, f.name)
+        if isinstance(want, np.ndarray):
+            assert isinstance(got, np.ndarray)
+            np.testing.assert_array_equal(got, want)
+        else:
+            assert got == want, f.name
+
+
+def test_check_detections_accepts_well_formed_and_returns_new_object() -> None:
+    mask = np.zeros((2, 4), dtype=bool)
     d = Detections(
         motion=np.bool_(True),
-        persons=(Box(np.int32(0), np.int64(1), 2, 0, score=0.5), Box(0, 0, 1, 1)),  # type: ignore[arg-type]
+        persons=(Box(np.int32(0), np.int64(1), 2, 0, score=np.float32(0.5)), Box(0, 0, 1, 1)),  # type: ignore[arg-type]
         background_diff=False,
-        faces=(Face(Box(0, 0, 1, 1), landmarks=((0.0, 1.0),)),),
-        mask=np.zeros((2, 4), dtype=bool),
+        faces=(Face(Box(0, 0, 1, 1), landmarks=((0, 1.5),)),),
+        mask=mask,
     )
-    assert check_detections(d, _ALL, _SHAPE) is d
-    empty = Detections()
-    assert check_detections(empty, frozenset(), _SHAPE) is empty
+    out = check_detections(d, _ALL, _SHAPE)
+    assert out is not d
+    assert out.motion is True
+    assert out.background_diff is False
+    assert out.persons == (Box(0, 1, 2, 0, score=0.5), Box(0, 0, 1, 1))
+    assert out.persons is not None
+    for box in out.persons:
+        assert type(box) is Box
+        assert all(type(getattr(box, n)) is int for n in ("x", "y", "w", "h"))
+    assert type(out.persons[0].score) is float
+    assert out.faces == (Face(Box(0, 0, 1, 1), landmarks=((0.0, 1.5),)),)
+    assert out.faces is not None
+    assert out.faces[0].landmarks is not None
+    assert all(type(c) is float for c in out.faces[0].landmarks[0])
+    assert out.mask is not mask
+    empty = check_detections(Detections(), frozenset(), _SHAPE)
+    assert _fields(empty) == (None,) * 5
 
 
 def test_check_detections_faces_without_landmarks_ok_when_landmarks_not_provided() -> None:
     d = Detections(faces=(Face(Box(0, 0, 1, 1)),))
-    assert check_detections(d, frozenset({DetectionKind.FACES}), _SHAPE) is d
+    _assert_same(check_detections(d, frozenset({DetectionKind.FACES}), _SHAPE), d)
 
 
 def test_check_detections_landmarks_kind_permits_faces_field() -> None:
     d = Detections(faces=(Face(Box(0, 0, 1, 1), landmarks=((0.0, 0.0),)),))
-    assert check_detections(d, frozenset({DetectionKind.LANDMARKS}), _SHAPE) is d
+    _assert_same(check_detections(d, frozenset({DetectionKind.LANDMARKS}), _SHAPE), d)
 
 
 def test_check_detections_rejects_non_detections() -> None:
@@ -301,6 +339,19 @@ def test_check_detections_rejects_non_detections() -> None:
         check_detections({"motion": True}, _ALL, _SHAPE)
     with pytest.raises(MalformedDetections, match="expected Detections"):
         check_detections(None, _ALL, _SHAPE)
+
+
+@pytest.mark.parametrize("kind", ["pose", "motion", 3, None])
+def test_check_detections_rejects_unknown_kind(kind: object) -> None:
+    # A plain string equal to a kind's value is not a DetectionKind either.
+    for provides in (frozenset({kind}), frozenset({DetectionKind.PERSONS, kind})):
+        with pytest.raises(MalformedDetections, match="unknown detection kind"):
+            check_detections(Detections(), provides, _SHAPE)  # type: ignore[arg-type]
+
+
+def test_check_detections_rejects_non_iterable_provides() -> None:
+    with pytest.raises(MalformedDetections, match="provides"):
+        check_detections(Detections(), 5, _SHAPE)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -328,6 +379,13 @@ def test_check_detections_rejects_non_bool_flag(name: str, value: object) -> Non
         check_detections(Detections(**{name: value}), _ALL, _SHAPE)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("name", ["motion", "background_diff"])
+@pytest.mark.parametrize("value", [np.bool_(True), np.bool_(False), True, False])
+def test_check_detections_outputs_python_bool_flags(name: str, value: object) -> None:
+    out = check_detections(Detections(**{name: value}), _ALL, _SHAPE)  # type: ignore[arg-type]
+    assert getattr(out, name) is bool(value)
+
+
 _BAD_BOXES = [
     pytest.param((0, 0, 1, 1), "expected a Box", id="plain-tuple"),
     pytest.param(Box(0.0, 0, 1, 1), "Box.x must be an integer", id="float-x"),  # type: ignore[arg-type]
@@ -337,13 +395,34 @@ _BAD_BOXES = [
     pytest.param(Box(0, 0, "1", 1), "Box.w must be an integer", id="str-w"),  # type: ignore[arg-type]
     pytest.param(Box(0, 0, -1, 1), "non-negative", id="negative-w"),
     pytest.param(Box(0, 0, 1, np.int32(-2)), "non-negative", id="negative-h"),  # type: ignore[arg-type]
+    pytest.param(Box(0, 0, 1, 1, score=float("nan")), "Box.score", id="nan-score"),
+    pytest.param(Box(0, 0, 1, 1, score=float("inf")), "Box.score", id="inf-score"),
+    pytest.param(Box(0, 0, 1, 1, score=np.float64("-inf")), "Box.score", id="numpy-inf-score"),  # type: ignore[arg-type]
+    pytest.param(Box(0, 0, 1, 1, score="0.5"), "Box.score", id="str-score"),  # type: ignore[arg-type]
+    pytest.param(Box(0, 0, 1, 1, score=True), "Box.score", id="bool-score"),
+    pytest.param(Box(0, 0, 1, 1, score=10**400), "Box.score", id="overflow-score"),
+    pytest.param(Box(0, 0, 1, 1, score=np.array([0.5])), "Box.score", id="array-score"),  # type: ignore[arg-type]
 ]
 
 
-def test_check_detections_rejects_persons_not_tuple() -> None:
-    d = Detections(persons=[Box(0, 0, 1, 1)])  # type: ignore[arg-type]
-    with pytest.raises(MalformedDetections, match="persons must be a tuple"):
-        check_detections(d, _ALL, _SHAPE)
+class _LyingTuple(tuple):  # type: ignore[type-arg]
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        return iter(())
+
+
+@pytest.mark.parametrize("name", ["persons", "faces"])
+@pytest.mark.parametrize(
+    "container",
+    [
+        pytest.param(list, id="list"),
+        pytest.param(_LyingTuple, id="lying-tuple-subclass"),
+    ],
+)
+def test_check_detections_rejects_container_not_exactly_tuple(name: str, container: type) -> None:
+    item = Box(0, 0, 1, 1) if name == "persons" else Face(Box(0, 0, 1, 1))
+    d = Detections(**{name: container([item])})
+    with pytest.raises(MalformedDetections, match=f"{name} must be a tuple"):
+        check_detections(d, _NO_LANDMARKS, _SHAPE)
 
 
 @pytest.mark.parametrize(("box", "match"), _BAD_BOXES)
@@ -354,12 +433,6 @@ def test_check_detections_rejects_bad_person_box(box: object, match: str) -> Non
     assert match in str(info.value)
 
 
-def test_check_detections_rejects_faces_not_tuple() -> None:
-    d = Detections(faces=[Face(Box(0, 0, 1, 1))])  # type: ignore[arg-type]
-    with pytest.raises(MalformedDetections, match="faces must be a tuple"):
-        check_detections(d, _ALL, _SHAPE)
-
-
 def test_check_detections_rejects_non_face() -> None:
     d = Detections(faces=(Box(0, 0, 1, 1),))  # type: ignore[arg-type]
     with pytest.raises(MalformedDetections, match=r"faces\[0\]: expected a Face"):
@@ -368,22 +441,193 @@ def test_check_detections_rejects_non_face() -> None:
 
 @pytest.mark.parametrize(("box", "match"), _BAD_BOXES)
 def test_check_detections_rejects_bad_face_box(box: object, match: str) -> None:
-    d = Detections(faces=(Face(box, landmarks=()),))  # type: ignore[arg-type]
+    d = Detections(faces=(Face(box),))  # type: ignore[arg-type]
     with pytest.raises(MalformedDetections, match=r"faces\[0\]\.box") as info:
+        check_detections(d, _NO_LANDMARKS, _SHAPE)
+    assert match in str(info.value)
+
+
+# Frame for the clipping cases: H=10, W=20.
+_CLIP_SHAPE = (10, 20, 3)
+
+
+@pytest.mark.parametrize(
+    ("box", "expected"),
+    [
+        pytest.param(Box(2, 3, 4, 5), Box(2, 3, 4, 5), id="inside"),
+        pytest.param(Box(0, 0, 20, 10), Box(0, 0, 20, 10), id="full-frame"),
+        pytest.param(Box(-5, 2, 8, 3), Box(0, 2, 3, 3), id="negative-x"),
+        pytest.param(Box(2, -4, 3, 6), Box(2, 0, 3, 2), id="negative-y"),
+        pytest.param(Box(15, 2, 10, 3), Box(15, 2, 5, 3), id="past-right"),
+        pytest.param(Box(2, 8, 3, 10), Box(2, 8, 3, 2), id="past-bottom"),
+        pytest.param(Box(-5, -5, 40, 40), Box(0, 0, 20, 10), id="covers-frame"),
+        pytest.param(Box(-30, 2, 5, 3), Box(0, 2, 0, 3), id="wholly-left"),
+        pytest.param(Box(25, 2, 5, 3), Box(20, 2, 0, 3), id="wholly-right"),
+        pytest.param(Box(2, -30, 3, 5), Box(2, 0, 3, 0), id="wholly-above"),
+        pytest.param(Box(2, 12, 3, 5), Box(2, 10, 3, 0), id="wholly-below"),
+        pytest.param(Box(-9, -9, 2, 2), Box(0, 0, 0, 0), id="wholly-top-left"),
+        pytest.param(Box(4, 4, 0, 0), Box(4, 4, 0, 0), id="zero-area-input"),
+        pytest.param(Box(20, 10, 0, 0), Box(20, 10, 0, 0), id="zero-area-at-corner"),
+        pytest.param(Box(10**30, 2, 10**30, 3), Box(20, 2, 0, 3), id="huge-python-int"),
+        pytest.param(
+            Box(np.int64(2**62), np.int64(2**62), np.int64(2**62), np.int64(2**62)),  # type: ignore[arg-type]
+            Box(20, 10, 0, 0),
+            id="huge-int64-overflows-on-add",
+        ),
+        pytest.param(
+            Box(np.int64(-(2**62)), 2, np.int64(2**62), 3),  # type: ignore[arg-type]
+            Box(0, 2, 0, 3),
+            id="huge-negative-int64",
+        ),
+        pytest.param(
+            Box(np.int32(-5), np.int32(2), np.int32(2**31 - 1), np.int32(3)),  # type: ignore[arg-type]
+            Box(0, 2, 20, 3),
+            id="int32-overflows-on-add",
+        ),
+        pytest.param(Box(np.uint64(2**63), 2, 1, 3), Box(20, 2, 0, 3), id="huge-uint64"),  # type: ignore[arg-type]
+        pytest.param(Box(-5, 2, 8, 3, score=0.7), Box(0, 2, 3, 3, score=0.7), id="keeps-score"),
+    ],
+)
+def test_check_detections_clips_boxes(box: Box, expected: Box) -> None:
+    out = check_detections(Detections(persons=(box,)), _ALL, _CLIP_SHAPE)
+    assert out.persons == (expected,)
+    assert out.persons is not None
+    clipped = out.persons[0]
+    assert all(type(getattr(clipped, n)) is int for n in ("x", "y", "w", "h"))
+    # The clipped box always selects a region of the frame that slicing honors.
+    image = np.zeros(_CLIP_SHAPE, dtype=np.uint8)
+    region = image[clipped.y:clipped.y + clipped.h, clipped.x:clipped.x + clipped.w]
+    assert region.shape[:2] == (clipped.h, clipped.w)
+    # Faces are clipped the same way.
+    faces = check_detections(Detections(faces=(Face(box),)), _NO_LANDMARKS, _CLIP_SHAPE).faces
+    assert faces == (Face(expected),)
+
+
+def test_check_detections_clipping_never_drops_boxes() -> None:
+    boxes = (Box(-100, -100, 1, 1), Box(500, 500, 1, 1))
+    out = check_detections(Detections(persons=boxes), _ALL, _CLIP_SHAPE)
+    assert out.persons is not None
+    assert len(out.persons) == 2
+    assert out.subject_present
+
+
+def test_check_detections_rebuilds_subclasses_as_base_types() -> None:
+    @dataclasses.dataclass(frozen=True)
+    class _SubBox(Box):
+        extra: int = 0
+
+    @dataclasses.dataclass(frozen=True)
+    class _SubFace(Face):
+        extra: int = 0
+
+    @dataclasses.dataclass(frozen=True, eq=False)
+    class _SubDetections(Detections):
+        extra: int = 0
+
+    d = _SubDetections(
+        persons=(_SubBox(1, 1, 2, 2, extra=1),),
+        faces=(_SubFace(_SubBox(0, 0, 1, 1), extra=1),),
+        extra=1,
+    )
+    out = check_detections(d, _NO_LANDMARKS, _CLIP_SHAPE)
+    assert type(out) is Detections
+    assert out.persons is not None
+    assert out.faces is not None
+    assert type(out.persons[0]) is Box
+    assert type(out.faces[0]) is Face
+    assert type(out.faces[0].box) is Box
+    assert out.persons == (Box(1, 1, 2, 2),)
+
+
+@pytest.mark.parametrize("first", [True, False])
+def test_check_detections_rejects_face_without_landmarks_when_provided(first: bool) -> None:
+    good = Face(Box(0, 0, 1, 1), landmarks=((0.0, 0.0),))
+    bare = Face(Box(0, 0, 1, 1))
+    faces = (bare, good) if first else (good, bare)
+    index = 0 if first else 1
+    with pytest.raises(MalformedDetections, match=rf"faces\[{index}\] has no landmarks"):
+        check_detections(Detections(faces=faces), _ALL, _SHAPE)
+
+
+def test_check_detections_rejects_landmarks_when_not_provided() -> None:
+    d = Detections(faces=(Face(Box(0, 0, 1, 1), landmarks=((0.0, 0.0),)),))
+    with pytest.raises(MalformedDetections, match="LANDMARKS is not provided"):
+        check_detections(d, frozenset({DetectionKind.FACES}), _SHAPE)
+
+
+@pytest.mark.parametrize(
+    ("landmarks", "match"),
+    [
+        pytest.param((), "must not be empty", id="empty-tuple"),
+        pytest.param([], "must not be empty", id="empty-list"),
+        pytest.param("ab", "tuple or list", id="string"),
+        pytest.param(((p, p) for p in (1.0,)), "tuple or list", id="generator"),
+        pytest.param(np.array([[1.0, 2.0]]), "tuple or list", id="2d-array"),
+        pytest.param({(1.0, 2.0)}, "tuple or list", id="set"),
+        pytest.param(((float("nan"), 1.0),), "finite real", id="nan"),
+        pytest.param(((1.0, float("inf")),), "finite real", id="inf"),
+        pytest.param(((10**400, 1.0),), "finite real", id="overflow"),
+        pytest.param(((1.0,),), "2 coordinates", id="arity-1"),
+        pytest.param(((1.0, 2.0, 3.0),), "2 coordinates", id="arity-3"),
+        pytest.param(("ab",), "2-sequence", id="string-point"),
+        pytest.param(((1.0, "2"),), "finite real", id="string-coordinate"),
+        pytest.param(((True, 1.0),), "finite real", id="bool-coordinate"),
+        pytest.param(((1.0, None),), "finite real", id="none-coordinate"),
+        pytest.param((np.array([[1.0, 2.0]]),), "1-d array", id="2d-array-point"),
+        pytest.param((np.array([1.0, 2.0, 3.0]),), "2 coordinates", id="array-point-arity"),
+        pytest.param((np.array([True, False]),), "finite real", id="bool-array-point"),
+        pytest.param((np.array([np.nan, 1.0]),), "finite real", id="nan-array-point"),
+        pytest.param(((1.0, 2.0), 3.0), "2-sequence", id="scalar-point"),
+    ],
+)
+def test_check_detections_rejects_bad_landmarks(landmarks: object, match: str) -> None:
+    d = Detections(faces=(Face(Box(0, 0, 1, 1), landmarks=landmarks),))  # type: ignore[arg-type]
+    with pytest.raises(MalformedDetections, match=r"faces\[0\]") as info:
         check_detections(d, _ALL, _SHAPE)
     assert match in str(info.value)
 
 
-def test_check_detections_rejects_face_without_landmarks_when_provided() -> None:
-    d = Detections(faces=(Face(Box(0, 0, 1, 1), landmarks=((0.0, 0.0),)), Face(Box(0, 0, 1, 1))))
-    with pytest.raises(MalformedDetections, match=r"faces\[1\] has no landmarks"):
-        check_detections(d, frozenset({DetectionKind.FACES, DetectionKind.LANDMARKS}), _SHAPE)
+def test_check_detections_normalizes_landmarks() -> None:
+    points = [[1, 2], (np.float32(3.5), np.int64(4)), np.array([-5.0, 99.0])]
+    d = Detections(faces=(Face(Box(0, 0, 1, 1), landmarks=points),))  # type: ignore[arg-type]
+    out = check_detections(d, _ALL, _SHAPE)
+    assert out.faces is not None
+    landmarks = out.faces[0].landmarks
+    # Points outside the frame are kept as given (not clipped).
+    assert landmarks == ((1.0, 2.0), (3.5, 4.0), (-5.0, 99.0))
+    assert type(landmarks) is tuple
+    assert all(type(p) is tuple and all(type(c) is float for c in p) for p in landmarks)
+    # Mutating the detector's list afterwards does not reach the checked result.
+    points[0][0] = 100
+    points.append([7, 7])
+    assert out.faces[0].landmarks == ((1.0, 2.0), (3.5, 4.0), (-5.0, 99.0))
+
+
+class _ArraySubclass(np.ndarray):
+    pass
+
+
+class _FakeArray:
+    shape = (2, 4)
+    dtype = np.dtype(bool)
+
+    def any(self) -> bool:
+        return True
 
 
 @pytest.mark.parametrize(
     ("mask", "match"),
     [
-        pytest.param([[True] * 4] * 2, "numpy array", id="list"),
+        pytest.param([[True] * 4] * 2, "numpy.ndarray", id="list"),
+        pytest.param(_FakeArray(), "numpy.ndarray", id="duck-typed-array"),
+        pytest.param(
+            np.ma.masked_array(np.ones((2, 4), dtype=bool), mask=np.ones((2, 4), dtype=bool)),
+            "numpy.ndarray",
+            id="masked-array",
+        ),
+        pytest.param(
+            np.ones((2, 4), dtype=bool).view(_ArraySubclass), "numpy.ndarray", id="subclass"
+        ),
         pytest.param(np.zeros((2, 4), dtype=np.uint8), "dtype must be bool", id="uint8"),
         pytest.param(np.zeros((2, 4), dtype=np.float32), "dtype must be bool", id="float"),
         pytest.param(np.zeros((1, 2), dtype=bool), "shape must be", id="downscaled"),
@@ -398,12 +642,74 @@ def test_check_detections_rejects_bad_mask(mask: object, match: str) -> None:
         check_detections(Detections(mask=mask), _ALL, _SHAPE)  # type: ignore[arg-type]
 
 
-def test_check_detections_mask_accepts_grayscale_frame_shape() -> None:
+def test_subject_present_sees_masked_array_pixels() -> None:
+    # Second line of defense: a masked array whose every pixel is masked out still
+    # counts its True data pixels.
+    data = np.zeros((2, 4), dtype=bool)
+    data[1, 2] = True
+    masked = np.ma.masked_array(data, mask=np.ones((2, 4), dtype=bool))
+    assert Detections(mask=masked).subject_present is True
+
+
+def test_check_detections_mask_accepts_grayscale_and_list_frame_shape() -> None:
     d = Detections(mask=np.ones((2, 4), dtype=bool))
-    assert check_detections(d, frozenset({DetectionKind.MASK}), (2, 4)) is d
+    _assert_same(check_detections(d, frozenset({DetectionKind.MASK}), (2, 4)), d)
+    _assert_same(check_detections(d, frozenset({DetectionKind.MASK}), [2, 4, 3]), d)  # type: ignore[arg-type]
+    with pytest.raises(MalformedDetections, match="shape must be"):
+        check_detections(d, frozenset({DetectionKind.MASK}), [4, 2, 3])  # type: ignore[arg-type]
 
 
-# The built-in detectors, run for real, must produce results that pass the check.
+def test_check_detections_list_frame_shape_clips_boxes() -> None:
+    d = Detections(persons=(Box(-1, -1, 100, 100),))
+    out = check_detections(d, _ALL, [10, 20, 3])  # type: ignore[arg-type]
+    assert out.persons == (Box(0, 0, 20, 10),)
+
+
+def test_check_detections_mask_is_a_read_only_copy() -> None:
+    # A detector that reuses one buffer must not be able to change a result that
+    # is waiting in the lookahead buffer.
+    buf = np.zeros((2, 4), dtype=bool)
+    buf[0, 1] = True
+    out = check_detections(Detections(mask=buf), _ALL, _SHAPE)
+    buf[:] = False
+    assert out.mask is not None
+    assert out.mask is not buf
+    assert not np.shares_memory(out.mask, buf)
+    assert out.mask[0, 1]
+    assert out.subject_present
+    assert not out.mask.flags.writeable
+    assert out.mask.flags.c_contiguous
+    with pytest.raises(ValueError):
+        out.mask[0, 0] = True
+
+
+def test_check_detections_mask_from_non_contiguous_view() -> None:
+    base = np.zeros((4, 8), dtype=bool)
+    base[0, 2] = True
+    view = base[::2, ::2]
+    assert not view.flags.c_contiguous
+    out = check_detections(Detections(mask=view), _ALL, _SHAPE)
+    assert out.mask is not None
+    assert out.mask.flags.c_contiguous
+    np.testing.assert_array_equal(out.mask, view)
+    fortran = np.asfortranarray(np.eye(2, 4, dtype=bool))
+    assert not fortran.flags.c_contiguous
+    out = check_detections(Detections(mask=fortran), _ALL, _SHAPE)
+    assert out.mask is not None
+    assert out.mask.flags.c_contiguous
+    np.testing.assert_array_equal(out.mask, fortran)
+
+
+def test_merged_mask_is_read_only() -> None:
+    a = Detections(mask=np.array([[True, False]]))
+    b = Detections(mask=np.array([[False, True]]))
+    out = a.merged(b)
+    assert out.mask is not None
+    assert not out.mask.flags.writeable
+
+
+# The built-in detectors, run for real, must produce results that pass the check
+# with the same truthiness.
 
 
 def _image_frame(image: np.ndarray, index: int = 0) -> Frame:
@@ -424,7 +730,9 @@ def test_motion_detector_output_passes_check() -> None:
     results = [detector.detect(_image_frame(_scene(lit=i == 29), i)) for i in range(30)]
     assert {r.motion for r in results} == {True, False}
     for r in results:
-        assert check_detections(r, detector.provides, (128, 128, 3)) is r
+        out = check_detections(r, detector.provides, (128, 128, 3))
+        _assert_same(out, r)
+        assert out.subject_present is r.subject_present
 
 
 def test_bgdiff_output_passes_check() -> None:
@@ -432,7 +740,9 @@ def test_bgdiff_output_passes_check() -> None:
     for lit, expected in ((False, False), (True, True)):
         r = differ.detect(_image_frame(_scene(lit)))
         assert r.background_diff is expected
-        assert check_detections(r, differ.provides, (128, 128, 3)) is r
+        out = check_detections(r, differ.provides, (128, 128, 3))
+        _assert_same(out, r)
+        assert out.subject_present is r.subject_present
 
 
 def test_bgdiff_not_ready_output_passes_check() -> None:
@@ -445,13 +755,14 @@ def test_bgdiff_not_ready_output_passes_check() -> None:
     differ = BackgroundDiffer.from_model(_NotReady(), BackgroundDiffConfig())  # type: ignore[arg-type]
     r = differ.detect(_image_frame(_scene(lit=False)))
     assert r.background_diff is None
-    assert check_detections(r, differ.provides, (128, 128, 3)) is r
+    _assert_same(check_detections(r, differ.provides, (128, 128, 3)), r)
 
 
 def test_person_detector_output_passes_check(monkeypatch: pytest.MonkeyPatch) -> None:
     # Feed detect() the array types cv2.HOGDescriptor.detectMultiScale returns
     # (int32 boxes of shape (N, 4), float64 weights of shape (N,)) so the real
-    # conversion to Box runs on them.
+    # conversion to Box runs on them. The first box extends past the frame edge,
+    # as HOG boxes do.
     detector = PersonDetector(min_box_area=0, min_confidence=0.0)
     small = np.zeros((64, 64, 3), dtype=np.uint8)
     boxes = np.array([[3, 5, 64, 128], [0, 0, 7, 9]], dtype=np.int32)
@@ -459,10 +770,11 @@ def test_person_detector_output_passes_check(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(detector, "_raw_detections", lambda frame: (small, boxes, weights))
     image = np.zeros((128, 128, 3), dtype=np.uint8)
     r = detector.detect(_image_frame(image))
-    assert r.persons is not None
-    assert len(r.persons) == 2
+    assert r.persons == (Box(6, 10, 128, 256, score=0.8), Box(0, 0, 14, 18, score=1.25))
     assert all(type(b.score) is float for b in r.persons)
-    assert check_detections(r, detector.provides, image.shape) is r
+    out = check_detections(r, detector.provides, image.shape)
+    assert out.persons == (Box(6, 10, 122, 118, score=0.8), Box(0, 0, 14, 18, score=1.25))
+    assert out.subject_present is r.subject_present is True
 
 
 def test_person_detector_empty_output_passes_check(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -472,7 +784,9 @@ def test_person_detector_empty_output_passes_check(monkeypatch: pytest.MonkeyPat
     image = np.zeros((128, 128, 3), dtype=np.uint8)
     r = detector.detect(_image_frame(image))
     assert r.persons == ()
-    assert check_detections(r, detector.provides, image.shape) is r
+    out = check_detections(r, detector.provides, image.shape)
+    assert out.persons == ()
+    assert out.subject_present is r.subject_present is False
 
 
 def test_detections_frozen() -> None:
