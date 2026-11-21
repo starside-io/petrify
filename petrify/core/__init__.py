@@ -29,7 +29,14 @@ from petrify.core.config import (
     RoiConfig,
 )
 from petrify.core.detections import Box, DetectionKind, Detections, Face
-from petrify.core.engine import Engine, EngineStats, FrameTrace, Output
+from petrify.core.engine import (
+    Engine,
+    EngineStats,
+    EngineTimings,
+    FrameTrace,
+    Output,
+    StageTiming,
+)
 from petrify.core.frame import Frame, FrameMeta, SourceInfo
 from petrify.core.plugin import (
     BackgroundModel,
@@ -54,6 +61,7 @@ __all__ = [
     "Engine",
     "EngineConfig",
     "EngineStats",
+    "EngineTimings",
     "Face",
     "Frame",
     "FrameMeta",
@@ -68,4 +76,5 @@ __all__ = [
     "Source",
     "SourceInfo",
     "Stage",
+    "StageTiming",
 ]

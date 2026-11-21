@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import replace
 from typing import ClassVar
 
 import numpy as np
@@ -1148,3 +1149,748 @@ def test_e6_config_property_is_read_only() -> None:
     assert engine.config is config
     with pytest.raises(AttributeError):
         engine.config = EngineConfig()  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Reconfigure at a frame boundary (P3-1)
+# ---------------------------------------------------------------------------
+
+
+class TagMode:
+    """Renders a constant ``tag`` (``tag + 1`` when frozen) so outputs show which mode ran."""
+
+    name = "tag"
+    requires: ClassVar[frozenset[DetectionKind]] = frozenset({DetectionKind.MOTION})
+
+    def __init__(self, tag: int) -> None:
+        self.tag = tag
+        self.calls: list[tuple[int, bool]] = []
+
+    def render(self, frame: Frame, detections: Detections, subject_present: bool) -> np.ndarray:
+        self.calls.append((frame.index, subject_present))
+        return np.full_like(frame.image, self.tag + (1 if subject_present else 0))
+
+
+class PersonsMode(TagMode):
+    name = "persons"
+    requires: ClassVar[frozenset[DetectionKind]] = frozenset({DetectionKind.PERSONS})
+
+
+def _stream(engine: Engine, indices: Iterable[int]) -> list[Output]:
+    return [o for i in indices for o in engine.step(_frame(i))]
+
+
+def _swap_engine(
+    *,
+    detectors: Sequence[Detector] | None = None,
+    mode: Mode | None = None,
+    stages: Sequence[Stage] = (),
+    lookahead: int = 0,
+    cold_start: int = 0,
+    sinks: Sequence[Sink] | None = None,
+) -> tuple[Engine, list[FakeSink], list[FrameTrace]]:
+    traces: list[FrameTrace] = []
+    sink_list = list(sinks) if sinks is not None else [FakeSink()]
+    engine = _engine(
+        detectors if detectors is not None else [FakeDetector()],
+        sink_list,
+        mode=mode or TagMode(10),
+        stages=stages,
+        lookahead=lookahead,
+        cold_start=cold_start,
+        observer=traces.append,
+    )
+    return engine, sink_list, traces  # type: ignore[return-value]
+
+
+SWAPS: dict[str, Callable[[], dict[str, object]]] = {
+    "detectors": lambda: {"detectors": [FakeDetector(stateful=True)]},
+    "mode": lambda: {"mode": TagMode(50)},
+    "stages": lambda: {"stages": [FakeStage()]},
+    "config": lambda: {"config": EngineConfig(lookahead=1, cold_start_frames=0)},
+    "budget": lambda: {"config": EngineConfig(lookahead=3, frame_budget_ms=1000.0)},
+    "combined": lambda: {
+        "detectors": [FakeDetector()],
+        "mode": TagMode(50),
+        "stages": [FakeStage(), FakeStage()],
+        "config": EngineConfig(lookahead=5, cold_start_frames=2),
+    },
+    "nothing": dict,
+}
+
+
+@pytest.mark.parametrize("swap", sorted(SWAPS))
+def test_reconfigure_keeps_stream_contiguous(swap: str) -> None:
+    k, n, m = 3, 6, 9
+    engine, (sink,), traces = _swap_engine(detectors=[FakeDetector(hits=[2, 8])], lookahead=k)
+    engine.open(INFO)
+    outputs = _stream(engine, range(n))
+    tail = engine.reconfigure(**SWAPS[swap]())  # type: ignore[arg-type]
+    expected_tail = [] if swap == "nothing" else list(range(n - k, n))
+    assert [o.meta.index for o in tail] == expected_tail
+    assert all(o.trace.final for o in tail)
+    outputs += tail
+    outputs += _stream(engine, range(n, n + m))
+    outputs += engine.flush()
+    stats = engine.close()
+
+    assert [i for i, _ in sink.written] == list(range(n + m))
+    assert [t.index for t in traces] == list(range(n + m))
+    assert [o.trace for o in outputs] == traces
+    assert [o.meta for o in outputs] == sink.metas
+    assert stats.frames == n + m
+    assert stats.reconfigurations == 1
+    assert stats.frozen + stats.passed_through + stats.failed_closed == stats.frames
+
+
+def test_reconfigure_with_no_arguments_keeps_every_component() -> None:
+    detector, mode, stage = FakeDetector(), TagMode(10), FakeStage()
+    engine, _, _ = _swap_engine(detectors=[detector], mode=mode, stages=[stage], lookahead=2)
+    config = engine.config
+    engine.open(INFO)
+    _stream(engine, range(3))
+    engine.reconfigure()
+    assert engine.detectors == (detector,)
+    assert engine.mode is mode
+    assert engine.stages == (stage,)
+    assert engine.config is config
+    assert detector.resets == 1  # Only the reset of open().
+    engine.close()
+
+
+@pytest.mark.parametrize("which", ["detectors", "mode", "stages", "config"])
+def test_reconfigure_single_argument_changes_only_that(which: str) -> None:
+    detector, mode, stage = FakeDetector(), TagMode(10), FakeStage()
+    engine, _, _ = _swap_engine(detectors=[detector], mode=mode, stages=[stage], lookahead=1)
+    config = engine.config
+    engine.open(INFO)
+    _stream(engine, range(2))
+    new_detector, new_mode, new_stage = FakeDetector(), TagMode(50), FakeStage()
+    new_config = EngineConfig(lookahead=4, cold_start_frames=0)
+    args: dict[str, object] = {
+        "detectors": [new_detector],
+        "mode": new_mode,
+        "stages": [new_stage],
+        "config": new_config,
+    }
+    engine.reconfigure(**{which: args[which]})  # type: ignore[arg-type]
+    assert engine.detectors == ((new_detector,) if which == "detectors" else (detector,))
+    assert engine.mode is (new_mode if which == "mode" else mode)
+    assert engine.stages == ((new_stage,) if which == "stages" else (stage,))
+    assert engine.config is (new_config if which == "config" else config)
+    engine.close()
+
+
+def test_old_components_render_tail_and_new_ones_the_rest() -> None:
+    k, n, m = 2, 5, 4
+    old_mode, new_mode = TagMode(10), TagMode(50)
+    old_stage, new_stage = FakeStage(), FakeStage()
+    engine, (sink,), _ = _swap_engine(mode=old_mode, stages=[old_stage], lookahead=k)
+    engine.open(INFO)
+    _stream(engine, range(n))
+    tail = engine.reconfigure(mode=new_mode, stages=[new_stage])
+    _stream(engine, range(n, n + m))
+    engine.close()
+
+    assert [i for i, _ in old_mode.calls] == list(range(n))
+    assert [i for i, _ in new_mode.calls] == list(range(n, n + m))
+    assert old_stage.applied == list(range(n))
+    assert new_stage.applied == list(range(n, n + m))
+    images = dict(sink.written)
+    # TagMode(tag) renders tag, or tag + 1 when frozen; each stage adds 1. The tail
+    # (frames n - k to n - 1) and the first k frames after the switch are frozen.
+    for i in range(n):
+        assert np.all(images[i] == 10 + (1 if i >= n - k else 0) + 1)
+    for i in range(n, n + m):
+        assert np.all(images[i] == 50 + (1 if i < n + k else 0) + 1)
+    for out in tail:
+        assert np.all(out.image == 12)
+
+
+def _finals(traces: Sequence[FrameTrace]) -> list[int]:
+    return [t.index for t in traces if t.final]
+
+
+def test_detector_swap_restarts_cold_start_and_freezes_tail() -> None:
+    engine, _, traces = _swap_engine(lookahead=1, cold_start=2)
+    engine.open(INFO)
+    _stream(engine, range(6))  # Frames 0 and 1 are the initial cold start.
+    tail = engine.reconfigure(detectors=[FakeDetector()])
+    _stream(engine, range(6, 12))
+    engine.close()
+    assert [o.trace.index for o in tail] == [5]
+    assert tail[0].trace.final and not tail[0].trace.filled
+    assert _finals(traces) == [0, 1, 5, 6, 7]
+    assert not any(t.raw for t in traces)
+
+
+@pytest.mark.parametrize(
+    "swap",
+    [{"mode": TagMode(50)}, {"stages": [FakeStage()]}],
+    ids=["mode", "stages"],
+)
+def test_mode_or_stage_swap_freezes_only_one_lookahead_window(swap: dict[str, object]) -> None:
+    engine, _, traces = _swap_engine(lookahead=1, cold_start=2)
+    engine.open(INFO)
+    _stream(engine, range(6))
+    tail = engine.reconfigure(**swap)  # type: ignore[arg-type]
+    _stream(engine, range(6, 12))
+    engine.close()
+    assert [o.trace.index for o in tail] == [5]
+    assert tail[0].trace.final and not tail[0].trace.filled
+    assert _finals(traces) == [0, 1, 5, 6]  # No cold-start restart: one window of 1.
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        EngineConfig(lookahead=3, cold_start_frames=2),
+        EngineConfig(lookahead=1, cold_start_frames=3),
+    ],
+    ids=["lookahead", "cold_start_frames"],
+)
+def test_lookahead_or_cold_start_change_restarts_cold_start(config: EngineConfig) -> None:
+    engine, _, traces = _swap_engine(lookahead=1, cold_start=2)
+    engine.open(INFO)
+    _stream(engine, range(6))
+    tail = engine.reconfigure(config=config)
+    _stream(engine, range(6, 14))
+    engine.close()
+    assert tail[0].trace.final and not tail[0].trace.filled
+    length = max(config.cold_start_frames, 1, config.lookahead)
+    window = list(range(6, 6 + length))
+    assert _finals(traces) == [0, 1, 5, *window]
+
+
+def test_cold_start_in_progress_carries_over_a_mode_swap() -> None:
+    engine, _, traces = _swap_engine(lookahead=0, cold_start=5)
+    engine.open(INFO)
+    _stream(engine, range(2))
+    engine.reconfigure(mode=TagMode(50))
+    _stream(engine, range(2, 8))
+    engine.close()
+    assert _finals(traces) == [0, 1, 2, 3, 4]
+
+
+def test_detector_swap_inside_cold_start_keeps_the_longer_window() -> None:
+    engine, _, traces = _swap_engine(lookahead=0, cold_start=5)
+    engine.open(INFO)
+    _stream(engine, range(1))
+    engine.reconfigure(
+        detectors=[FakeDetector()], config=EngineConfig(lookahead=0, cold_start_frames=2)
+    )
+    _stream(engine, range(1, 8))
+    engine.close()
+    assert _finals(traces) == [0, 1, 2, 3, 4]
+
+
+def test_tail_detection_and_fill_survive_a_mode_swap() -> None:
+    engine, _, traces = _swap_engine(detectors=[FakeDetector(hits=[4])], lookahead=2)
+    engine.open(INFO)
+    _stream(engine, range(5))
+    tail = engine.reconfigure(mode=TagMode(50))
+    _stream(engine, range(5, 9))
+    engine.close()
+    assert [o.trace.index for o in tail] == [3, 4]
+    assert [o.trace.final for o in tail] == [True, True]
+    assert [o.trace.filled for o in tail] == [True, True]  # Filled from the hit at 4.
+    assert _finals(traces) == [2, 3, 4, 5, 6]  # The window after the swap covers 5 and 6.
+
+
+def test_new_stateful_detector_is_reset_and_sees_every_later_frame() -> None:
+    old, new = FakeDetector(stateful=True), FakeDetector(stateful=True)
+    engine, _, _ = _swap_engine(detectors=[old], lookahead=2)
+    engine.open(INFO)
+    _stream(engine, range(4))
+    assert new.resets == 0
+    engine.reconfigure(detectors=[new])
+    assert new.resets == 1
+    assert old.resets == 1  # Only the reset of open().
+    _stream(engine, range(4, 9))
+    engine.close()
+    assert old.seen == [0, 1, 2, 3]
+    assert new.seen == [4, 5, 6, 7, 8]
+    assert engine.detectors == (new,)
+
+
+def test_mode_swap_that_activates_a_detector_resets_it_and_cold_starts() -> None:
+    motion = FakeDetector()
+    persons = FakeDetector(kind=DetectionKind.PERSONS, stateful=True)
+    engine, _, traces = _swap_engine(detectors=[motion, persons], lookahead=1, cold_start=0)
+    engine.open(INFO)
+    assert engine.detectors == (motion,)
+    _stream(engine, range(4))
+    assert persons.seen == [] and persons.resets == 0
+    tail = engine.reconfigure(mode=PersonsMode(50))
+    assert engine.detectors == (persons,)
+    assert persons.resets == 1
+    assert [o.trace.index for o in tail] == [3]
+    assert tail[0].trace.final  # A detector came in: the tail is forced frozen.
+    _stream(engine, range(4, 9))
+    engine.close()
+    assert persons.seen == [4, 5, 6, 7, 8]
+    assert _finals(traces) == [3, 4]  # cold_start_frames is 0: one lookahead window.
+
+
+def test_mode_swap_that_activates_a_detector_applies_cold_start() -> None:
+    motion = FakeDetector()
+    persons = FakeDetector(kind=DetectionKind.PERSONS, stateful=True)
+    engine, _, traces = _swap_engine(detectors=[motion, persons], lookahead=0, cold_start=2)
+    engine.open(INFO)
+    _stream(engine, range(4))
+    engine.reconfigure(mode=PersonsMode(50))
+    _stream(engine, range(4, 9))
+    engine.close()
+    assert _finals(traces) == [0, 1, 4, 5]
+
+
+@pytest.mark.parametrize(
+    "swap",
+    [
+        lambda: {"mode": PersonsMode(50)},
+        lambda: {"detectors": [FakeDetector(kind=DetectionKind.PERSONS)]},
+        lambda: {"detectors": []},
+    ],
+    ids=["mode", "detectors", "empty"],
+)
+def test_invalid_reconfigure_changes_nothing(swap: Callable[[], dict[str, object]]) -> None:
+    detector, mode, stage = FakeDetector(hits=[3]), TagMode(10), FakeStage()
+    engine, (sink,), traces = _swap_engine(
+        detectors=[detector], mode=mode, stages=[stage], lookahead=2, cold_start=1
+    )
+    config = engine.config
+    engine.open(INFO)
+    _stream(engine, range(4))
+    written = len(sink.written)
+    with pytest.raises(ValueError, match="requires"):
+        engine.reconfigure(stages=[], config=EngineConfig(lookahead=0), **swap())  # type: ignore[arg-type]
+    assert engine.is_open
+    assert len(sink.written) == written  # Nothing was flushed.
+    assert engine.detectors == (detector,)
+    assert engine.mode is mode and engine.stages == (stage,) and engine.config is config
+    _stream(engine, range(4, 8))
+    stats = engine.close()
+    assert [i for i, _ in sink.written] == list(range(8))
+    assert [i for i, _ in mode.calls] == list(range(8))
+    assert stage.applied == list(range(8))
+    assert _finals(traces) == [0, 1, 2, 3, 4, 5]
+    assert stats.reconfigurations == 0
+    assert detector.seen == list(range(8))
+
+
+def test_reconfigure_when_not_open_or_flushed_raises() -> None:
+    engine, _, _ = _swap_engine(lookahead=1)
+    with pytest.raises(RuntimeError, match="not open"):
+        engine.reconfigure(mode=TagMode(50))
+    engine.open(INFO)
+    engine.step(_frame(0))
+    engine.flush()
+    with pytest.raises(RuntimeError, match="flushed"):
+        engine.reconfigure(mode=TagMode(50))
+    engine.close()
+    with pytest.raises(RuntimeError, match="not open"):
+        engine.reconfigure(mode=TagMode(50))
+
+
+def test_reconfigure_from_sink_is_rejected() -> None:
+    holder: list[Engine] = []
+
+    class Reentrant(FakeSink):
+        def __init__(self) -> None:
+            super().__init__(critical=False)
+            self.errors: list[str] = []
+
+        def write(self, image: np.ndarray, meta: FrameMeta) -> None:
+            super().write(image, meta)
+            try:
+                holder[0].reconfigure(mode=TagMode(50))
+            except RuntimeError as exc:
+                self.errors.append(str(exc))
+
+    reentrant, recording = Reentrant(), FakeSink()
+    mode = TagMode(10)
+    engine, _, _ = _swap_engine(mode=mode, sinks=[reentrant, recording], lookahead=1)
+    holder.append(engine)
+    engine.open(INFO)
+    _stream(engine, range(3))
+    engine.reconfigure(stages=[FakeStage()])  # Releases frame 2 through the sinks.
+    stats = engine.close()
+    assert len(reentrant.errors) == 3
+    assert all("re-entrant" in e for e in reentrant.errors)
+    assert engine.mode is mode
+    assert [i for i, _ in recording.written] == [0, 1, 2]
+    assert recording.events == ["open", "close"]
+    assert stats.reconfigurations == 1
+
+
+def test_reconfigure_from_observer_is_rejected() -> None:
+    holder: list[Engine] = []
+    errors: list[str] = []
+
+    def observer(trace: FrameTrace) -> None:
+        try:
+            holder[0].reconfigure(mode=TagMode(50))
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    sink = FakeSink()
+    mode = TagMode(10)
+    engine = _engine([FakeDetector()], [sink], mode=mode, lookahead=0, observer=observer)
+    holder.append(engine)
+    engine.open(INFO)
+    _stream(engine, range(3))
+    engine.close()
+    assert len(errors) == 3 and all("re-entrant" in e for e in errors)
+    assert engine.mode is mode
+    assert [i for i, _ in sink.written] == [0, 1, 2]
+
+
+def test_critical_sink_failure_during_tail_aborts_and_installs_nothing() -> None:
+    preview, recording = FakeSink(critical=False), FakeSink(fail_write_at=4)
+    mode, new_mode = TagMode(10), TagMode(50)
+    new_detector = FakeDetector(stateful=True)
+    engine, _, _ = _swap_engine(mode=mode, sinks=[preview, recording], lookahead=3)
+    engine.open(INFO)
+    _stream(engine, range(6))
+    with pytest.raises(OSError, match="sink broke"):
+        engine.reconfigure(detectors=[new_detector], mode=new_mode)
+    assert not engine.is_open
+    assert engine.mode is mode
+    assert new_detector.resets == 0
+    assert new_mode.calls == []
+    assert [i for i, _ in recording.written] == [0, 1, 2, 3]
+    for sink in (preview, recording):
+        assert sink.events == ["open", "abort"]
+    with pytest.raises(RuntimeError, match="not open"):
+        engine.step(_frame(6))
+
+
+def test_stats_count_reconfigurations_and_keep_the_partition() -> None:
+    engine, _, _ = _swap_engine(detectors=[FakeDetector(hits=[1, 9], fail=[5])], lookahead=2)
+    engine.open(INFO)
+    _stream(engine, range(4))
+    engine.reconfigure(mode=TagMode(50))
+    _stream(engine, range(4, 8))
+    engine.reconfigure(detectors=[FakeDetector(hits=[9], fail=[10])])
+    _stream(engine, range(8, 12))
+    stats = engine.close()
+    assert stats.reconfigurations == 2
+    assert stats.frames == 12
+    assert stats.failed_closed == 2  # Frame 5 (first detector) and frame 10 (second).
+    assert stats.frozen + stats.passed_through + stats.failed_closed == stats.frames
+
+
+def test_detector_failing_after_swap_fails_closed() -> None:
+    frames = [_frame(i) for i in range(10)]
+    sink = FakeSink()
+    engine, _, traces = _swap_engine(sinks=[sink], mode=FakeMode(), lookahead=1)
+    engine.open(INFO)
+    for frame in frames[:4]:
+        engine.step(frame)
+    engine.reconfigure(detectors=[FakeDetector(fail=range(4, 10))])
+    for frame in frames[4:]:
+        engine.step(frame)
+    stats = engine.close()
+    assert len(sink.received) == len(frames)
+    for frame, image, meta in zip(frames, sink.received, sink.metas):
+        assert meta == frame.meta
+        if frame.index >= 4:
+            assert _is_black(image, frame.image)
+            assert not np.shares_memory(image, frame.image)
+            assert not np.any(image == 100 + frame.index)
+    assert [t.index for t in traces if t.failed_closed] == list(range(4, 10))
+    assert stats.failed_closed == 6
+
+
+# ---------------------------------------------------------------------------
+# Every reconfigure freezes the frames around the switch (P3-1 follow-up)
+# ---------------------------------------------------------------------------
+
+# (name, old lookahead, swap arguments, new lookahead)
+FREEZE_SWAPS: list[tuple[str, int, Callable[[], dict[str, object]], int]] = [
+    ("mode", 3, lambda: {"mode": TagMode(50)}, 3),
+    ("stages", 3, lambda: {"stages": [FakeStage()]}, 3),
+    ("lookahead_grows", 2, lambda: {"config": EngineConfig(lookahead=5, cold_start_frames=0)}, 5),
+    (
+        "lookahead_shrinks",
+        5,
+        lambda: {"config": EngineConfig(lookahead=2, cold_start_frames=0)},
+        2,
+    ),
+]
+FREEZE_IDS = [case[0] for case in FREEZE_SWAPS]
+
+
+@pytest.mark.parametrize(("name", "old_k", "swap", "new_k"), FREEZE_SWAPS, ids=FREEZE_IDS)
+def test_tail_frozen_when_subject_appears_just_after_swap(
+    name: str, old_k: int, swap: Callable[[], dict[str, object]], new_k: int
+) -> None:
+    n = 10
+    detector = FakeDetector(hits=[n])  # First frame after the switch.
+    engine, _, traces = _swap_engine(detectors=[detector], lookahead=old_k)
+    engine.open(INFO)
+    _stream(engine, range(n))
+    tail = engine.reconfigure(**swap())  # type: ignore[arg-type]
+    _stream(engine, range(n, n + 12))
+    engine.close()
+    assert [o.trace.index for o in tail] == list(range(n - old_k, n))
+    assert all(o.trace.final for o in tail)
+    assert not any(o.trace.raw or o.trace.filled for o in tail)  # Only final is forced.
+    # After the switch: the forced window, or the new gap fill around the hit at n.
+    end = n + max(max(old_k, new_k), new_k + 1)
+    assert _finals(traces) == list(range(n - old_k, end))
+
+
+@pytest.mark.parametrize(("name", "old_k", "swap", "new_k"), FREEZE_SWAPS, ids=FREEZE_IDS)
+def test_frames_after_swap_frozen_when_subject_was_just_before(
+    name: str, old_k: int, swap: Callable[[], dict[str, object]], new_k: int
+) -> None:
+    n = 10
+    detector = FakeDetector(hits=[n - 1])  # Last frame before the switch; none after.
+    engine, _, traces = _swap_engine(detectors=[detector], lookahead=old_k)
+    engine.open(INFO)
+    _stream(engine, range(n))
+    engine.reconfigure(**swap())  # type: ignore[arg-type]
+    _stream(engine, range(n, n + 15))
+    engine.close()
+    window = max(old_k, new_k)
+    assert _finals(traces) == list(range(n - 1 - old_k, n + window))
+    assert [t.index for t in traces] == list(range(n + 15))
+
+
+@pytest.mark.parametrize(
+    "make_config",
+    [lambda c: replace(c, frame_budget_ms=500.0), lambda c: None],
+    ids=["budget_only", "all_none"],
+)
+def test_no_op_reconfigure_neither_flushes_nor_freezes(
+    make_config: Callable[[EngineConfig], EngineConfig | None],
+) -> None:
+    engine, (sink,), traces = _swap_engine(detectors=[FakeDetector(hits=[2])], lookahead=2)
+    engine.open(INFO)
+    _stream(engine, range(6))
+    written = len(sink.written)
+    config = make_config(engine.config)
+    assert engine.reconfigure(config=config) == []
+    assert len(sink.written) == written  # Nothing flushed.
+    if config is not None:
+        assert engine.config is config
+    _stream(engine, range(6, 12))
+    stats = engine.close()
+    assert [t.index for t in traces] == list(range(12))
+    assert [i for i, _ in sink.written] == list(range(12))
+    assert _finals(traces) == [0, 1, 2, 3, 4]  # Only the gap fill around the hit at 2.
+    assert stats.reconfigurations == 1
+
+
+def test_budget_only_reconfigure_applies_the_new_budget() -> None:
+    clock = FakeClock()
+    traces: list[FrameTrace] = []
+    engine = Engine(
+        [SlowDetector(clock, {5: 0.030})],
+        FakeMode(),
+        [],
+        [FakeSink()],
+        EngineConfig(lookahead=0, cold_start_frames=0),
+        traces.append,
+        clock,
+    )
+    engine.open(INFO)
+    _stream(engine, range(3))
+    engine.reconfigure(config=replace(engine.config, frame_budget_ms=20.0))
+    _stream(engine, range(3, 8))
+    stats = engine.close()
+    assert [t.index for t in traces if t.failed_closed] == [5]
+    assert stats.over_budget == 1
+
+
+@pytest.mark.parametrize("subject_at", [7, 8, 9, 10, 11, 12], ids=lambda i: f"subject{i}")
+@pytest.mark.parametrize("swap", ["mode", "stages", "lookahead"])
+def test_no_subject_pixels_reach_sinks_around_a_swap(subject_at: int, swap: str) -> None:
+    """A pass-through mode; the detector sees the subject on one frame near the switch.
+
+    Every frame within one lookahead of the subject must be frozen, on either side
+    of the switch at 10, so the sink never receives those input pixels. The
+    lookahead is 3 before the switch, and 1 after it in the ``lookahead`` case.
+    """
+    k, n = 3, 10
+    radius = 1 if swap == "lookahead" and subject_at >= n else k
+    frames = [_frame(i) for i in range(n + 10)]
+    sink = FakeSink()
+    engine, _, _ = _swap_engine(
+        detectors=[FakeDetector(hits=[subject_at])], mode=FakeMode(), sinks=[sink], lookahead=k
+    )
+    engine.open(INFO)
+    for frame in frames[:n]:
+        engine.step(frame)
+    args: dict[str, object] = {
+        "mode": {"mode": FakeMode()},
+        "stages": {"stages": []},
+        "lookahead": {"config": EngineConfig(lookahead=1, cold_start_frames=0)},
+    }[swap]  # type: ignore[assignment]
+    engine.reconfigure(**args)  # type: ignore[arg-type]
+    for frame in frames[n:]:
+        engine.step(frame)
+    engine.close()
+    assert [m.index for m in sink.metas] == list(range(n + 10))
+    for frame, image in zip(frames, sink.received):
+        if abs(frame.index - subject_at) <= radius:
+            assert not np.shares_memory(image, frame.image), frame.index
+            assert not np.any(image == 100 + frame.index), frame.index
+            assert np.all(image == BACKGROUND_VALUE), frame.index
+
+
+# ---------------------------------------------------------------------------
+# Timings (P3-1)
+# ---------------------------------------------------------------------------
+
+
+class SlowSink(FakeSink):
+    """Advances ``clock`` by ``cost`` seconds per write."""
+
+    def __init__(self, clock: FakeClock, cost: float) -> None:
+        super().__init__()
+        self.clock = clock
+        self.cost = cost
+
+    def write(self, image: np.ndarray, meta: FrameMeta) -> None:
+        self.clock.now += self.cost
+        super().write(image, meta)
+
+
+def test_timings_follow_the_clock() -> None:
+    clock = FakeClock()
+    detect_costs = {0: 0.010, 1: 0.020, 2: 0.010}
+    render_costs = {0: 0.005, 1: 0.005, 2: 0.015}
+    engine = Engine(
+        [SlowDetector(clock, detect_costs)],
+        SlowMode(clock, render_costs),
+        [],
+        [SlowSink(clock, 0.002)],
+        EngineConfig(lookahead=0, cold_start_frames=0),
+        clock=clock,
+    )
+    empty = engine.timings
+    assert empty.detect.mean_ms is None and empty.detect.last_ms is None
+    assert empty.render.mean_ms is None and empty.write.last_ms is None
+    assert empty.frames_per_second is None
+
+    engine.open(INFO)
+    engine.step(_frame(0))
+    first = engine.timings
+    assert first.detect.last_ms == pytest.approx(10.0)
+    assert first.detect.mean_ms == pytest.approx(10.0)
+    assert first.render.last_ms == pytest.approx(5.0)
+    assert first.write.last_ms == pytest.approx(2.0)
+    assert first.frames_per_second is None  # One frame emitted.
+
+    engine.step(_frame(1))
+    second = engine.timings
+    assert second.detect.last_ms == pytest.approx(20.0)
+    assert second.detect.mean_ms == pytest.approx(10.0 + 0.1 * (20.0 - 10.0))
+    assert second.render.mean_ms == pytest.approx(5.0)
+    # Interval between the two writes: detect 20 + render 5 + write 2 = 27 ms.
+    assert second.frames_per_second == pytest.approx(1000.0 / 27.0)
+
+    engine.step(_frame(2))
+    third = engine.timings
+    assert third.render.last_ms == pytest.approx(15.0)
+    assert third.render.mean_ms == pytest.approx(5.0 + 0.1 * (15.0 - 5.0))
+    assert third.detect.mean_ms == pytest.approx(11.0 + 0.1 * (10.0 - 11.0))
+    # Second interval: detect 10 + render 15 + write 2 = 27 ms, so the mean stays 27.
+    assert third.frames_per_second == pytest.approx(1000.0 / 27.0)
+    assert third.write.mean_ms == pytest.approx(2.0)
+    engine.close()
+
+    # Snapshots are immutable and do not follow later frames.
+    assert second.detect.last_ms == pytest.approx(20.0)
+    with pytest.raises(AttributeError):
+        second.frames_per_second = 1.0  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        second.detect.mean_ms = 1.0  # type: ignore[misc]
+
+
+def test_timings_fps_is_inverse_of_mean_interval() -> None:
+    clock = FakeClock()
+    engine = Engine(
+        [FakeDetector()],
+        FakeMode(),
+        [],
+        [FakeSink()],
+        EngineConfig(lookahead=0, cold_start_frames=0),
+        clock=clock,
+    )
+    engine.open(INFO)
+    for i, gap in enumerate([0.0, 0.010, 0.030]):
+        clock.now += gap
+        engine.step(_frame(i))
+    mean = 0.010 + 0.1 * (0.030 - 0.010)
+    assert engine.timings.frames_per_second == pytest.approx(1.0 / mean)
+    engine.close()
+
+
+def test_timings_skip_render_for_unrendered_frames_and_reset_on_open() -> None:
+    clock = FakeClock()
+    mode = SlowMode(clock, {0: 0.004, 1: 0.004})
+    engine = Engine(
+        [FakeDetector(fail=[1])],
+        mode,
+        [],
+        [FakeSink()],
+        EngineConfig(lookahead=0, cold_start_frames=0),
+        clock=clock,
+    )
+    engine.open(INFO)
+    engine.step(_frame(0))
+    clock.now += 0.050
+    engine.step(_frame(1))  # Detection fails: not rendered.
+    timings = engine.timings
+    assert timings.render.last_ms == pytest.approx(4.0)
+    assert timings.render.mean_ms == pytest.approx(4.0)
+    assert timings.detect.last_ms == pytest.approx(0.0)
+    assert timings.frames_per_second == pytest.approx(1000.0 / 50.0)
+    engine.close()
+    engine.open(INFO)
+    assert engine.timings.render.mean_ms is None
+    assert engine.timings.frames_per_second is None
+    engine.close()
+
+
+def test_timings_with_a_still_clock_report_no_rate() -> None:
+    clock = FakeClock()
+    engine = Engine(
+        [FakeDetector()], FakeMode(), [], [FakeSink()], EngineConfig(lookahead=0), clock=clock
+    )
+    engine.open(INFO)
+    _stream(engine, range(3))
+    timings = engine.timings
+    assert timings.detect.mean_ms == 0.0
+    assert timings.frames_per_second is None  # Zero mean interval: undefined.
+    engine.close()
+
+
+def test_timings_do_not_change_budget_decisions() -> None:
+    def run(read_timings: bool) -> tuple[EngineStats, list[FrameTrace]]:
+        clock = FakeClock()
+        traces: list[FrameTrace] = []
+        engine = Engine(
+            [SlowDetector(clock, {2: 0.030, 5: 0.012})],
+            SlowMode(clock, {5: 0.012, 7: 0.025}),
+            [],
+            [SlowSink(clock, 0.050)],  # Write time is not part of the budget.
+            EngineConfig(lookahead=1, cold_start_frames=0, frame_budget_ms=20.0),
+            traces.append,
+            clock,
+        )
+        engine.open(INFO)
+        for i in range(9):
+            engine.step(_frame(i))
+            if read_timings:
+                assert engine.timings.write.last_ms is not None or i == 0
+        return engine.close(), traces
+
+    with_reads, plain = run(True), run(False)
+    assert with_reads == plain
+    stats, traces = plain
+    assert [t.index for t in traces if t.failed_closed] == [2, 5, 7]
+    assert stats.over_budget == 3

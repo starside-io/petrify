@@ -23,7 +23,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Generic, TypeVar
 
 import numpy as np
@@ -44,13 +44,13 @@ class Decision(Generic[T]):
 
     item: T
     index: int
-    """0-based position in the stream."""
+    """Position in the stream; the first item pushed gets ``start_index`` (0 by default)."""
     raw: bool
     """The value pushed for this item."""
     filled: bool
     """``raw`` after gap fill: any raw True within +/- ``lookahead`` positions."""
     final: bool
-    """``filled``, or ``index < cold_start_frames``."""
+    """``filled``, or ``index < start_index + cold_start_frames``."""
 
 
 class LookaheadBuffer(Generic[T]):
@@ -60,19 +60,29 @@ class LookaheadBuffer(Generic[T]):
     at end of stream). The result matches ``_fill_gaps`` followed by
     ``_freeze_cold_start`` from the file pipeline, index for index.
 
+    ``start_index`` numbers the first item, so a buffer created mid-stream (for
+    example by :meth:`Engine.reconfigure`) continues the stream's numbering. The
+    cold-start window covers the first ``cold_start_frames`` items pushed, that is
+    indices ``start_index`` to ``start_index + cold_start_frames - 1``, and gap fill
+    never looks before the first item pushed.
+
     After :meth:`flush` the buffer is reset and may be reused for a new stream,
-    whose first item gets index 0.
+    whose first item gets index ``start_index`` again.
     """
 
-    def __init__(self, lookahead: int, cold_start_frames: int = 0) -> None:
+    def __init__(self, lookahead: int, cold_start_frames: int = 0, start_index: int = 0) -> None:
         if lookahead < 0:
             raise ValueError(f"lookahead must be >= 0, got {lookahead}")
         if cold_start_frames < 0:
             raise ValueError(f"cold_start_frames must be >= 0, got {cold_start_frames}")
+        if start_index < 0:
+            raise ValueError(f"start_index must be >= 0, got {start_index}")
         self._lookahead = lookahead
         self._cold_start = cold_start_frames
+        self._start = start_index
+        self._cold_end = start_index + cold_start_frames
         self._pending: deque[tuple[T, bool]] = deque()
-        self._next_index = 0
+        self._next_index = start_index
         self._last_true: int | None = None
 
     @property
@@ -84,6 +94,21 @@ class LookaheadBuffer(Generic[T]):
     def cold_start_frames(self) -> int:
         """Number of leading items forced to ``final=True``."""
         return self._cold_start
+
+    @property
+    def start_index(self) -> int:
+        """Index of the first item pushed (after construction or :meth:`flush`)."""
+        return self._start
+
+    @property
+    def next_index(self) -> int:
+        """Index the next pushed item will get."""
+        return self._next_index
+
+    @property
+    def cold_start_end(self) -> int:
+        """First index after the cold-start window (``start_index + cold_start_frames``)."""
+        return self._cold_end
 
     @property
     def pending(self) -> int:
@@ -104,7 +129,7 @@ class LookaheadBuffer(Generic[T]):
     def flush(self) -> list[Decision[T]]:
         """Emit every pending item (end of stream) and reset for a new stream."""
         out = [self._emit() for _ in range(len(self._pending))]
-        self._next_index = 0
+        self._next_index = self._start
         self._last_true = None
         return out
 
@@ -118,7 +143,7 @@ class LookaheadBuffer(Generic[T]):
         item, raw = self._pending.popleft()
         index = self._next_index - 1 - len(self._pending)
         filled = self._last_true is not None and self._last_true >= index - self._lookahead
-        final = filled or index < self._cold_start
+        final = filled or index < self._cold_end
         return Decision(item=item, index=index, raw=raw, filled=filled, final=final)
 
 
@@ -161,7 +186,8 @@ class EngineStats:
     ``frozen`` and ``passed_through`` count frames that rendered normally, so
     ``frozen + passed_through + failed_closed == frames``. ``over_budget`` frames
     are a subset of ``failed_closed``. ``sink_failures`` counts non-critical sinks
-    that failed and were dropped.
+    that failed and were dropped. ``reconfigurations`` counts successful
+    :meth:`Engine.reconfigure` calls.
     """
 
     frames: int = 0
@@ -170,6 +196,60 @@ class EngineStats:
     failed_closed: int = 0
     over_budget: int = 0
     sink_failures: int = 0
+    reconfigurations: int = 0
+
+
+_TIMING_ALPHA = 0.1  # Weight of the newest sample in the moving averages.
+
+
+@dataclass(frozen=True)
+class StageTiming:
+    """Rolling duration of one per-frame stage, in milliseconds (None before any sample)."""
+
+    mean_ms: float | None
+    """Exponentially weighted moving average (alpha 0.1)."""
+    last_ms: float | None
+    """The most recent sample."""
+
+
+@dataclass(frozen=True)
+class EngineTimings:
+    """Snapshot of the engine's rolling per-frame timings, from :attr:`Engine.timings`.
+
+    ``detect`` is the detector time of each emitted frame, ``render`` the mode plus
+    stages (only frames that were rendered: a frame whose detection failed or went
+    over budget is not rendered), ``write`` the time spent writing to every sink.
+    ``frames_per_second`` is the inverse of the moving average of the interval
+    between two emitted frames; None until two frames were emitted, or while that
+    average is zero.
+    """
+
+    detect: StageTiming
+    render: StageTiming
+    write: StageTiming
+    frames_per_second: float | None
+
+
+class _Rolling:
+    """Mutable exponentially weighted moving average, in seconds."""
+
+    __slots__ = ("last", "mean")
+
+    def __init__(self) -> None:
+        self.mean: float | None = None
+        self.last: float | None = None
+
+    def add(self, seconds: float) -> None:
+        self.last = seconds
+        mean = self.mean
+        self.mean = seconds if mean is None else mean + _TIMING_ALPHA * (seconds - mean)
+
+    def snapshot(self) -> StageTiming:
+        mean, last = self.mean, self.last
+        return StageTiming(
+            mean_ms=None if mean is None else mean * 1000.0,
+            last_ms=None if last is None else last * 1000.0,
+        )
 
 
 @dataclass(frozen=True)
@@ -217,10 +297,15 @@ class Engine:
     therefore not modify or reuse an image array after yielding it (the built-in
     sources and ``PushSession`` already copy). The engine does not copy.
 
+    Reconfiguration: :meth:`reconfigure` swaps detectors, mode, stages, or config
+    between two :meth:`step` calls, that is at a frame boundary. :attr:`timings`
+    reports rolling detect, render and write times and the output frame rate.
+
     Threading: the engine is single-threaded and not thread-safe; drive it from one
     thread. Separately, it is not re-entrant: :meth:`open`, :meth:`step`,
-    :meth:`flush`, :meth:`close` and :meth:`run` raise ``RuntimeError`` when called
-    (for example by a sink, a stage, or the observer) while one of them is running.
+    :meth:`reconfigure`, :meth:`flush`, :meth:`close` and :meth:`run` raise
+    ``RuntimeError`` when called (for example by a sink, a stage, or the observer)
+    while one of them is running.
     :meth:`abort` may be called re-entrantly: no sink receives a write after it, and
     the call it interrupted raises ``RuntimeError``.
     """
@@ -235,21 +320,15 @@ class Engine:
         observer: Callable[[FrameTrace], None] | None = None,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
-        self._detectors = tuple(d for d in detectors if d.provides & mode.requires)
-        if mode.requires and not self._detectors:
-            required = ", ".join(sorted(kind.value for kind in mode.requires))
-            raise ValueError(
-                f"Mode {mode.name!r} requires {required} but no detector provides any of "
-                "them; every frame would pass through unprocessed"
-            )
+        self._all_detectors = tuple(detectors)
+        self._detectors = _active_detectors(self._all_detectors, mode)
         self._mode = mode
         self._stages = tuple(stages)
         self._sinks = tuple(sinks)
         self._config = config
         self._observer = observer
         self._clock = clock
-        budget_ms = config.frame_budget_ms
-        self._budget_s = None if budget_ms is None else budget_ms / 1000.0
+        self._budget_s = _budget_seconds(config)
         self._stats = EngineStats()
         self._failures_seen = 0
         self._buffer: LookaheadBuffer[_Pending] | None = None
@@ -257,16 +336,42 @@ class Engine:
         self._active: list[Sink] = []
         self._busy: str | None = None  # Name of the public call in progress.
         self._aborted_in_call = False  # abort() ran during that call.
+        self._reset_timings()
 
     @property
     def config(self) -> EngineConfig:
-        """The configuration this engine was built with (read-only)."""
+        """The current configuration (read-only; change it with :meth:`reconfigure`)."""
         return self._config
 
     @property
     def detectors(self) -> tuple[Detector, ...]:
         """The detectors this engine runs, in order (only those the mode requires)."""
         return self._detectors
+
+    @property
+    def mode(self) -> Mode:
+        """The current mode."""
+        return self._mode
+
+    @property
+    def stages(self) -> tuple[Stage, ...]:
+        """The current stages, in order."""
+        return self._stages
+
+    @property
+    def timings(self) -> EngineTimings:
+        """Rolling per-frame timings since :meth:`open`, as an immutable snapshot.
+
+        Measured with the engine's ``clock`` on every emitted frame, whether or not
+        a frame budget is set; they never influence the budget check.
+        """
+        interval = self._interval.mean
+        return EngineTimings(
+            detect=self._detect_time.snapshot(),
+            render=self._render_time.snapshot(),
+            write=self._write_time.snapshot(),
+            frames_per_second=1.0 / interval if interval else None,
+        )
 
     @property
     def is_open(self) -> bool:
@@ -292,6 +397,7 @@ class Engine:
             raise RuntimeError("Engine is already open; close or abort it first")
         self._stats = EngineStats()
         self._failures_seen = 0
+        self._reset_timings()
         buffer: LookaheadBuffer[_Pending] = LookaheadBuffer(
             self._config.lookahead, self._config.cold_start_frames
         )
@@ -360,6 +466,126 @@ class Engine:
         except BaseException:
             self.abort()
             raise
+
+    def reconfigure(
+        self,
+        *,
+        detectors: Sequence[Detector] | None = None,
+        mode: Mode | None = None,
+        stages: Sequence[Stage] | None = None,
+        config: EngineConfig | None = None,
+    ) -> list[Output]:
+        """Swap components at a frame boundary; return the outputs of the flushed tail.
+
+        Call it between two :meth:`step` calls while the engine is open and not
+        flushed. An argument left as None keeps the current component; ``detectors``
+        replaces the whole list given to the constructor, and the mode in effect
+        then picks the ones it requires, exactly as at construction. Build a changed
+        config with ``dataclasses.replace(engine.config, lookahead=3)``. Sinks and
+        the observer are not changed, and stats keep accumulating.
+
+        Validation runs first, with the constructor's rules: when the mode requires
+        detections and no detector provides any of them, ``ValueError`` is raised,
+        nothing changes, and the engine stays usable.
+
+        Every reconfiguration freezes the frames around the switch: the buffered
+        tail and at least one lookahead window after it, because the lookahead
+        cannot see across the switch in either direction. The only exception is a
+        call that changes nothing affecting decisions or rendering (every argument
+        None, or a ``config`` that differs only in ``frame_budget_ms``): it applies
+        the new budget, keeps the buffer as it is, and freezes nothing.
+
+        Transition, in order:
+
+        1. The frames still in the lookahead buffer were detected by the old
+           detectors. They are rendered with the old mode and stages and written to
+           the sinks, exactly as :meth:`flush` would, and returned. All of them are
+           forced to ``final=True`` (``raw`` and ``filled`` keep their values).
+        2. The new components are installed. Detectors that became active
+           (``detectors`` given, or a new mode that activates a detector the old
+           mode did not run) are ``reset()``. A new lookahead buffer continues the
+           stream's frame numbering, so indices stay contiguous for sinks and the
+           observer.
+        3. The frames after the switch are forced to ``final=True`` for the
+           longest of: ``max(old lookahead, new lookahead)``; the full
+           ``cold_start_frames`` of the new config when detectors became active or
+           the config changes ``lookahead`` or ``cold_start_frames``; the rest of a
+           cold-start window already in progress.
+
+        If writing the tail fails in a way that aborts the engine (critical sink,
+        observer, or abort from a callback), or a detector's ``reset()`` raises,
+        the engine is aborted, the error propagates, and the new components are not
+        installed.
+
+        Threading: like every other call this runs on the thread that drives the
+        engine. A caller on another thread (for example a web request) must hand
+        the change to that thread, which applies it between two steps; the engine
+        has no locking.
+        """
+        with self._call("reconfigure"):
+            return self._reconfigure(detectors, mode, stages, config)
+
+    def _reconfigure(
+        self,
+        detectors: Sequence[Detector] | None,
+        mode: Mode | None,
+        stages: Sequence[Stage] | None,
+        config: EngineConfig | None,
+    ) -> list[Output]:
+        buffer = self._require_streaming("reconfigure")
+        new_all = self._all_detectors if detectors is None else tuple(detectors)
+        new_mode = self._mode if mode is None else mode
+        new_stages = self._stages if stages is None else tuple(stages)
+        new_config = self._config if config is None else config
+        new_detectors = _active_detectors(new_all, new_mode)  # Raises before any change.
+
+        old_config = self._config
+        if (
+            detectors is None
+            and mode is None
+            and stages is None
+            and replace(new_config, frame_budget_ms=old_config.frame_budget_ms) == old_config
+        ):
+            # Nothing that affects decisions or rendering changes: keep the buffer.
+            self._config = new_config
+            self._budget_s = _budget_seconds(new_config)
+            self._stats.reconfigurations += 1
+            return []
+
+        old_ids = {id(d) for d in self._detectors}
+        if detectors is not None:
+            installed = new_detectors
+        else:
+            installed = tuple(d for d in new_detectors if id(d) not in old_ids)
+        cold = bool(installed) or (
+            new_config.lookahead != old_config.lookahead
+            or new_config.cold_start_frames != old_config.cold_start_frames
+        )
+
+        start = buffer.next_index  # Read before flush(), which rewinds it.
+        cold_frames = max(buffer.cold_start_end - start, 0)  # Window already in progress.
+        if cold:
+            cold_frames = max(cold_frames, new_config.cold_start_frames)
+        # The lookahead cannot see across the switch in either direction.
+        cold_frames = max(cold_frames, old_config.lookahead, new_config.lookahead)
+        try:
+            decisions = [d if d.final else replace(d, final=True) for d in buffer.flush()]
+            outputs = [self._emit(decision) for decision in decisions]
+            for detector in installed:
+                detector.reset()
+        except BaseException:
+            self.abort()
+            raise
+
+        self._all_detectors = new_all
+        self._detectors = new_detectors
+        self._mode = new_mode
+        self._stages = new_stages
+        self._config = new_config
+        self._budget_s = _budget_seconds(new_config)
+        self._buffer = LookaheadBuffer(new_config.lookahead, cold_frames, start)
+        self._stats.reconfigurations += 1
+        return outputs
 
     def close(self) -> EngineStats:
         """Flush the tail (if :meth:`flush` was not called), close every sink, return stats.
@@ -466,6 +692,13 @@ class Engine:
                 "the engine is not re-entrant"
             )
 
+    def _reset_timings(self) -> None:
+        self._detect_time = _Rolling()
+        self._render_time = _Rolling()
+        self._write_time = _Rolling()
+        self._interval = _Rolling()
+        self._last_emit: float | None = None
+
     def _check_not_aborted(self) -> None:
         """Raise when :meth:`abort` was called from inside the current call."""
         if self._aborted_in_call:
@@ -502,7 +735,7 @@ class Engine:
         so their models stay in step with the stream; their results are discarded.
         """
         budget = self._budget_s
-        start = self._clock() if budget is not None else 0.0
+        start = self._clock()
         detections = Detections()
         failed = False
         for detector in self._detectors:
@@ -518,13 +751,11 @@ class Engine:
             if not failed:
                 detections = detections.merged(result)
 
-        elapsed = 0.0
+        elapsed = self._clock() - start
         over = False
-        if budget is not None:
-            elapsed = self._clock() - start
-            if not failed and elapsed > budget:
-                over = True
-                self._log_over_budget(frame.index, "detection", elapsed)
+        if budget is not None and not failed and elapsed > budget:
+            over = True
+            self._log_over_budget(frame.index, "detection", elapsed)
         return _Pending(
             frame=frame,
             detections=detections,
@@ -539,10 +770,12 @@ class Engine:
         frame = pending.frame
         over = pending.over_budget
         failed = pending.detect_failed or over
+        clock = self._clock
+        self._detect_time.add(pending.detect_seconds)
         image: np.ndarray | None = None
         if not failed:
             budget = self._budget_s
-            start = self._clock() if budget is not None else 0.0
+            start = clock()
             where = f"mode {self._mode.name}"
             try:
                 image = self._mode.render(frame, pending.detections, decision.final)
@@ -552,8 +785,10 @@ class Engine:
             except Exception as exc:
                 self._log_failure(frame.index, where, exc)
                 failed = True
+            rendered = clock() - start
+            self._render_time.add(rendered)
             if not failed and budget is not None:
-                total = pending.detect_seconds + (self._clock() - start)
+                total = pending.detect_seconds + rendered
                 if total > budget:
                     over = failed = True
                     self._log_over_budget(frame.index, "detection and render", total)
@@ -562,7 +797,13 @@ class Engine:
             image = np.zeros_like(frame.image)
 
         meta = frame.meta
+        start = clock()
         self._write(image, meta)
+        end = clock()
+        self._write_time.add(end - start)
+        if self._last_emit is not None:
+            self._interval.add(end - self._last_emit)
+        self._last_emit = end
 
         stats = self._stats
         stats.frames += 1
@@ -625,6 +866,24 @@ class Engine:
                 seconds * 1000.0,
                 self._config.frame_budget_ms,
             )
+
+
+def _active_detectors(detectors: Sequence[Detector], mode: Mode) -> tuple[Detector, ...]:
+    """Return the detectors ``mode`` requires, in order; raise when it needs one and gets none."""
+    active = tuple(d for d in detectors if d.provides & mode.requires)
+    if mode.requires and not active:
+        required = ", ".join(sorted(kind.value for kind in mode.requires))
+        raise ValueError(
+            f"Mode {mode.name!r} requires {required} but no detector provides any of "
+            "them; every frame would pass through unprocessed"
+        )
+    return active
+
+
+def _budget_seconds(config: EngineConfig) -> float | None:
+    """Return the per-frame budget in seconds, or None when disabled."""
+    budget_ms = config.frame_budget_ms
+    return None if budget_ms is None else budget_ms / 1000.0
 
 
 def _abort_all(sinks: Sequence[Sink]) -> None:

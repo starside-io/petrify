@@ -239,6 +239,75 @@ def test_reuse_after_flush_starts_new_stream_at_index_zero() -> None:
     assert [d.final for d in second] == [True, False, False, False]
 
 
+def test_negative_start_index_raises() -> None:
+    with pytest.raises(ValueError, match="start_index"):
+        LookaheadBuffer(2, 0, -1)
+
+
+# ---------------------------------------------------------------------------
+# Start index (mid-stream buffers)
+# ---------------------------------------------------------------------------
+
+
+def test_default_start_index_is_zero() -> None:
+    buf: LookaheadBuffer[int] = LookaheadBuffer(2, 3)
+    assert buf.start_index == 0
+    assert buf.next_index == 0
+    assert buf.cold_start_end == 3
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 3, 10])
+@pytest.mark.parametrize("cold_start", [0, 2, 50])
+@pytest.mark.parametrize("start", [1, 7, 1000])
+def test_start_index_only_shifts_indices(lookahead: int, cold_start: int, start: int) -> None:
+    for seed in range(20):
+        rng = random.Random(seed * 7 + start + lookahead)
+        raws = [rng.random() < DENSITIES[seed % len(DENSITIES)] for _ in range(rng.randint(0, 120))]
+        _, base, base_calls = _run(raws, lookahead, cold_start)
+
+        buf: LookaheadBuffer[object] = LookaheadBuffer(lookahead, cold_start, start)
+        items = [object() for _ in raws]
+        calls = [buf.push(item, raw) for item, raw in zip(items, raws)]
+        assert buf.next_index == start + len(raws)
+        calls.append(buf.flush())
+        shifted = [d for batch in calls for d in batch]
+
+        assert [len(c) for c in calls] == [len(c) for c in base_calls]
+        assert [d.index for d in shifted] == [d.index + start for d in base]
+        assert all(d.item is it for d, it in zip(shifted, items))
+        assert [(d.raw, d.filled, d.final) for d in shifted] == [
+            (d.raw, d.filled, d.final) for d in base
+        ]
+
+
+def test_cold_start_and_fill_at_non_zero_start() -> None:
+    buf: LookaheadBuffer[int] = LookaheadBuffer(1, 2, 10)
+    assert buf.cold_start_end == 12
+    raws = _bits("....1...")
+    decisions = [d for i, raw in enumerate(raws) for d in buf.push(i, raw)] + buf.flush()
+    assert [d.index for d in decisions] == list(range(10, 18))
+    assert [d.filled for d in decisions] == _bits("...111..")
+    assert [d.final for d in decisions] == _bits("11.111..")
+
+
+def test_fill_never_reaches_before_start() -> None:
+    buf: LookaheadBuffer[int] = LookaheadBuffer(3, 0, 5)
+    decisions = buf.push(0, True) + buf.push(1, False) + buf.flush()
+    assert [d.index for d in decisions] == [5, 6]
+    assert [d.filled for d in decisions] == [True, True]
+
+
+def test_flush_rewinds_to_start_index() -> None:
+    buf: LookaheadBuffer[str] = LookaheadBuffer(1, 1, 4)
+    first = buf.push("a", False) + buf.push("b", True) + buf.flush()
+    assert [d.index for d in first] == [4, 5]
+    assert buf.next_index == 4
+    second = buf.push("c", False) + buf.push("d", False) + buf.flush()
+    assert [d.index for d in second] == [4, 5]
+    assert [d.filled for d in second] == [False, False]
+    assert [d.final for d in second] == [True, False]
+
+
 def test_flush_twice_is_empty() -> None:
     buf: LookaheadBuffer[int] = LookaheadBuffer(3)
     buf.push(0, True)
