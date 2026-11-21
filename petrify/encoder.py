@@ -26,6 +26,32 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def find_ffmpeg() -> str:
+    """Return the path of the ``ffmpeg`` binary.
+
+    Looks on ``PATH`` first, then in common Homebrew locations that are not
+    always on ``PATH``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no ``ffmpeg`` binary is found.
+    """
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin is None:
+        # Fallback: check common Homebrew locations not always on PATH
+        for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if Path(candidate).is_file():
+                ffmpeg_bin = candidate
+                break
+    if ffmpeg_bin is None:
+        raise FileNotFoundError(
+            "ffmpeg binary not found on PATH. "
+            "Install FFmpeg: https://ffmpeg.org/download.html"
+        )
+    return ffmpeg_bin
+
+
 def ffmpeg_encode(
     video_path: str | Path,
     original_audio_source: str | Path,
@@ -71,18 +97,7 @@ def ffmpeg_encode(
     subprocess.CalledProcessError
         If FFmpeg exits with a non-zero return code.
     """
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin is None:
-        # Fallback: check common Homebrew locations not always on PATH
-        for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
-            if Path(candidate).is_file():
-                ffmpeg_bin = candidate
-                break
-    if ffmpeg_bin is None:
-        raise FileNotFoundError(
-            "ffmpeg binary not found on PATH. "
-            "Install FFmpeg: https://ffmpeg.org/download.html"
-        )
+    ffmpeg_bin = find_ffmpeg()
 
     cmd: list[str] = [ffmpeg_bin, "-y"]
 

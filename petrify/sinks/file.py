@@ -14,21 +14,32 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-"""Video file sink: intermediate mp4v file, then FFmpeg re-encode with original audio."""
+"""Video file sinks.
+
+``FileSink`` writes an intermediate mp4v file, then re-encodes it with FFmpeg and
+the original audio. ``FfmpegPipeSink`` pipes raw frames to FFmpeg and encodes them
+in one step.
+"""
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import math
 import os
+import subprocess
 import tempfile
+from collections.abc import Callable
+from fractions import Fraction
 from pathlib import Path
+from typing import IO, Any
 
 import cv2
 import numpy as np
 
 from petrify.core.config import EncodeConfig
 from petrify.core.frame import FrameMeta, SourceInfo
-from petrify.encoder import ffmpeg_encode
+from petrify.encoder import ffmpeg_encode, find_ffmpeg
 
 logger = logging.getLogger(__name__)
 
@@ -124,3 +135,237 @@ def _remove_temp(temp_path: str) -> None:
         os.unlink(temp_path)
     except OSError as exc:
         logger.warning("Could not remove temp file %s: %s", temp_path, exc)
+
+
+# Seconds ``close`` waits for FFmpeg to finish encoding the tail and exit.
+_CLOSE_TIMEOUT_S = 60.0
+# Seconds ``abort`` (and a failed write) waits after terminate before killing.
+_STOP_TIMEOUT_S = 5.0
+# How much of FFmpeg's stderr goes into error messages.
+_STDERR_TAIL_BYTES = 4096
+_STDERR_TAIL_LINES = 20
+
+
+class FfmpegPipeSink:
+    """Encode frames in one step by piping raw BGR frames to an FFmpeg subprocess.
+
+    There is no intermediate file and no second encode. FFmpeg writes to a sibling
+    ``<name>.partial<suffix>`` that ``close`` moves onto ``output_path`` only after
+    FFmpeg exits with code 0, so a failed or aborted run never leaves a file at
+    ``output_path`` and never replaces an existing one.
+
+    ``audio_source`` (optional) is muxed as the output's audio, copied without
+    re-encoding; a source without audio is skipped silently.
+
+    ``wallclock_timestamps=True`` stamps each frame with the time FFmpeg receives
+    it. Use it for live sources: a stream that drops frames then keeps real time
+    instead of being compressed to a constant frame rate. Leave it off for files,
+    where every frame is delivered and the source frame rate is the right clock
+    (wallclock stamps would follow processing speed instead).
+
+    FFmpeg's stderr goes to a temporary file, never to an undrained pipe, so it
+    cannot block the pipeline; its tail is quoted in error messages. The command
+    line, including the output path, is logged.
+
+    ``close`` and ``abort`` are idempotent; ``abort`` is safe before ``open`` and
+    after a failed ``open``.
+    """
+
+    critical = True
+
+    def __init__(
+        self,
+        output_path: str | Path,
+        encode: EncodeConfig,
+        *,
+        audio_source: str | Path | None = None,
+        wallclock_timestamps: bool = False,
+        popen: Callable[..., Any] = subprocess.Popen,
+    ) -> None:
+        self._output_path = Path(output_path)
+        self._partial_path = self._output_path.with_name(
+            f"{self._output_path.stem}.partial{self._output_path.suffix}"
+        )
+        self._encode = encode
+        self._audio_source = None if audio_source is None else Path(audio_source)
+        self._wallclock = wallclock_timestamps
+        self._popen = popen
+        self._proc: Any = None
+        self._stderr: IO[bytes] | None = None
+        self._shape: tuple[int, int, int] | None = None
+
+    @property
+    def partial_path(self) -> Path:
+        """Where FFmpeg writes until ``close`` succeeds."""
+        return self._partial_path
+
+    def build_command(self, ffmpeg_bin: str, info: SourceInfo) -> list[str]:
+        """Return the FFmpeg command line for a stream described by ``info``."""
+        cmd: list[str] = [ffmpeg_bin, "-y", "-hide_banner", "-nostats"]
+        if self._encode.hwaccel:
+            cmd += ["-hwaccel", self._encode.hwaccel]
+        # An input -r replaces the wallclock stamps with a constant rate, so the live
+        # variant gives the nominal rate with -framerate instead.
+        rate_flag = "-r"
+        if self._wallclock:
+            cmd += ["-use_wallclock_as_timestamps", "1"]
+            rate_flag = "-framerate"
+        cmd += [
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{info.width}x{info.height}",
+            rate_flag, _format_fps(info.fps),
+            "-i", "pipe:0",
+        ]
+        if self._audio_source is not None:
+            cmd += ["-i", str(self._audio_source)]
+        cmd += ["-map", "0:v:0"]
+        if self._audio_source is not None:
+            cmd += ["-map", "1:a?"]
+        cmd += [
+            "-c:v", self._encode.codec,
+            "-crf", str(self._encode.crf),
+            "-preset", self._encode.preset,
+            "-pix_fmt", "yuv420p",
+        ]
+        if self._audio_source is not None:
+            cmd += ["-c:a", "copy"]
+        cmd.append(str(self._partial_path))
+        return cmd
+
+    def open(self, info: SourceInfo) -> None:
+        """Start FFmpeg reading raw frames from its stdin."""
+        if self._proc is not None:
+            raise RuntimeError("FfmpegPipeSink is already open")
+        if info.width <= 0 or info.height <= 0:
+            raise ValueError(f"Invalid frame size {info.width}x{info.height}")
+        cmd = self.build_command(find_ffmpeg(), info)
+        logger.info("FFmpeg command: %s", " ".join(cmd))
+
+        stderr = tempfile.TemporaryFile()
+        try:
+            proc = self._popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr,
+            )
+        except BaseException:
+            stderr.close()
+            raise
+        self._proc = proc
+        self._stderr = stderr
+        self._shape = (info.height, info.width, 3)
+
+    def write(self, image: np.ndarray, meta: FrameMeta) -> None:
+        """Send one BGR uint8 image to FFmpeg."""
+        proc = self._proc
+        if proc is None or self._shape is None:
+            raise RuntimeError("FfmpegPipeSink is not open")
+        if image.shape != self._shape or image.dtype != np.uint8:
+            raise ValueError(
+                f"Expected a uint8 image of shape {self._shape}, "
+                f"got {image.dtype} {image.shape}"
+            )
+        if proc.poll() is not None:
+            raise OSError(self._failure("FFmpeg exited while frames were still being written"))
+        try:
+            proc.stdin.write(np.ascontiguousarray(image).data)
+        except (OSError, ValueError) as exc:  # BrokenPipeError is an OSError.
+            self._wait_quietly(_STOP_TIMEOUT_S)
+            raise OSError(self._failure("Writing a frame to FFmpeg failed")) from exc
+
+    def close(self) -> None:
+        """Finish the encode; on success move the partial file onto ``output_path``."""
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            with contextlib.suppress(OSError, ValueError):
+                proc.stdin.close()
+            try:
+                proc.wait(timeout=_CLOSE_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                self._wait_quietly(_STOP_TIMEOUT_S)
+                _remove_quietly(self._partial_path)
+                raise OSError(
+                    self._failure(f"FFmpeg did not exit within {_CLOSE_TIMEOUT_S:g} s and was killed")
+                ) from None
+            if proc.returncode != 0:
+                _remove_quietly(self._partial_path)
+                raise OSError(self._failure("FFmpeg failed"))
+            os.replace(self._partial_path, self._output_path)
+        finally:
+            self._release()
+        logger.info("Done. Output written to: %s", self._output_path)
+
+    def abort(self) -> None:
+        """Stop FFmpeg and remove the partial file. Idempotent."""
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            with contextlib.suppress(OSError, ValueError):
+                proc.stdin.close()
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=_STOP_TIMEOUT_S)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=_STOP_TIMEOUT_S)
+            except Exception as exc:
+                logger.warning("Could not stop FFmpeg cleanly: %r", exc)
+            _remove_quietly(self._partial_path)
+        finally:
+            self._release()
+
+    def _failure(self, what: str) -> str:
+        """Build an error message with FFmpeg's exit code and stderr tail."""
+        code = None if self._proc is None else self._proc.poll()
+        tail = self._stderr_tail()
+        message = f"{what} (exit code {code})"
+        return f"{message}:\n{tail}" if tail else message
+
+    def _stderr_tail(self) -> str:
+        stderr = self._stderr
+        if stderr is None:
+            return ""
+        try:
+            stderr.flush()
+            size = stderr.seek(0, os.SEEK_END)
+            stderr.seek(max(0, size - _STDERR_TAIL_BYTES))
+            data = stderr.read()
+        except (OSError, ValueError):
+            return ""
+        lines = data.decode("utf-8", errors="replace").strip().splitlines()
+        return "\n".join(lines[-_STDERR_TAIL_LINES:])
+
+    def _wait_quietly(self, timeout: float) -> None:
+        """Give an exiting FFmpeg a moment so its exit code and stderr are complete."""
+        with contextlib.suppress(Exception):
+            self._proc.wait(timeout=timeout)
+
+    def _release(self) -> None:
+        self._proc = None
+        self._shape = None
+        stderr, self._stderr = self._stderr, None
+        if stderr is not None:
+            with contextlib.suppress(OSError):
+                stderr.close()
+
+
+def _format_fps(fps: float) -> str:
+    """Format a frame rate for FFmpeg, keeping NTSC rates exact (30000/1001)."""
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError(f"Frame rate must be a positive number, got {fps!r}")
+    return str(Fraction(fps).limit_denominator(1001))
+
+
+def _remove_quietly(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not remove partial file %s: %s", path, exc)

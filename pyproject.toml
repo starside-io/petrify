@@ -50,6 +50,7 @@ dev = [
     "ruff>=0.1",
     "mypy>=1.0",
 ]
+virtualcam = ["pyvirtualcam>=0.11"]
 
 [project.scripts]
 petrify = "petrify.cli:main"
