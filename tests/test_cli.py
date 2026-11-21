@@ -2,17 +2,31 @@
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 from collections.abc import Iterator
+from pathlib import Path
 from unittest import mock
 
 import pytest
 
 import petrify
 import petrify.pipeline
-from petrify.cli import _build_parser, main
-from petrify.core.config import PetrifyConfig
+import petrify.sources
+from petrify.cli import _build_parser, _build_run_parser, _resolve_run, main
+from petrify.core.config import (
+    BackgroundConfig,
+    BackgroundDiffConfig,
+    EncodeConfig,
+    EngineConfig,
+    MotionConfig,
+    PersonHogConfig,
+    PetrifyConfig,
+    RoiConfig,
+)
 from petrify.core.engine import EngineStats
-from petrify.pipeline import RunReport
+from petrify.core.frame import SourceInfo
+from petrify.pipeline import OutputConfig, RunReport
 
 IN = "in.mp4"
 OUT = "out.mp4"
@@ -156,5 +170,286 @@ def test_help(run_file: mock.MagicMock, capsys: pytest.CaptureFixture[str]) -> N
     with pytest.raises(SystemExit) as excinfo:
         main(["--help"])
     assert excinfo.value.code == 0
-    assert "usage: petrify" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "usage: petrify" in out
+    assert "petrify run --help" in out
     run_file.assert_not_called()
+
+
+def test_file_form_namespace_and_config_unchanged() -> None:
+    """The file form parses exactly as before the run form existed."""
+    args = _build_parser().parse_args([IN, OUT, *NON_DEFAULT_ARGV])
+    assert vars(args) == {
+        "input": IN, "output": OUT,
+        "roi": [10, 20, 320, 80], "no_roi": False,
+        "roi_scan_samples": 30, "roi_scan_min_freq": 0.7, "roi_scan_margin": 4,
+        "roi_scan_max_area_frac": 0.2, "roi_scan_edge_threshold": 70.0,
+        "roi_scan_edge_gap_tolerance": 20, "roi_scan_edge_samples": 5,
+        "detector": "both", "hog_downsample": 0.75, "hog_scale": 1.1,
+        "hog_min_confidence": 0.5, "hog_min_box_area": 2000,
+        "gap_fill": 3, "background_frame": 7, "no_bg_diff": False,
+        "bg_diff_pixel_threshold": 30, "bg_diff_area_threshold": 300,
+        "threshold": 250, "history": 100, "var_threshold": 20.0, "detect_shadows": True,
+        "downsample": 0.25,
+        "codec": "libx265", "crf": 18, "preset": "slow", "hwaccel": "videotoolbox",
+        "verbose": True,
+    }
+    assert PetrifyConfig.from_namespace(args) == PetrifyConfig(
+        detector="both",
+        motion=MotionConfig(history=100, var_threshold=20.0, detect_shadows=True,
+                            threshold=250, downsample=0.25),
+        person=PersonHogConfig(downsample=0.75, scale=1.1, min_confidence=0.5,
+                               min_box_area=2000),
+        background_diff=BackgroundDiffConfig(pixel_threshold=30, area_threshold=300,
+                                             downsample=0.25),
+        roi=RoiConfig(mode="manual", box=(10, 20, 320, 80), scan_samples=30,
+                      scan_min_freq=0.7, scan_margin=4, scan_max_area_frac=0.2,
+                      scan_edge_threshold=70.0, scan_edge_gap_tolerance=20,
+                      scan_edge_samples=5),
+        background=BackgroundConfig(strategy="locked", frame_index=7),
+        encode=EncodeConfig(codec="libx265", crf=18, preset="slow", hwaccel="videotoolbox"),
+        engine=EngineConfig(lookahead=3),
+    )
+    assert PetrifyConfig.from_namespace(_build_parser().parse_args([IN, OUT])) == PetrifyConfig()
+
+
+def test_first_argument_run_selects_run_form(run_file: mock.MagicMock) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run"])  # --source is required in the run form.
+    assert excinfo.value.code == 2
+    run_file.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# petrify run
+# ---------------------------------------------------------------------------
+
+SECRET = "Zq9CliSecretPassw0rd"
+SECRET_URL = f"rtsp://admin:{SECRET}@cam.example:554/live?token=Tk7CliToken"
+
+
+class _StubSource:
+    def __init__(self, live: bool = False) -> None:
+        self.info = SourceInfo(fps=25.0, width=320, height=256, frame_count=None,
+                               seekable=not live, live=live, uri="stub")
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def run_stream() -> Iterator[mock.MagicMock]:
+    with (
+        mock.patch.object(petrify.pipeline, "run_stream", return_value=_report()) as patched,
+        mock.patch.object(petrify.sources, "open_source", return_value=_StubSource()),
+    ):
+        yield patched
+
+
+def _resolved(argv: list[str]) -> tuple[PetrifyConfig, OutputConfig]:
+    parser = _build_run_parser()
+    settings = _resolve_run(parser, parser.parse_args(argv))
+    return settings.config, settings.outputs
+
+
+@pytest.fixture
+def image_dir(tmp_path: Path) -> str:
+    return str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("spec", "background", "lookahead"),
+    [
+        ("clip.mp4", "locked", 10),
+        ("frames/*.png", "locked", 10),
+        ("camera:0", "running", 3),
+        ("rtsp://cam.example/live", "running", 3),
+        ("https://cam.example/mjpeg", "running", 3),
+    ],
+)
+def test_run_defaults_per_source_kind(spec: str, background: str, lookahead: int) -> None:
+    config, outputs = _resolved(["--source", spec, "--output", OUT])
+    assert config.background.strategy == background
+    assert config.engine.lookahead == lookahead
+    assert config.engine.frame_budget_ms is None
+    assert config.roi == RoiConfig()
+    assert outputs == OutputConfig(file=Path(OUT))
+
+
+def test_run_defaults_for_image_directory(image_dir: str) -> None:
+    config, _ = _resolved(["--source", image_dir, "--preview"])
+    assert (config.background.strategy, config.engine.lookahead) == ("locked", 10)
+
+
+def test_run_file_source_defaults_match_file_form() -> None:
+    config, _ = _resolved(["--source", IN, "--output", OUT])
+    assert config == PetrifyConfig.from_namespace(_build_parser().parse_args([IN, OUT]))
+
+
+def test_run_shared_options_match_file_form() -> None:
+    shared = ["--lookahead" if a == "--gap-fill" else a for a in NON_DEFAULT_ARGV]
+    config, _ = _resolved(["--source", IN, "--output", OUT, *shared])
+    assert config == PetrifyConfig.from_namespace(
+        _build_parser().parse_args([IN, OUT, *NON_DEFAULT_ARGV])
+    )
+
+
+def test_run_options_reach_the_config(image_dir: str) -> None:
+    config, outputs = _resolved([
+        "--source", "camera:1", "--virtualcam", "--virtualcam-device", "OBS", "--preview",
+        "--output", OUT, "--background", "calibrate", "--calibrate-seconds", "4.5",
+        "--lookahead", "0", "--frame-budget-ms", "40", "--roi-warmup", "6",
+    ])
+    assert config.background.strategy == "calibrate"
+    assert config.background.calibrate_seconds == 4.5
+    assert config.engine.lookahead == 0
+    assert config.engine.frame_budget_ms == 40.0
+    assert config.roi.warmup_seconds == 6.0
+    assert outputs == OutputConfig(file=Path(OUT), virtualcam=True, virtualcam_device="OBS",
+                                   preview=True)
+    config, _ = _resolved(["--source", "clip.mp4", "--output", OUT, "--background", "running"])
+    assert config.background.strategy == "running"
+    config, _ = _resolved(["--source", "a.mp4", "--output", OUT, "--background-frame", "4"])
+    assert config.background.frame_index == 4
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--source", IN], "at least one output is required"),
+        (["--source", "camera:0", "--output", OUT, "--background", "locked"],
+         "--background locked needs a video file"),
+        (["--source", SECRET_URL, "--output", OUT, "--background", "locked"],
+         "--background locked needs a video file"),
+        (["--source", IN, "--output", OUT, "--virtualcam-device", "x"],
+         "--virtualcam-device requires --virtualcam"),
+        (["--source", IN, "--output", OUT, "--gap-fill", "3"], "use --lookahead"),
+        (["--source", IN, "--output", OUT, "--lookahead", "-1"], "--lookahead must be >= 0"),
+        (["--source", IN, "--output", OUT, "--frame-budget-ms", "0"],
+         "--frame-budget-ms must be > 0"),
+        (["--source", IN, "--output", OUT, "--background", "calibrate",
+          "--calibrate-seconds", "-2"], "--calibrate-seconds must be > 0"),
+        (["--source", IN, "--output", OUT, "--roi-warmup", "0"], "--roi-warmup must be > 0"),
+        (["--source", "f/*.png", "--output", OUT, "--fps", "0"], "--fps must be > 0"),
+        (["--source", IN, "--output", OUT, "--fps", "10"], "--fps applies only"),
+        (["--source", IN, "--output", OUT, "--downsample", "1.5"], "--downsample must be in"),
+        (["--source", IN, "--output", OUT, "--background-frame", "-1"],
+         "--background-frame must be >= 0"),
+        (["--source", "camera:0", "--output", OUT, "--background-frame", "3"],
+         "--background-frame requires --background locked"),
+        (["--source", IN, "--output", OUT, "--calibrate-seconds", "3"],
+         "--calibrate-seconds requires --background calibrate"),
+        (["--source", "camera:x", "--output", OUT], "camera:N"),
+        (["--source", f"ftp://u:{SECRET}@h/x", "--output", OUT], "supported schemes"),
+        (["--source", IN, "--output", OUT, "--mode", "shadow"], "invalid choice"),
+        (["--output", OUT], "--source"),
+    ],
+)
+def test_run_usage_errors(
+    run_stream: mock.MagicMock,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    message: str,
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run", *argv])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert message in err
+    assert SECRET not in err
+    run_stream.assert_not_called()
+
+
+def test_unknown_mode_lists_available_modes(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["run", "--source", IN, "--output", OUT, "--mode", "shadow"])
+    err = capsys.readouterr().err
+    assert "erase" in err.split("invalid choice", 1)[1]
+
+
+def test_run_calls_run_stream(run_stream: mock.MagicMock) -> None:
+    assert main(["run", "--source", IN, "--output", OUT, "--lookahead", "5"]) == 0
+    run_stream.assert_called_once()
+    source, config, outputs = run_stream.call_args.args
+    assert isinstance(source, _StubSource)
+    assert config.engine.lookahead == 5
+    assert outputs == OutputConfig(file=Path(OUT))
+    petrify.sources.open_source.assert_called_once_with(IN, fps=None)  # type: ignore[attr-defined]
+
+
+def test_run_prints_banner_but_not_for_help(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["run", "--source", IN, "--output", OUT]) == 0
+    assert "Freeze the world" in capsys.readouterr().err
+    run_stream.reset_mock()
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run", "--help"])
+    assert excinfo.value.code == 0
+    captured = capsys.readouterr()
+    assert "Freeze the world" not in captured.err
+    assert "usage: petrify run" in captured.out
+    assert "--lookahead" in captured.out and "--gap-fill" in captured.out  # Named in help text.
+    run_stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("result", "code"),
+    [
+        (_report(), 0),
+        (dataclasses.replace(_report(failed_closed=2), interrupted=True), 0),
+        (FileNotFoundError("missing.mp4"), 2),
+        (KeyboardInterrupt(), 130),
+        (RuntimeError("boom"), 1),
+    ],
+    ids=["ok", "live-interrupted", "file-not-found", "keyboard-interrupt", "other-exception"],
+)
+def test_run_exit_codes(run_stream: mock.MagicMock, result: object, code: int) -> None:
+    if isinstance(result, BaseException):
+        run_stream.side_effect = result
+    else:
+        run_stream.return_value = result
+    assert main(["run", "--source", IN, "--output", OUT]) == code
+
+
+def test_run_missing_input_file_exits_2(tmp_path: Path) -> None:
+    assert main(["run", "--source", str(tmp_path / "missing.mp4"), "--output", OUT]) == 2
+
+
+def test_run_never_logs_the_stream_url(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    real_open = petrify.sources.open_source
+
+    class _Closed:
+        def __init__(self, url: str) -> None:
+            pass
+
+        def isOpened(self) -> bool:  # noqa: N802 (mirrors the OpenCV API)
+            return False
+
+        def release(self) -> None:
+            pass
+
+    def fake_open(spec: str, **kwargs: object) -> object:
+        return real_open(spec, capture_factory=_Closed, **kwargs)  # type: ignore[arg-type]
+
+    with mock.patch.object(petrify.sources, "open_source", side_effect=fake_open):
+        code = main(["run", "--source", SECRET_URL, "--preview", "-v"])
+    assert code == 1
+    text = capsys.readouterr().err + caplog.text
+    assert "rtsp://***@cam.example:554" in text
+    assert SECRET not in text and "Tk7CliToken" not in text
+
+
+def test_run_logs_the_redacted_source_uri(caplog: pytest.LogCaptureFixture) -> None:
+    stub = _StubSource(live=True)
+    stub.info = dataclasses.replace(stub.info, uri="rtsp://***@cam.example:554")
+    with (
+        mock.patch.object(petrify.pipeline, "run_stream", return_value=_report()),
+        mock.patch.object(petrify.sources, "open_source", return_value=stub),
+        caplog.at_level(logging.INFO, logger="petrify.cli"),
+    ):
+        assert main(["run", "--source", SECRET_URL, "--preview"]) == 0
+    assert "rtsp://***@cam.example:554" in caplog.text
+    assert SECRET not in caplog.text

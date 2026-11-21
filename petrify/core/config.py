@@ -71,6 +71,8 @@ class RoiConfig:
     scan_edge_threshold: float = 80.0
     scan_edge_gap_tolerance: int = 30
     scan_edge_samples: int = 3
+    # Auto mode on a source that cannot be scanned in advance: seconds of warmup.
+    warmup_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         if self.mode not in ("manual", "auto", "disabled"):
@@ -79,6 +81,10 @@ class RoiConfig:
             raise ValueError("RoiConfig.mode 'manual' requires a box")
         if self.mode != "manual" and self.box is not None:
             raise ValueError(f"RoiConfig.mode {self.mode!r} requires box to be None")
+        if not self.warmup_seconds > 0:
+            raise ValueError(
+                f"RoiConfig.warmup_seconds must be > 0, got {self.warmup_seconds}"
+            )
 
 
 @dataclass(frozen=True)

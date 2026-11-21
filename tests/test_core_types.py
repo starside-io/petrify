@@ -315,6 +315,14 @@ def test_roi_box_rejected_outside_manual(mode: str) -> None:
         RoiConfig(mode=mode, box=(1, 2, 3, 4))  # type: ignore[arg-type]
 
 
+def test_roi_warmup_seconds_default_and_validation() -> None:
+    assert RoiConfig().warmup_seconds == 10.0
+    assert RoiConfig(warmup_seconds=2.5).warmup_seconds == 2.5
+    for bad in (0.0, -1.0, float("nan")):
+        with pytest.raises(ValueError, match="warmup_seconds"):
+            RoiConfig(warmup_seconds=bad)
+
+
 def test_negative_lookahead_rejected() -> None:
     with pytest.raises(ValueError):
         EngineConfig(lookahead=-1)

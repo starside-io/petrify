@@ -21,28 +21,37 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import tempfile
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType, TracebackType
+from typing import Any
 
 import cv2
 import numpy as np
 from tqdm import tqdm
 
+from petrify.background.calibrate import CalibratedBackground, frames_for
 from petrify.background.locked import locked_background
+from petrify.background.running import RunningBackground
 from petrify.core.config import PetrifyConfig
 from petrify.core.engine import Engine, EngineStats, FrameTrace
-from petrify.core.plugin import Detector
+from petrify.core.plugin import BackgroundModel, Detector, Sink, Source, Stage
 from petrify.detectors.bgdiff import BackgroundDiffer
 from petrify.detectors.motion import MotionDetector
 from petrify.detectors.person_hog import PersonDetector
 from petrify.encoder import ffmpeg_encode
 from petrify.modes.erase import EraseMode
-from petrify.roi_detect import auto_detect_roi
-from petrify.sinks.file import FileSink
+from petrify.roi_detect import WarmupRoiDetector, auto_detect_roi
+from petrify.sinks.file import FfmpegPipeSink, FileSink
+from petrify.sinks.preview import PreviewSink
+from petrify.sinks.threaded import ThreadedSink
+from petrify.sinks.virtualcam import VirtualCamSink
 from petrify.sources.file import FileSource
-from petrify.stages.roi_overlay import Compositor, RoiOverlay
+from petrify.stages.roi_overlay import Compositor, RoiOverlay, WarmupRoiOverlay
 
 logger = logging.getLogger(__name__)
 
@@ -461,11 +470,20 @@ def run(args: argparse.Namespace) -> None:
 
 @dataclass(frozen=True)
 class RunReport:
-    """Outcome of :func:`run_file`."""
+    """Outcome of :func:`run_file` or :func:`run_stream`.
+
+    ``background_index`` is the locked background's frame index, or None for an
+    online background strategy. ``roi`` is the ROI in use at the end of the run
+    (None when disabled or not found). ``dropped_frames`` counts frames a live
+    source captured but never delivered. ``interrupted`` is True when a live run
+    was ended with Ctrl-C and finished cleanly.
+    """
 
     stats: EngineStats
-    background_index: int
+    background_index: int | None
     roi: tuple[int, int, int, int] | None
+    dropped_frames: int = 0
+    interrupted: bool = False
 
 
 def _resolve_roi(source: FileSource, config: PetrifyConfig) -> tuple[int, int, int, int] | None:
@@ -568,3 +586,314 @@ def run_file(
             stats.failed_closed,
         )
     return RunReport(stats=stats, background_index=bg_idx, roi=roi)
+
+
+# ---------------------------------------------------------------------------
+# Streaming engine runner for any source
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OutputConfig:
+    """Where :func:`run_stream` writes: a video file, a virtual camera, a preview window."""
+
+    file: Path | None = None
+    virtualcam: bool = False
+    virtualcam_device: str | None = None
+    preview: bool = False
+
+    def __post_init__(self) -> None:
+        if self.virtualcam_device is not None and not self.virtualcam:
+            raise ValueError("OutputConfig.virtualcam_device requires virtualcam=True")
+
+    @property
+    def selected(self) -> bool:
+        """True when at least one output is selected."""
+        return self.file is not None or self.virtualcam or self.preview
+
+
+def _build_sinks(source: Source, config: PetrifyConfig, outputs: OutputConfig) -> list[Sink]:
+    """Build the sinks ``outputs`` selects.
+
+    On a live source the file and virtual camera sinks run on their own thread
+    (``ThreadedSink``, which blocks rather than drops for these critical sinks) so a
+    slow encoder does not stall capture. The preview always stays on the calling
+    thread: GUI calls must run there.
+    """
+    info = source.info
+    live = info.live
+    sinks: list[Sink] = []
+    if outputs.file is not None:
+        audio = Path(info.uri) if isinstance(source, FileSource) and info.uri else None
+        pipe = FfmpegPipeSink(
+            outputs.file,
+            config.encode,
+            audio_source=audio,
+            wallclock_timestamps=live,
+        )
+        sinks.append(ThreadedSink(pipe) if live else pipe)
+    if outputs.virtualcam:
+        cam = VirtualCamSink(device=outputs.virtualcam_device)
+        sinks.append(ThreadedSink(cam) if live else cam)
+    if outputs.preview:
+        sinks.append(PreviewSink())
+    return sinks
+
+
+def _background_for(
+    source: Source, config: PetrifyConfig
+) -> tuple[np.ndarray | BackgroundModel, int | None]:
+    """Return the locked image and its index, or an online model and None."""
+    bg_cfg = config.background
+    info = source.info
+    if bg_cfg.strategy == "locked":
+        if not info.seekable or not hasattr(source, "read_frame"):
+            raise ValueError(
+                "The locked background needs a seekable source (a video file or an image "
+                "folder) to pre-scan; live sources need the running or calibrate background"
+            )
+        return locked_background(
+            source,  # type: ignore[arg-type]
+            bg_cfg,
+            config.background_scan_person_config(),
+        )
+    if bg_cfg.strategy == "running":
+        model: BackgroundModel = RunningBackground(
+            bg_cfg.running_window,
+            bg_cfg.running_interval,
+            bg_cfg.running_min_samples,
+            recompute_in_background=info.live,
+        )
+        logger.info(
+            "Background: running median (window=%d interval=%d min_samples=%d)",
+            bg_cfg.running_window,
+            bg_cfg.running_interval,
+            bg_cfg.running_min_samples,
+        )
+        return model, None
+    frames = frames_for(bg_cfg.calibrate_seconds, info.fps)
+    logger.info(
+        "Background: calibrate on the first %d frames (%.1f s); keep the scene empty",
+        frames,
+        bg_cfg.calibrate_seconds,
+    )
+    return CalibratedBackground(frames), None
+
+
+def _roi_stage(source: Source, config: PetrifyConfig) -> RoiOverlay | WarmupRoiOverlay:
+    """Return the ROI stage: manual box, disabled, whole-clip scan, or warmup detection."""
+    roi_cfg = config.roi
+    if roi_cfg.mode != "auto" or (isinstance(source, FileSource) and source.info.seekable):
+        return RoiOverlay(_resolve_roi(source, config))  # type: ignore[arg-type]
+    logger.info("ROI: auto-detect on the first %.1f s, then locked", roi_cfg.warmup_seconds)
+    detector = WarmupRoiDetector(
+        source.info.fps,
+        roi_cfg.warmup_seconds,
+        min_freq=roi_cfg.scan_min_freq,
+        margin=roi_cfg.scan_margin,
+        max_area_frac=roi_cfg.scan_max_area_frac,
+        edge_threshold=roi_cfg.scan_edge_threshold,
+        edge_gap_tolerance=roi_cfg.scan_edge_gap_tolerance,
+        n_edge_samples=roi_cfg.scan_edge_samples,
+    )
+    return WarmupRoiOverlay(detector)
+
+
+class _InterruptGuard:
+    """Defer a Ctrl-C that arrives inside ``Engine.step`` until the step returns.
+
+    An interrupt inside a step would abort the engine and discard the recording, so
+    the first one received there only sets :attr:`pending`; the loop then stops and
+    closes cleanly. An interrupt anywhere else (for example while waiting for the
+    next frame), or a second one, raises ``KeyboardInterrupt`` as usual. With
+    ``enabled=False`` (non-live runs), on a thread other than the main thread, or
+    when a handler other than Python's default is installed, the guard does nothing.
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.in_step = False
+        self.pending = False
+        self._previous: Any = None
+        self._installed = False
+
+    def __enter__(self) -> _InterruptGuard:
+        if (
+            self.enabled
+            and threading.current_thread() is threading.main_thread()
+            and signal.getsignal(signal.SIGINT) is signal.default_int_handler
+        ):
+            self._previous = signal.signal(signal.SIGINT, self._handle)
+            self._installed = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self._installed:
+            signal.signal(signal.SIGINT, self._previous)
+            self._installed = False
+
+    def _handle(self, signum: int, frame: FrameType | None) -> None:
+        if self.in_step and not self.pending:
+            self.pending = True
+            logger.info("Interrupt received: finishing the current frame, then stopping")
+            return
+        raise KeyboardInterrupt
+
+
+def _drive(
+    engine: Engine,
+    source: Source,
+    should_stop: Callable[[], bool],
+) -> tuple[EngineStats, bool]:
+    """Run the engine over the source with the step API; return the stats and ``interrupted``.
+
+    On a live source a ``KeyboardInterrupt`` ends the run: reading stops and the
+    engine is closed normally, so the outputs are finalized. If the interrupt
+    landed inside a step that already aborted the engine, or on a non-live source,
+    it propagates. Any other exception aborts the engine and propagates. The
+    interrupt guard is removed before the close, so a second Ctrl-C there aborts.
+    """
+    live = source.info.live
+    interrupted = False
+    try:
+        engine.open(source.info)
+        with _InterruptGuard(enabled=live) as guard:
+            try:
+                for frame in source:
+                    guard.in_step = True
+                    engine.step(frame)
+                    guard.in_step = False
+                    if guard.pending:
+                        interrupted = True
+                        break
+                    if should_stop():
+                        logger.info("Stop requested; finishing the run")
+                        break
+            except KeyboardInterrupt:
+                if not live or not engine.is_open:
+                    raise
+                interrupted = True
+        if interrupted:
+            logger.info("Interrupted by user; finishing the outputs (Ctrl-C again to abort)")
+        return engine.close(), interrupted
+    except BaseException:
+        engine.abort()
+        raise
+
+
+def run_stream(
+    source: Source,
+    config: PetrifyConfig,
+    outputs: OutputConfig,
+    *,
+    observer: Callable[[FrameTrace], None] | None = None,
+    sinks: Sequence[Sink] | None = None,
+    stop: Callable[[], bool] | None = None,
+) -> RunReport:
+    """Run the streaming engine on any source and write to the selected outputs.
+
+    ``sinks`` replaces the sinks built from ``outputs``. Components are built in
+    the same order as :func:`run_file`: detectors, ROI, background, then the
+    background differ. On a file source with the locked background and whole-clip
+    ROI detection the written frames are exactly the ones :func:`run_file` writes.
+
+    The run stops at the end of the source, when ``stop()`` returns True or a
+    preview window asks to stop (both checked after each frame), or on Ctrl-C for a
+    live source; the lookahead tail is still written and the outputs are
+    finalized. A ``KeyboardInterrupt`` on a non-live source, or any other error,
+    aborts the outputs and propagates. The source is always closed.
+    """
+    try:
+        if sinks is not None:
+            sink_list = list(sinks)
+        else:
+            if not outputs.selected:
+                raise ValueError(
+                    "At least one output is required: a file, the virtual camera, or the preview"
+                )
+            sink_list = _build_sinks(source, config, outputs)
+        if not sink_list:
+            raise ValueError("At least one sink is required")
+        previews = [s for s in sink_list if isinstance(s, PreviewSink)]
+
+        detectors: list[Detector] = []
+        if config.detector in ("motion", "both"):
+            detectors.append(MotionDetector.from_config(config.motion))
+        if config.detector in ("person", "both"):
+            detectors.append(PersonDetector.from_config(config.person))
+        logger.info("Detector mode: %s", config.detector)
+
+        roi_stage = _roi_stage(source, config)
+        background, bg_idx = _background_for(source, config)
+        model_backed = False
+        if config.background_diff is not None:
+            if isinstance(background, np.ndarray):
+                bg_differ = BackgroundDiffer.from_config(background, config.background_diff)
+            else:
+                bg_differ = BackgroundDiffer.from_model(background, config.background_diff)
+                model_backed = True
+            detectors.append(bg_differ)
+            logger.info(
+                "BackgroundDiffer enabled: pixel_threshold=%d area_threshold=%d",
+                bg_differ.pixel_threshold,
+                bg_differ.area_threshold,
+            )
+        mode = EraseMode(background, require_background_diff=model_backed)
+
+        def should_stop() -> bool:
+            if stop is not None and stop():
+                return True
+            return any(p.stop_requested for p in previews)
+
+        with tqdm(
+            total=source.info.frame_count or None,
+            desc="Petrify",
+            unit="fr",
+            dynamic_ncols=True,
+        ) as progress:
+
+            def on_frame(trace: FrameTrace) -> None:
+                progress.update(1)
+                if observer is not None:
+                    observer(trace)
+
+            stages: list[Stage] = [roi_stage]
+            engine = Engine(detectors, mode, stages, sink_list, config.engine, on_frame)
+            stats, interrupted = _drive(engine, source, should_stop)
+        dropped = int(getattr(source, "dropped", 0) or 0)
+    finally:
+        source.close()
+
+    _log_summary(stats, dropped)
+    return RunReport(
+        stats=stats,
+        background_index=bg_idx,
+        roi=roi_stage.roi,
+        dropped_frames=dropped,
+        interrupted=interrupted,
+    )
+
+
+def _log_summary(stats: EngineStats, dropped: int) -> None:
+    """Log one summary line, and a warning when frames failed closed."""
+    logger.info(
+        "Run done: frames=%d frozen=%d pass-through=%d failed-closed=%d (over budget %d) "
+        "source-dropped=%d sink-failures=%d",
+        stats.frames,
+        stats.frozen,
+        stats.passed_through,
+        stats.failed_closed,
+        stats.over_budget,
+        dropped,
+        stats.sink_failures,
+    )
+    if stats.failed_closed > 0:
+        logger.warning(
+            "%d frame(s) failed closed and were written as black frames (%d over budget)",
+            stats.failed_closed,
+            stats.over_budget,
+        )

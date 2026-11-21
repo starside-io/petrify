@@ -23,6 +23,7 @@ from typing import Any
 from unittest import mock
 
 import cv2
+import numpy as np
 
 import petrify.cli
 import petrify.encoder
@@ -368,6 +369,89 @@ def capture_cli_output(
     if not frame_digests:
         raise RuntimeError("Expected at least one composited frame to be written, got none.")
     return frame_digests, output
+
+
+class _RecordingPipe:
+    """Stand-in for FFmpeg's stdin: digests every raw frame written to it."""
+
+    def __init__(self, width: int, height: int, digests: list[str]) -> None:
+        self._shape = (height, width, 3)
+        self._frame_bytes = width * height * 3
+        self._digests = digests
+
+    def write(self, data: Any) -> int:
+        raw = bytes(data)
+        if len(raw) != self._frame_bytes:
+            raise RuntimeError(
+                f"Expected one {self._frame_bytes}-byte frame per write, got {len(raw)} bytes."
+            )
+        frame = np.frombuffer(raw, dtype=np.uint8).reshape(self._shape)
+        self._digests.append(_frame_digest(frame))
+        return len(raw)
+
+    def close(self) -> None:
+        pass
+
+
+class _RecordingPopen:
+    """Stand-in for ``subprocess.Popen`` running FFmpeg: records frames, exits 0.
+
+    The encode "succeeds" by creating the output file FFmpeg was asked to write (the
+    last argument), so the sink can move it into place.
+    """
+
+    def __init__(self, cmd: list[str], digests: list[str], **_kwargs: Any) -> None:
+        width, height = (int(v) for v in cmd[cmd.index("-s") + 1].split("x"))
+        self._target = Path(cmd[-1])
+        self.stdin = _RecordingPipe(width, height, digests)
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is None:
+            self._target.touch()
+            self.returncode = 0
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+def capture_run_cli_output(clip_path: str | Path, extra_argv: Sequence[str] = ()) -> list[str]:
+    """Run ``petrify run --source CLIP --output OUT`` and return a digest per written frame.
+
+    The FFmpeg subprocess of ``FfmpegPipeSink`` is replaced (through the sink's
+    default ``popen``) by a stand-in that digests each raw frame piped to it, after
+    reshaping the bytes to ``(height, width, 3)`` uint8, with ``_frame_digest``.
+    """
+    clip = Path(clip_path)
+    argv = [str(a) for a in extra_argv]
+    frame_digests: list[str] = []
+
+    def popen(cmd: list[str], **kwargs: Any) -> _RecordingPopen:
+        return _RecordingPopen(cmd, frame_digests, **kwargs)
+
+    kwdefaults = petrify.sinks.file.FfmpegPipeSink.__init__.__kwdefaults__
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_out = Path(tmp_dir) / "out.mp4"
+        with (
+            mock.patch.dict(kwdefaults, {"popen": popen}),
+            mock.patch.object(petrify.sinks.file, "find_ffmpeg", return_value="ffmpeg"),
+        ):
+            code = petrify.cli.main(
+                ["run", "--source", str(clip), "--output", str(tmp_out), *argv]
+            )
+        if code != 0:
+            raise RuntimeError(f"Expected petrify run to exit 0, got {code}.")
+
+    if not frame_digests:
+        raise RuntimeError("Expected at least one frame to be piped to FFmpeg, got none.")
+    return frame_digests
 
 
 def _encode_bits(values: Sequence[bool]) -> str:

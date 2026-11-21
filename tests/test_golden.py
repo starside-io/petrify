@@ -22,6 +22,7 @@ from tests.golden.harness import (
     capture_cli_output,
     capture_engine,
     capture_legacy,
+    capture_run_cli_output,
 )
 
 Producer = Callable[[Path, Sequence[str]], GoldenRecord]
@@ -89,5 +90,26 @@ def test_cli_matches_golden(case: GoldenCase) -> None:
     diffs.extend(_compare_frames(DIGEST_FIELD, frame_digests, expected.frame_digests))
     if diffs:
         lines = [f"CLI golden mismatch for case {case.case_id!r}:"]
+        lines.extend(f"  - {d}" for d in diffs)
+        pytest.fail("\n".join(lines), pytrace=False)
+
+
+# ``petrify run`` takes --lookahead where the file form takes --gap-fill (same
+# meaning); every other flag of these cases is accepted unchanged.
+_RUN_FLAG_RENAMES = {"--gap-fill": "--lookahead"}
+
+
+def _run_argv(argv: Sequence[str]) -> tuple[str, ...]:
+    return tuple(_RUN_FLAG_RENAMES.get(a, a) for a in argv)
+
+
+@pytest.mark.golden
+@pytest.mark.parametrize("case", CLI_CASES, ids=[c.case_id for c in CLI_CASES])
+def test_run_cli_matches_golden(case: GoldenCase) -> None:
+    expected = _load_checked_fixture(case)
+    frame_digests = capture_run_cli_output(case.clip_path, _run_argv(case.argv))
+    diffs = _compare_frames(DIGEST_FIELD, frame_digests, expected.frame_digests)
+    if diffs:
+        lines = [f"petrify run golden mismatch for case {case.case_id!r}:"]
         lines.extend(f"  - {d}" for d in diffs)
         pytest.fail("\n".join(lines), pytrace=False)

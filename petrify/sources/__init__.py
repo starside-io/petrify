@@ -14,10 +14,101 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-"""Frame sources."""
+"""Frame sources, and :func:`open_source` to pick one from a command-line spec."""
 
 from __future__ import annotations
 
-from petrify.sources.file import FileSource
+import re
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Literal
 
-__all__ = ["FileSource"]
+from petrify.core.plugin import Source
+from petrify.sources.camera import CameraSource
+from petrify.sources.file import FileSource
+from petrify.sources.images import ImageFolderSource
+from petrify.sources.push import PushSession
+from petrify.sources.stream import StreamSource, redact_url
+
+__all__ = [
+    "CameraSource",
+    "FileSource",
+    "ImageFolderSource",
+    "PushSession",
+    "SourceKind",
+    "StreamSource",
+    "open_source",
+    "source_kind",
+]
+
+SourceKind = Literal["camera", "stream", "images", "file"]
+
+STREAM_SCHEMES = ("rtsp", "rtsps", "http", "https")
+
+_CAMERA = re.compile(r"camera:([0-9]+)")
+_URL_SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://")
+_GLOB_CHARS = ("*", "?", "[")
+
+
+def source_kind(spec: str) -> SourceKind:
+    """Classify a source spec without opening anything.
+
+    ``camera:N`` (N a non-negative integer) is a webcam; ``rtsp``, ``rtsps``,
+    ``http`` and ``https`` URLs are network streams; an existing directory, or a
+    string with glob characters that is not an existing file, is an image folder;
+    anything else is a video file path. A bare integer is a file path, never a
+    camera index.
+
+    Raises ``ValueError`` for a malformed ``camera:`` spec or a URL whose scheme
+    is not supported; the message holds only the redacted URL.
+    """
+    if spec.startswith("camera:"):
+        if _CAMERA.fullmatch(spec) is None:
+            raise ValueError(
+                f"Invalid camera source {spec!r}: use camera:N with N a non-negative integer"
+            )
+        return "camera"
+    scheme = _URL_SCHEME.match(spec.strip())
+    if scheme is not None:
+        if scheme.group(1).lower() in STREAM_SCHEMES:
+            return "stream"
+        raise ValueError(
+            f"Unsupported stream URL {redact_url(spec)}: supported schemes are "
+            + ", ".join(STREAM_SCHEMES)
+        )
+    path = Path(spec)
+    if path.is_dir():
+        return "images"
+    if any(ch in spec for ch in _GLOB_CHARS) and not path.is_file():
+        return "images"
+    return "file"
+
+
+def open_source(
+    spec: str,
+    *,
+    fps: float | None = None,
+    capture_factory: Callable[[Any], Any] | None = None,
+) -> Source:
+    """Open the source a spec names (see :func:`source_kind` for the forms).
+
+    ``fps`` sets the frame rate of an image folder (default 25). ``capture_factory``
+    replaces ``cv2.VideoCapture`` for the live sources (tests). A missing video
+    file raises ``FileNotFoundError``; for a bare integer the message suggests
+    ``camera:N``. No error message holds an unredacted URL.
+    """
+    kind = source_kind(spec)
+    live_kwargs: dict[str, Any] = {}
+    if capture_factory is not None:
+        live_kwargs["capture_factory"] = capture_factory
+    if kind == "camera":
+        return CameraSource(int(spec.partition(":")[2]), **live_kwargs)
+    if kind == "stream":
+        return StreamSource(spec, **live_kwargs)
+    if kind == "images":
+        return ImageFolderSource(spec) if fps is None else ImageFolderSource(spec, fps=fps)
+    if spec.strip().isdigit() and not Path(spec).exists():
+        raise FileNotFoundError(
+            f"Input file not found: {spec} (for a webcam, use camera:{spec.strip()})"
+        )
+    return FileSource(spec)
