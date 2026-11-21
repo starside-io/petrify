@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import logging
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import numpy as np
 import pytest
 
-from petrify.core import FrameMeta, Sink, SourceInfo
+from petrify.core import (
+    DetectionKind,
+    Detections,
+    Engine,
+    EngineConfig,
+    Frame,
+    FrameMeta,
+    Sink,
+    SourceInfo,
+)
 from petrify.sinks import ThreadedSink
 
 INFO = SourceInfo(fps=10.0, width=4, height=2, frame_count=None, seekable=False, live=True)
@@ -277,4 +287,377 @@ def test_threaded_non_critical_sink_dropped_by_engine() -> None:
     assert [i for i, _ in recording.written] == list(range(50))
     assert recording.events == ["open", "close"]
     assert preview_inner.events == ["open", "abort"]
+    assert stats.sink_failures == 1
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-8a)
+# ---------------------------------------------------------------------------
+
+SHORT = 0.01  # A join or write timeout that is certain to expire: the fake is blocked on an event.
+
+
+class OverlapSink:
+    """Records every call; ``write`` blocks on ``release``. Flags any two overlapping calls."""
+
+    def __init__(self, *, critical: bool = False) -> None:
+        self.critical = critical
+        self.release = threading.Event()
+        self.entered = threading.Event()
+        self.calls: list[str] = []
+        self.overlap = False
+        self._lock = threading.Lock()
+        self._active = 0
+
+    def _enter(self, name: str) -> None:
+        with self._lock:
+            self._active += 1
+            if self._active > 1:
+                self.overlap = True
+            self.calls.append(name)
+
+    def _leave(self) -> None:
+        with self._lock:
+            self._active -= 1
+
+    def open(self, info: SourceInfo) -> None:
+        self._enter("open")
+        self._leave()
+
+    def write(self, image: np.ndarray, meta: FrameMeta) -> None:
+        self._enter("write")
+        try:
+            self.entered.set()
+            assert self.release.wait(WAIT)
+        finally:
+            self._leave()
+
+    def close(self) -> None:
+        self._enter("close")
+        self._leave()
+
+    def abort(self) -> None:
+        self._enter("abort")
+        self._leave()
+
+
+class _MotionDetector:
+    provides = frozenset({DetectionKind.MOTION})
+    stateful = False
+
+    def detect(self, frame: Frame) -> Detections:
+        return Detections(motion=False)
+
+    def reset(self) -> None:
+        pass
+
+
+class _BlackMode:
+    name = "black"
+    requires = frozenset({DetectionKind.MOTION})
+
+    def render(self, frame: Frame, detections: Detections, present: bool) -> np.ndarray:
+        return np.zeros_like(frame.image)
+
+
+def _black_engine(sinks: list[Sink]) -> Engine:
+    return Engine([_MotionDetector()], _BlackMode(), [], sinks, EngineConfig(lookahead=0))
+
+
+def _frame(i: int) -> Frame:
+    return Frame(image=_image(i), index=i, timestamp=0.0, source=INFO)
+
+
+def _join_worker(sink: ThreadedSink) -> None:
+    assert sink._thread is not None
+    sink._thread.join(WAIT)
+    assert not sink._thread.is_alive()
+
+
+def test_t1_abort_timeout_hands_abort_to_worker(caplog: pytest.LogCaptureFixture) -> None:
+    inner = OverlapSink()
+    sink = ThreadedSink(inner, max_queue=4, join_timeout=SHORT)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    assert inner.entered.wait(WAIT)
+    with caplog.at_level(logging.WARNING, logger="petrify.sinks.threaded"):
+        sink.abort()  # The worker is stuck inside write: abort must not run concurrently.
+    assert "abort" not in inner.calls
+    assert any("still running" in r.getMessage() for r in caplog.records)
+    inner.release.set()
+    _join_worker(sink)
+    sink.abort()
+    sink.close()
+    assert inner.calls == ["open", "write", "abort"]
+    assert not inner.overlap
+
+
+def test_t1_close_timeout_hands_abort_to_worker() -> None:
+    inner = OverlapSink(critical=True)
+    sink = ThreadedSink(inner, max_queue=4, join_timeout=SHORT)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    sink.write(_image(1), _meta(1))
+    assert inner.entered.wait(WAIT)
+    with pytest.raises(TimeoutError):
+        sink.close()
+    assert "abort" not in inner.calls
+    inner.release.set()
+    _join_worker(sink)
+    sink.close()
+    sink.abort()
+    assert inner.calls == ["open", "write", "abort"]  # Frame 1 was discarded, not written.
+    assert not inner.overlap
+
+
+def test_t2_blocked_write_times_out() -> None:
+    inner = GatedSink(gated=True, critical=True)
+    sink = ThreadedSink(inner, max_queue=1, write_timeout=SHORT)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    _wait_entered(inner)
+    sink.write(_image(1), _meta(1))  # Fills the queue.
+    with pytest.raises(TimeoutError, match="blocked"):
+        sink.write(_image(2), _meta(2))
+    inner.gate.set()
+    sink.close()
+    assert [i for i, _ in inner.written] == [0, 1]
+    assert sink.dropped == 0
+
+
+def test_t2_write_timeout_none_and_validation() -> None:
+    with pytest.raises(ValueError, match="write_timeout"):
+        ThreadedSink(GatedSink(), write_timeout=0.0)
+    inner = GatedSink(gated=True)
+    sink = ThreadedSink(inner, max_queue=1, drop_when_full=False, write_timeout=None)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    _wait_entered(inner)
+    sink.write(_image(1), _meta(1))
+    returned = threading.Event()
+
+    def writer() -> None:
+        sink.write(_image(2), _meta(2))
+        returned.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    assert not returned.wait(0.02)  # Unbounded wait: still blocked.
+    inner.gate.set()
+    assert returned.wait(WAIT)
+    thread.join(WAIT)
+    assert not thread.is_alive()
+    sink.close()
+    assert [i for i, _ in inner.written] == [0, 1, 2]
+
+
+def test_t2_engine_drops_stuck_non_critical_block_mode_sink() -> None:
+    recording = GatedSink(critical=True)
+    stuck = OverlapSink()
+    preview = ThreadedSink(
+        stuck, max_queue=1, drop_when_full=False, join_timeout=SHORT, write_timeout=SHORT
+    )
+    engine = _black_engine([recording, preview])
+    engine.open(INFO)
+    for i in range(5):
+        engine.step(_frame(i))
+    stats = engine.close()
+    assert [i for i, _ in recording.written] == list(range(5))
+    assert recording.events == ["open", "close"]
+    assert stats.sink_failures == 1
+    stuck.release.set()
+    _join_worker(preview)
+    assert stuck.calls == ["open", "write", "abort"]
+    assert not stuck.overlap
+
+
+def test_t3_critical_sink_blocks_by_default() -> None:
+    inner = GatedSink(gated=True, critical=True)
+    sink = ThreadedSink(inner, max_queue=1, write_timeout=SHORT)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    _wait_entered(inner)
+    sink.write(_image(1), _meta(1))
+    with pytest.raises(TimeoutError):
+        sink.write(_image(2), _meta(2))  # Blocks (then times out) instead of dropping.
+    assert sink.dropped == 0
+    inner.gate.set()
+    sink.close()
+    assert [i for i, _ in inner.written] == [0, 1]
+
+
+def test_t3_non_critical_sink_drops_by_default() -> None:
+    inner = GatedSink(gated=True)
+    sink = ThreadedSink(inner, max_queue=1)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    _wait_entered(inner)
+    sink.write(_image(1), _meta(1))
+    sink.write(_image(2), _meta(2))
+    assert sink.dropped == 1
+    inner.gate.set()
+    sink.close()
+    assert [i for i, _ in inner.written] == [0, 2]
+
+
+def test_t3_drop_mode_rejected_for_critical_sink() -> None:
+    with pytest.raises(ValueError, match="critical"):
+        ThreadedSink(GatedSink(critical=True), drop_when_full=True)
+    ThreadedSink(GatedSink(critical=True), drop_when_full=False)
+
+
+class _RaceProbe(ThreadedSink):
+    """Before the fix, close and abort read ``_done`` and then set it, outside the lock.
+
+    Once armed, the first two reads wait for each other, forcing that interleaving.
+    The fixed sink does not use ``_done``, so there the probe is inert.
+    """
+
+    def __init__(self, sink: Sink) -> None:
+        self._probe = threading.Barrier(2)
+        self._probe_reads = 0
+        self._probe_lock = threading.Lock()
+        self._done_value = False
+        self.armed = False
+        super().__init__(sink, max_queue=4)
+
+    @property
+    def _done(self) -> bool:
+        with self._probe_lock:
+            if self.armed:
+                self._probe_reads += 1
+            wait = self.armed and self._probe_reads <= 2
+            value = self._done_value
+        if wait:
+            try:
+                self._probe.wait(WAIT)
+            except threading.BrokenBarrierError:
+                pass
+        return value
+
+    @_done.setter
+    def _done(self, value: bool) -> None:
+        self._done_value = value
+
+
+def _close_and_abort_concurrently(sink: ThreadedSink) -> list[BaseException]:
+    errors: list[BaseException] = []
+    start = threading.Barrier(2)
+
+    def call(fn: Callable[[], None]) -> None:
+        start.wait(WAIT)
+        try:
+            fn()
+        except BaseException as exc:  # Recorded and asserted on by the caller.
+            errors.append(exc)
+
+    threads = [threading.Thread(target=call, args=(f,)) for f in (sink.close, sink.abort)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(WAIT)
+        assert not thread.is_alive()
+    return errors
+
+
+def test_t4_close_abort_race_forced_interleaving() -> None:
+    inner = GatedSink()
+    sink = _RaceProbe(inner)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    sink.armed = True
+    assert _close_and_abort_concurrently(sink) == []
+    assert inner.events in (["open", "close"], ["open", "abort"])
+
+
+def test_t4_close_abort_race_exactly_one_terminal_call() -> None:
+    for _ in range(50):
+        inner = GatedSink()
+        sink = ThreadedSink(inner, max_queue=4)
+        sink.open(INFO)
+        sink.write(_image(0), _meta(0))
+        assert _close_and_abort_concurrently(sink) == []
+        assert inner.events in (["open", "close"], ["open", "abort"])
+
+
+def test_t5_reopen_after_close_and_after_abort() -> None:
+    inner = GatedSink(gated=True)
+    sink = ThreadedSink(inner, max_queue=1)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    _wait_entered(inner)
+    sink.write(_image(1), _meta(1))
+    sink.write(_image(2), _meta(2))
+    assert sink.dropped == 1
+    inner.gate.set()
+    sink.close()
+    assert [i for i, _ in inner.written] == [0, 2]
+    sink.open(INFO)
+    assert sink.dropped == 0
+    sink.abort()
+    sink.open(INFO)
+    sink.write(_image(4), _meta(4))
+    sink.close()
+    assert inner.events == ["open", "close", "open", "abort", "open", "close"]
+    assert [i for i, _ in inner.written] == [0, 2, 4]
+
+
+def test_t5_open_while_open_raises() -> None:
+    inner = GatedSink()
+    sink = ThreadedSink(inner)
+    sink.open(INFO)
+    with pytest.raises(RuntimeError, match="already open"):
+        sink.open(INFO)
+    sink.close()
+    assert inner.events == ["open", "close"]
+
+
+def test_t5_engine_reuse_keeps_non_critical_threaded_sink() -> None:
+    inner = GatedSink()
+    preview = ThreadedSink(inner, max_queue=64)
+    engine = _black_engine([preview])
+    for _ in range(2):
+        engine.open(INFO)
+        for i in range(3):
+            engine.step(_frame(i))
+        stats = engine.close()
+        assert stats.sink_failures == 0
+    assert inner.events == ["open", "close", "open", "close"]
+    assert [i for i, _ in inner.written] == [0, 1, 2, 0, 1, 2]
+
+
+class _Fatal(BaseException):
+    """A non-Exception error raised by the wrapped sink."""
+
+
+class _FatalSink(GatedSink):
+    def write(self, image: np.ndarray, meta: FrameMeta) -> None:
+        raise _Fatal("fatal")
+
+
+def test_t6_base_exception_in_worker_surfaces_as_runtime_error() -> None:
+    inner = _FatalSink()
+    sink = ThreadedSink(inner, max_queue=4)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    _join_worker(sink)
+    with pytest.raises(RuntimeError) as info:
+        sink.write(_image(1), _meta(1))
+    assert isinstance(info.value.__cause__, _Fatal)
+    with pytest.raises(RuntimeError):
+        sink.close()
+    assert inner.events == ["open", "abort"]
+
+
+def test_t6_engine_drops_non_critical_sink_on_worker_base_exception() -> None:
+    recording, inner = GatedSink(critical=True), _FatalSink()
+    preview = ThreadedSink(inner, max_queue=1, drop_when_full=False)
+    engine = _black_engine([recording, preview])
+    engine.open(INFO)
+    for i in range(20):
+        engine.step(_frame(i))
+    stats = engine.close()
+    assert [i for i, _ in recording.written] == list(range(20))
+    assert recording.events == ["open", "close"]
+    assert inner.events == ["open", "abort"]
     assert stats.sink_failures == 1

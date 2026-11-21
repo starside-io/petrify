@@ -74,8 +74,7 @@ class PushSession:
             uri="push",
         )
         self._shape = (height, width, 3)
-        # Engine exposes no public lookahead accessor; read it from its config.
-        self._delay = int(engine._config.lookahead)
+        self._delay = int(engine.config.lookahead)
         self._next_index = 0
         self._last_timestamp: float | None = None
         self._stats: EngineStats | None = None

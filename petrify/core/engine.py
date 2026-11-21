@@ -21,7 +21,8 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -122,6 +123,7 @@ class LookaheadBuffer(Generic[T]):
 
 
 _MAX_LOGGED_FAILURES = 5
+_SUMMARY_EVERY = 100  # After the first few, one summary line per this many fail-closed frames.
 
 
 @dataclass(frozen=True)
@@ -197,12 +199,30 @@ class Engine:
     Fail closed: a detector, mode, or stage error replaces that frame with a black
     image, and so does exceeding ``config.frame_budget_ms`` (detection plus render
     time, measured with ``clock``). The budget is checked after the fact: a running
-    detector or mode is never interrupted.
+    detector or mode is never interrupted. A detection overrun is known before the
+    frame enters the lookahead buffer, so it counts as a subject and freezes its
+    neighbors. A frame that goes over budget only during render is blacked without
+    freezing its neighbors: its raw decision was already pushed. Construction
+    raises ``ValueError`` when the mode requires detections and no detector
+    provides any of them, since every frame would otherwise pass through.
 
     A failure of a critical sink, of the observer, or any ``BaseException`` aborts
     the engine (every active sink aborted, pending frames discarded) and propagates.
     A non-critical sink that fails is aborted and dropped while the run continues;
     if no sink is left the engine aborts and raises.
+
+    Buffer ownership: the engine keeps a reference to each frame's image while the
+    frame waits in the lookahead buffer, and on a pass-through frame it may hand
+    that same array to the sinks and return it in :class:`Output`. A source must
+    therefore not modify or reuse an image array after yielding it (the built-in
+    sources and ``PushSession`` already copy). The engine does not copy.
+
+    Threading: the engine is single-threaded and not thread-safe; drive it from one
+    thread. Separately, it is not re-entrant: :meth:`open`, :meth:`step`,
+    :meth:`flush`, :meth:`close` and :meth:`run` raise ``RuntimeError`` when called
+    (for example by a sink, a stage, or the observer) while one of them is running.
+    :meth:`abort` may be called re-entrantly: no sink receives a write after it, and
+    the call it interrupted raises ``RuntimeError``.
     """
 
     def __init__(
@@ -216,6 +236,12 @@ class Engine:
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self._detectors = tuple(d for d in detectors if d.provides & mode.requires)
+        if mode.requires and not self._detectors:
+            required = ", ".join(sorted(kind.value for kind in mode.requires))
+            raise ValueError(
+                f"Mode {mode.name!r} requires {required} but no detector provides any of "
+                "them; every frame would pass through unprocessed"
+            )
         self._mode = mode
         self._stages = tuple(stages)
         self._sinks = tuple(sinks)
@@ -229,6 +255,13 @@ class Engine:
         self._buffer: LookaheadBuffer[_Pending] | None = None
         self._flushed = False
         self._active: list[Sink] = []
+        self._busy: str | None = None  # Name of the public call in progress.
+        self._aborted_in_call = False  # abort() ran during that call.
+
+    @property
+    def config(self) -> EngineConfig:
+        """The configuration this engine was built with (read-only)."""
+        return self._config
 
     @property
     def detectors(self) -> tuple[Detector, ...]:
@@ -248,8 +281,13 @@ class Engine:
         """Reset the detectors, create the lookahead buffer, and open every sink.
 
         Raises ``RuntimeError`` if the engine is already open. On failure every
-        opened sink is aborted, the engine stays closed, and the error propagates.
+        opened sink, and a critical sink that failed to open, is aborted once, the
+        engine stays closed, and the error propagates.
         """
+        with self._call("open"):
+            self._open(info)
+
+    def _open(self, info: SourceInfo) -> None:
         if self._buffer is not None:
             raise RuntimeError("Engine is already open; close or abort it first")
         self._stats = EngineStats()
@@ -268,10 +306,14 @@ class Engine:
                     sink.open(info)
                 except Exception as exc:
                     if sink.critical:
+                        # abort() is safe after a failed open: abort this one too.
+                        self._active.insert(0, sink)
                         raise
                     self._drop_sink(sink, "open", exc)
+                    self._check_not_aborted()
                     continue
                 self._active.append(sink)
+                self._check_not_aborted()
             self._require_some_sink()
         except BaseException:
             self.abort()
@@ -283,9 +325,14 @@ class Engine:
         Returns an empty list while the lookahead buffer fills. On failure the
         engine is aborted and the error propagates.
         """
+        with self._call("step"):
+            return self._step(frame)
+
+    def _step(self, frame: Frame) -> list[Output]:
         buffer = self._require_streaming("step")
         try:
             pending = self._detect(frame)
+            self._check_not_aborted()
             raw = (
                 pending.detect_failed
                 or pending.over_budget
@@ -302,6 +349,10 @@ class Engine:
         Returns the tail outputs, in order. After this only :meth:`close` or
         :meth:`abort` may be called. On failure the engine is aborted.
         """
+        with self._call("flush"):
+            return self._flush()
+
+    def _flush(self) -> list[Output]:
         buffer = self._require_streaming("flush")
         self._flushed = True
         try:
@@ -315,13 +366,17 @@ class Engine:
 
         Callers that need the tail outputs call :meth:`flush` first; otherwise the
         tail is still written to the sinks but its outputs are not returned. On
-        failure of a critical sink the remaining sinks are aborted and the error
-        propagates.
+        failure of a critical sink that sink and the remaining sinks are aborted and
+        the error propagates.
         """
+        with self._call("close"):
+            return self._close()
+
+    def _close(self) -> EngineStats:
         if self._buffer is None:
             raise RuntimeError("Engine is not open")
         if not self._flushed:
-            self.flush()
+            self._flush()
         try:
             closed = 0
             while self._active:
@@ -330,6 +385,8 @@ class Engine:
                     sink.close()
                 except Exception as exc:
                     if sink.critical:
+                        # Abort it along with the remaining sinks.
+                        self._active.insert(0, sink)
                         raise
                     self._stats.sink_failures += 1
                     logger.warning(
@@ -338,8 +395,10 @@ class Engine:
                         exc,
                     )
                     _abort_all([sink])
+                    self._check_not_aborted()
                     continue
                 closed += 1
+                self._check_not_aborted()
             if self._sinks and closed == 0:
                 raise RuntimeError("Every sink failed; no output was written")
         except BaseException:
@@ -357,8 +416,12 @@ class Engine:
     def abort(self) -> None:
         """Abort every active sink and discard pending frames. Idempotent.
 
-        Safe to call at any time, including after a failed :meth:`open`.
+        Safe to call at any time, including after a failed :meth:`open`, and from
+        inside another engine call (a sink, a stage, or the observer): that call
+        then writes nothing more and raises ``RuntimeError``.
         """
+        if self._busy is not None:
+            self._aborted_in_call = True
         sinks, self._active = self._active, []
         self._buffer = None
         _abort_all(sinks)
@@ -369,6 +432,7 @@ class Engine:
         On any exception (``KeyboardInterrupt`` included) the engine is aborted and
         the exception propagates. The source is not closed.
         """
+        self._reject_reentry("run")  # Before the try: must not abort the outer call.
         try:
             self.open(source.info)
             for frame in source:
@@ -381,6 +445,31 @@ class Engine:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    @contextmanager
+    def _call(self, what: str) -> Iterator[None]:
+        """Mark a public call in progress; reject a re-entrant one."""
+        self._reject_reentry(what)
+        self._busy = what
+        self._aborted_in_call = False
+        try:
+            yield
+        finally:
+            self._busy = None
+            self._aborted_in_call = False
+
+    def _reject_reentry(self, what: str) -> None:
+        """Raise when ``what`` is called while another engine call is running."""
+        if self._busy is not None:
+            raise RuntimeError(
+                f"Engine.{what}() called re-entrantly during Engine.{self._busy}(); "
+                "the engine is not re-entrant"
+            )
+
+    def _check_not_aborted(self) -> None:
+        """Raise when :meth:`abort` was called from inside the current call."""
+        if self._aborted_in_call:
+            raise RuntimeError(f"Engine was aborted during Engine.{self._busy}()")
 
     def _require_streaming(self, what: str) -> LookaheadBuffer[_Pending]:
         """Return the buffer, or raise if the engine cannot accept ``what`` now."""
@@ -481,6 +570,13 @@ class Engine:
             stats.failed_closed += 1
             if over:
                 stats.over_budget += 1
+            beyond = stats.failed_closed - _MAX_LOGGED_FAILURES
+            if beyond > 0 and beyond % _SUMMARY_EVERY == 0:
+                logger.warning(
+                    "%d frames failed closed so far (%d over budget)",
+                    stats.failed_closed,
+                    stats.over_budget,
+                )
         elif decision.final:
             stats.frozen += 1
         else:
@@ -495,11 +591,13 @@ class Engine:
         )
         if self._observer is not None:
             self._observer(trace)
+            self._check_not_aborted()
         return Output(image=image, meta=meta, trace=trace)
 
     def _write(self, image: np.ndarray, meta: FrameMeta) -> None:
         """Write to every active sink; drop a failing non-critical sink, raise for a critical one."""
         for sink in tuple(self._active):
+            self._check_not_aborted()
             try:
                 sink.write(image, meta)
             except Exception as exc:
@@ -507,6 +605,7 @@ class Engine:
                     raise
                 self._active.remove(sink)
                 self._drop_sink(sink, "write", exc)
+        self._check_not_aborted()
         self._require_some_sink()
 
     def _log_failure(self, index: int, where: str, exc: Exception) -> None:

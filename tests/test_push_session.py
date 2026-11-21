@@ -452,6 +452,18 @@ def test_info_and_delay() -> None:
     session.abort()
 
 
+def test_e6_delay_read_from_public_engine_config() -> None:
+    class ConfigEngine(Engine):
+        @property
+        def config(self) -> EngineConfig:
+            return EngineConfig(lookahead=7)
+
+    engine = ConfigEngine([FakeDetector()], FakeMode(), [], [], EngineConfig(lookahead=0))
+    session = PushSession(engine, W, H, FPS)
+    assert session.delay == 7  # Taken from the public accessor, not the private attribute.
+    session.abort()
+
+
 def test_default_fps() -> None:
     session = PushSession(_engine(), W, H)
     assert session.info.fps == 30.0

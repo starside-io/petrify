@@ -47,7 +47,13 @@ class FrameMeta:
 
 @dataclass(frozen=True, eq=False)
 class Frame:
-    """One decoded frame: BGR uint8 image (H x W x 3) plus its position in the stream."""
+    """One decoded frame: BGR uint8 image (H x W x 3) plus its position in the stream.
+
+    Ownership: the engine keeps a reference to ``image`` while the frame waits in
+    its lookahead buffer, and on a pass-through frame it may hand that same array
+    to sinks and callers. A source must therefore not modify or reuse an image
+    array after yielding it; the built-in sources and ``PushSession`` already copy.
+    """
 
     image: np.ndarray
     index: int  # 0-based position in the stream.

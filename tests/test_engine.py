@@ -326,7 +326,7 @@ def test_sink_open_error_aborts_only_opened_sinks() -> None:
     with pytest.raises(OSError, match="cannot open"):
         _run(3, [FakeDetector()], sinks=[good, bad, never])
     assert good.events == ["open", "abort"]
-    assert bad.events == []
+    assert bad.events == ["abort"]  # The failing sink is aborted too (safe after a failed open).
     assert never.events == []
 
 
@@ -447,7 +447,7 @@ def test_close_error_aborts_remaining_sinks_and_propagates() -> None:
     first, second = BadClose(), FakeSink()
     with pytest.raises(OSError, match="cannot close"):
         _run(3, [FakeDetector()], sinks=[first, second])
-    assert first.events == ["open", "close"]
+    assert first.events == ["open", "close", "abort"]
     assert second.events == ["open", "abort"]
 
 
@@ -659,7 +659,7 @@ def test_failed_open_leaves_engine_closed_and_abort_safe() -> None:
     assert not engine.is_open
     engine.abort()
     assert good.events == ["open", "abort"]
-    assert bad.events == []
+    assert bad.events == ["abort"]
 
 
 def test_step_error_aborts_engine() -> None:
@@ -940,3 +940,211 @@ def test_no_budget_disables_the_check() -> None:
     )
     assert stats.over_budget == 0 and stats.failed_closed == 0
     assert not any(t.failed_closed for t in traces)
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (P2-8a)
+# ---------------------------------------------------------------------------
+
+
+def test_e1_no_detector_for_required_mode_rejected() -> None:
+    with pytest.raises(ValueError, match="fake.*requires"):
+        Engine([], FakeMode(), [], [FakeSink()], EngineConfig(lookahead=0))
+
+
+def test_e1_no_matching_detector_for_required_mode_rejected() -> None:
+    persons = FakeDetector(kind=DetectionKind.PERSONS)
+    with pytest.raises(ValueError, match="motion"):
+        Engine([persons], FakeMode(), [], [FakeSink()], EngineConfig(lookahead=0))
+
+
+def test_e1_mode_without_requirements_allows_no_detector() -> None:
+    class NoNeeds(FakeMode):
+        requires: ClassVar[frozenset[DetectionKind]] = frozenset()
+
+    sink = FakeSink()
+    engine = Engine([], NoNeeds(), [], [sink], EngineConfig(lookahead=0, cold_start_frames=0))
+    stats = engine.run(FakeSource(3))
+    assert engine.detectors == ()
+    assert stats.frames == 3 and stats.failed_closed == 0
+    assert [i for i, _ in sink.written] == [0, 1, 2]
+
+
+class _BadOpenSink(FakeSink):
+    def open(self, info: SourceInfo) -> None:
+        raise OSError("cannot open")
+
+
+def test_e2_failing_critical_open_aborts_it_and_the_others_once() -> None:
+    good, bad, never = FakeSink(), _BadOpenSink(), FakeSink(critical=False)
+    engine = _engine([FakeDetector()], [good, bad, never])
+    with pytest.raises(OSError, match="cannot open"):
+        engine.open(INFO)
+    assert not engine.is_open
+    engine.abort()
+    assert bad.events == ["abort"]
+    assert good.events == ["open", "abort"]
+    assert never.events == []
+
+
+def test_e3_failing_critical_close_is_aborted_once() -> None:
+    class BadClose(FakeSink):
+        def close(self) -> None:
+            self.events.append("close")
+            raise OSError("cannot close")
+
+    first, second = BadClose(), FakeSink(critical=False)
+    engine = _engine([FakeDetector()], [first, second])
+    with pytest.raises(OSError, match="cannot close"):
+        engine.run(FakeSource(3))
+    engine.abort()
+    assert first.events == ["open", "close", "abort"]
+    assert second.events == ["open", "abort"]
+
+
+def test_e4_step_from_observer_rejected_without_interleaving() -> None:
+    sink = FakeSink()
+    inner_errors: list[BaseException] = []
+    holder: list[Engine] = []
+
+    def observer(trace: FrameTrace) -> None:
+        try:
+            holder[0].step(_frame(100 + trace.index))
+        except RuntimeError as exc:
+            inner_errors.append(exc)
+            raise
+
+    engine = _engine([FakeDetector()], [sink], observer=observer)
+    holder.append(engine)
+    engine.open(INFO)
+    with pytest.raises(RuntimeError, match="re-entrant"):
+        engine.step(_frame(0))
+    assert len(inner_errors) == 1
+    assert [i for i, _ in sink.written] == [0]
+    assert sink.events == ["open", "abort"]
+
+
+def test_e4_reentrant_calls_from_sink_rejected() -> None:
+    class Reentrant(FakeSink):
+        def __init__(self, call: str) -> None:
+            super().__init__(critical=False)
+            self.call = call
+            self.errors: list[str] = []
+
+        def write(self, image: np.ndarray, meta: FrameMeta) -> None:
+            super().write(image, meta)
+            try:
+                if self.call == "open":
+                    holder[0].open(INFO)
+                elif self.call == "step":
+                    holder[0].step(_frame(50))
+                elif self.call == "flush":
+                    holder[0].flush()
+                elif self.call == "run":
+                    holder[0].run(FakeSource(1))
+                else:
+                    holder[0].close()
+            except RuntimeError as exc:
+                self.errors.append(str(exc))
+
+    for call in ("open", "step", "flush", "close", "run"):
+        holder: list[Engine] = []
+        reentrant, recording = Reentrant(call), FakeSink()
+        engine = _engine([FakeDetector()], [reentrant, recording], lookahead=1)
+        holder.append(engine)
+        engine.open(INFO)
+        for i in range(3):
+            engine.step(_frame(i))
+        stats = engine.close()
+        assert len(reentrant.errors) == 3, call
+        assert all("re-entrant" in e for e in reentrant.errors), call
+        assert [i for i, _ in recording.written] == [0, 1, 2], call
+        assert [i for i, _ in reentrant.written] == [0, 1, 2], call
+        assert recording.events == ["open", "close"], call
+        assert stats.frames == 3
+
+
+def test_e4_abort_from_sink_stops_writes_and_raises() -> None:
+    holder: list[Engine] = []
+
+    class Aborting(FakeSink):
+        def write(self, image: np.ndarray, meta: FrameMeta) -> None:
+            super().write(image, meta)
+            if meta.index == 1:
+                holder[0].abort()
+
+    first, aborting, last = FakeSink(), Aborting(critical=False), FakeSink(critical=False)
+    engine = _engine([FakeDetector()], [first, aborting, last], lookahead=2)
+    holder.append(engine)
+    engine.open(INFO)
+    for i in range(3):
+        engine.step(_frame(i))
+    with pytest.raises(RuntimeError, match="aborted during"):
+        engine.flush()  # Releases frames 1 and 2; the abort lands while writing frame 1.
+    assert not engine.is_open
+    assert [i for i, _ in first.written] == [0, 1]
+    assert [i for i, _ in aborting.written] == [0, 1]
+    assert [i for i, _ in last.written] == [0]
+    for sink in (first, aborting, last):
+        assert sink.events == ["open", "abort"]
+
+
+def test_e4_abort_from_observer_stops_later_frames() -> None:
+    holder: list[Engine] = []
+
+    def observer(trace: FrameTrace) -> None:
+        if trace.index == 0:
+            holder[0].abort()
+
+    sink = FakeSink()
+    engine = _engine([FakeDetector()], [sink], lookahead=2, observer=observer)
+    holder.append(engine)
+    engine.open(INFO)
+    engine.step(_frame(0))
+    engine.step(_frame(1))
+    with pytest.raises(RuntimeError, match="aborted during"):
+        engine.close()  # Flushes frames 0, 1, 2; the observer aborts after frame 0.
+    assert [i for i, _ in sink.written] == [0]
+    assert sink.events == ["open", "abort"]
+    with pytest.raises(RuntimeError, match="not open"):
+        engine.step(_frame(2))
+
+
+def test_e5_sustained_failure_logs_periodic_summary(caplog: pytest.LogCaptureFixture) -> None:
+    class LongSource(FakeSource):
+        def __iter__(self) -> Iterator[Frame]:
+            for i in range(self.n):  # _image() would overflow uint8 past 155 frames.
+                yield Frame(image=_image(i % 100), index=i, timestamp=i / INFO.fps, source=INFO)
+
+    detector = FakeDetector(fail=range(210))
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, _, _ = _run(210, [detector], source=LongSource(210))
+    messages = [r.getMessage() for r in caplog.records]
+    assert len([m for m in messages if "failed closed (" in m]) == 5
+    summaries = [m for m in messages if "so far" in m]
+    assert summaries == [
+        "105 frames failed closed so far (0 over budget)",
+        "205 frames failed closed so far (0 over budget)",
+    ]
+    assert any("205 further" in m for m in messages)
+    assert stats.failed_closed == 210
+
+
+def test_e5_summary_counts_over_budget(caplog: pytest.LogCaptureFixture) -> None:
+    clock = FakeClock()
+    costs = {i: 0.050 for i in range(60, 105)}
+    detector = SlowDetector(clock, costs)
+    detector.fail = set(range(60))
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, _, _ = _run(105, [detector], budget_ms=20.0, clock=clock)
+    summaries = [r.getMessage() for r in caplog.records if "so far" in r.getMessage()]
+    assert summaries == ["105 frames failed closed so far (45 over budget)"]
+    assert stats.failed_closed == 105 and stats.over_budget == 45
+
+
+def test_e6_config_property_is_read_only() -> None:
+    config = EngineConfig(lookahead=3, cold_start_frames=1)
+    engine = Engine([FakeDetector()], FakeMode(), [], [FakeSink()], config)
+    assert engine.config is config
+    with pytest.raises(AttributeError):
+        engine.config = EngineConfig()  # type: ignore[misc]
