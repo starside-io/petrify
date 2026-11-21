@@ -112,7 +112,16 @@ class Mode(Protocol):
       or a mask receives every region. Refiners require ``"all"``.
     - ``mandatory`` (``frozenset[DetectionKind]``, default empty): every kind in
       it must be provided by an active detector or refiner, or the engine raises
-      ``ValueError`` at construction and in ``reconfigure``.
+      ``ValueError`` at construction and in ``reconfigure``. A non-empty
+      ``mandatory`` requires ``detect_policy = "all"``, since ``"first_hit"`` can
+      skip the detectors that provide it.
+
+    Output rule: :meth:`render` must return a ``numpy.ndarray`` with the input
+    frame image's shape and dtype. When ``subject_present`` is True the returned
+    array must not share memory with ``frame.image`` (the engine checks with
+    ``numpy.may_share_memory``, so even a view of a disjoint slice is rejected).
+    Otherwise the frame fails closed. When ``subject_present`` is False the mode
+    may return ``frame.image`` itself.
     """
 
     name: str
@@ -129,7 +138,14 @@ class Mode(Protocol):
 
 @runtime_checkable
 class Stage(Protocol):
-    """Post-processing step run after the mode on every frame."""
+    """Post-processing step run after the mode on every frame.
+
+    Output rule: :meth:`apply` must return a ``numpy.ndarray`` with the input
+    frame image's shape and dtype, and on a frame whose final decision is subject
+    present the result must not share memory with ``frame.image`` (checked with
+    ``numpy.may_share_memory``); otherwise the frame fails closed. Returning
+    ``image`` unchanged is always allowed when the mode's image satisfied the rule.
+    """
 
     def apply(self, frame: Frame, image: np.ndarray) -> np.ndarray:
         """Return the processed image."""

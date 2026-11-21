@@ -2090,13 +2090,109 @@ def test_invalid_detect_policy_rejected(policy: object) -> None:
 
 def test_mandatory_kind_uncovered_at_construction_rejected() -> None:
     motion = FakeDetector()
-    with pytest.raises(ValueError, match="mask"):
-        _p_engine([motion], RegionMode({M, MASK}, mandatory={MASK}))
+    with pytest.raises(ValueError, match="mask as mandatory"):
+        _p_engine([motion], RegionMode({M, MASK}, "all", mandatory={MASK}))
     # Without mandatory the same set-up is accepted: MOTION is still provided.
-    assert _p_engine([motion], RegionMode({M, MASK})).detectors == (motion,)
+    assert _p_engine([motion], RegionMode({M, MASK}, "all")).detectors == (motion,)
     masker = ResultDetector({MASK}, lambda f: Detections(mask=np.zeros((H, W), dtype=bool)))
-    engine = _p_engine([motion, masker], RegionMode({M, MASK}, mandatory={MASK}))
+    engine = _p_engine([motion, masker], RegionMode({M, MASK}, "all", mandatory={MASK}))
     assert engine.detectors == (motion, masker)
+
+
+def test_mandatory_satisfied_only_by_an_inactive_detector_rejected() -> None:
+    # The persons detector provides the mandatory kind but the mode does not
+    # require it, so the detector is not active.
+    persons = FakeDetector(kind=DetectionKind.PERSONS)
+    with pytest.raises(ValueError, match="persons as mandatory"):
+        _p_engine([FakeDetector(), persons], RegionMode({M}, "all", mandatory={P}))
+
+
+@pytest.mark.parametrize("policy", ["first_hit", None], ids=["explicit", "absent"])
+def test_mandatory_under_first_hit_rejected(policy: str | None) -> None:
+    detectors = [FakeDetector(), FakeDetector(kind=DetectionKind.PERSONS)]
+    with pytest.raises(ValueError, match='detect_policy = "all"'):
+        _p_engine(detectors, RegionMode({M, P}, policy, mandatory={P}))
+    mode = RegionMode({M, P}, "all", mandatory={P})
+    engine = _p_engine(detectors, mode)
+    engine.open(INFO)
+    _stream(engine, range(2))
+    with pytest.raises(ValueError, match='detect_policy = "all"'):
+        engine.reconfigure(mode=RegionMode({M, P}, policy, mandatory={P}))
+    assert engine.mode is mode and engine.is_open
+    engine.close()
+
+
+def test_mandatory_persons_reach_the_mode_after_a_motion_hit() -> None:
+    """The reproduced bug: the mode must never get persons=None for a mandatory kind."""
+    persons = _box_detector(BOX_A)
+    mode = RegionMode({M, P}, "all", mandatory={P})
+    _p_run(3, [FakeDetector(hits=[0, 1, 2]), persons], mode)
+    assert persons.seen == [0, 1, 2]
+    assert mode.persons() == [(BOX_A,)] * 3
+
+
+@pytest.mark.parametrize(
+    "mandatory",
+    [{"bogus"}, {"persons"}, "persons", {P, 3}],
+    ids=["bogus", "plain_string_member", "string", "int_member"],
+)
+def test_mandatory_with_non_kind_members_rejected(mandatory: object) -> None:
+    mode = RegionMode({M, P}, "all")
+    mode.mandatory = mandatory  # type: ignore[attr-defined]
+    detectors = [FakeDetector(), FakeDetector(kind=DetectionKind.PERSONS)]
+    with pytest.raises(ValueError, match="not a DetectionKind"):
+        _p_engine(detectors, mode)
+
+
+def test_non_string_policy_equal_to_a_policy_name_rejected() -> None:
+    class LooksLikeAll:
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        __hash__ = object.__hash__
+
+    with pytest.raises(ValueError, match="detect_policy"):
+        _p_engine([FakeDetector()], RegionMode({M}, LooksLikeAll()))
+
+
+def test_mandatory_whose_iteration_raises_is_a_value_error() -> None:
+    class Hostile:
+        def __iter__(self) -> Iterator[DetectionKind]:
+            raise RuntimeError("no iteration")
+
+    mode = RegionMode({M}, "all")
+    mode.mandatory = Hostile()  # type: ignore[attr-defined]
+    with pytest.raises(ValueError, match="mandatory"):
+        _p_engine([FakeDetector()], mode)
+
+
+def test_hostile_mode_attributes_are_value_errors() -> None:
+    class RaisingPolicy(RegionMode):
+        @property
+        def detect_policy(self) -> str:  # type: ignore[override]
+            raise RuntimeError("policy broke")
+
+    class RaisingMandatory(RegionMode):
+        @property
+        def mandatory(self) -> frozenset[DetectionKind]:  # type: ignore[override]
+            raise RuntimeError("mandatory broke")
+
+    class PolicyStr(str):
+        def __eq__(self, other: object) -> bool:
+            raise RuntimeError("eq broke")
+
+        __hash__ = str.__hash__
+
+    for mode in (RaisingPolicy({M}), RaisingMandatory({M}), RegionMode({M}, PolicyStr("all"))):
+        with pytest.raises(ValueError):
+            _p_engine([FakeDetector()], mode)
+
+
+def test_detector_provides_that_cannot_be_matched_is_a_value_error() -> None:
+    detector = FakeDetector()
+    detector.provides = [M]  # type: ignore[assignment]  # list & frozenset: TypeError.
+    with pytest.raises(ValueError, match="Detector FakeDetector: cannot match"):
+        _p_engine([detector], RegionMode({M}))
 
 
 def test_mandatory_kind_covered_by_a_refiner_is_accepted() -> None:
@@ -2108,7 +2204,7 @@ def test_mandatory_kind_covered_by_a_refiner_is_accepted() -> None:
 def test_mandatory_kind_uncovered_at_reconfigure_changes_nothing() -> None:
     motion = FakeDetector(hits=[3])
     masker = ResultDetector({MASK}, lambda f: Detections(mask=np.zeros((H, W), dtype=bool)))
-    mode = RegionMode({M, MASK}, mandatory={MASK})
+    mode = RegionMode({M, MASK}, "all", mandatory={MASK})
     sink = FakeSink()
     traces: list[FrameTrace] = []
     engine = _p_engine([motion, masker], mode, sinks=[sink], lookahead=2, traces=traces)
@@ -2116,10 +2212,10 @@ def test_mandatory_kind_uncovered_at_reconfigure_changes_nothing() -> None:
     engine.open(INFO)
     _stream(engine, range(4))
     written = len(sink.written)
-    with pytest.raises(ValueError, match="mandatory"):
+    with pytest.raises(ValueError, match="as mandatory"):
         engine.reconfigure(detectors=[motion], stages=[FakeStage()])
-    with pytest.raises(ValueError, match="mandatory"):
-        engine.reconfigure(mode=RegionMode({M, MASK, P}, mandatory={P}))
+    with pytest.raises(ValueError, match="as mandatory"):
+        engine.reconfigure(mode=RegionMode({M, MASK, P}, "all", mandatory={P}))
     assert engine.is_open
     assert len(sink.written) == written
     assert engine.detectors == (motion, masker)
@@ -2127,7 +2223,7 @@ def test_mandatory_kind_uncovered_at_reconfigure_changes_nothing() -> None:
     _stream(engine, range(4, 8))
     stats = engine.close()
     assert [i for i, _ in sink.written] == list(range(8))
-    assert masker.seen == [0, 1, 2, 4, 5, 6, 7]  # first_hit: skipped after the hit at 3.
+    assert masker.seen == list(range(8))
     assert _finals(traces) == [1, 2, 3, 4, 5]
     assert stats.reconfigurations == 0
 
@@ -2497,3 +2593,179 @@ def test_stage_cannot_repair_a_bad_mode_image() -> None:
     mode = RegionMode({M}, output=lambda f: f.image.astype(np.float32))
     stats, _, _ = _p_run(2, [FakeDetector()], mode, stages=[Cast()])
     assert stats.failed_closed == 2
+
+
+# Review follow-up (T2b) -------------------------------------------------------
+
+SHARING_OUTPUTS: dict[str, Callable[[Frame], np.ndarray]] = {
+    "input_itself": lambda f: f.image,
+    "full_view": lambda f: f.image[:],
+    "reversed_view": lambda f: f.image[::-1],
+}
+
+
+@pytest.mark.parametrize("case", sorted(SHARING_OUTPUTS))
+def test_mode_returning_input_memory_on_a_frozen_frame_fails_closed(
+    case: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    share = SHARING_OUTPUTS[case]
+    mode = RegionMode({M}, "all", output=share)  # Broken: never hides anything.
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, traces, sink = _p_run(6, [FakeDetector(hits=[3])], mode, lookahead=1)
+    frozen = [t.index for t in traces if t.final]
+    assert frozen == [2, 3, 4]
+    assert [t.index for t in traces if t.failed_closed] == frozen
+    images = dict(sink.written)
+    for i in range(6):
+        if i in frozen:
+            assert _is_black(images[i], _image(i))
+            assert not np.may_share_memory(sink.received[i], _image(i))
+        else:
+            assert np.array_equal(images[i], share(_frame(i)))  # Pass-through is allowed.
+    assert stats.failed_closed == 3 and stats.passed_through == 3
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Frame 2 failed closed (mode region)" in m and "share memory" in m
+               for m in messages)
+
+
+def test_stage_returning_input_memory_on_a_frozen_frame_fails_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Leak:
+        def apply(self, frame: Frame, image: np.ndarray) -> np.ndarray:
+            return frame.image
+
+    later = FakeStage()
+    stages: list[Stage] = [Leak(), later]
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, traces, sink = _p_run(4, [FakeDetector(hits=[1])], FakeMode(), stages=stages)
+    assert [t.index for t in traces if t.failed_closed] == [1]
+    assert _is_black(dict(sink.written)[1], _image(1))
+    assert np.array_equal(dict(sink.written)[0], _image(0) + 1)
+    assert later.applied == [0, 2, 3]
+    assert stats.failed_closed == 1
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Frame 1 failed closed (stage Leak)" in m for m in messages)
+
+
+def test_frozen_output_in_the_input_bounds_fails_closed_even_if_disjoint() -> None:
+    """The check is the cheap bounds test, so an interleaved disjoint view is rejected."""
+    base = np.full((H, 2 * W, 3), 100, dtype=np.uint8)
+    frame = Frame(image=base[:, ::2], index=0, timestamp=0.0, source=INFO)
+    other = base[:, 1::2]
+    assert not np.shares_memory(frame.image, other)
+    mode = RegionMode({M}, "all", output=lambda f: other)
+    engine = _p_engine([FakeDetector(hits=[0])], mode)
+    engine.open(INFO)
+    (out,) = engine.step(frame)
+    engine.close()
+    assert out.trace.final and out.trace.failed_closed
+    assert not out.image.any()
+
+
+def test_frozen_frame_rendered_into_a_fresh_array_passes() -> None:
+    mode = RegionMode({M}, "all", output=lambda f: f.image.copy())
+    stats, _, _ = _p_run(3, [FakeDetector(hits=[1])], mode)
+    assert stats.failed_closed == 0 and stats.frozen == 1
+
+
+def test_reconfigure_updates_the_detect_policy() -> None:
+    a, b = _box_detector(BOX_A), _box_detector(BOX_B)
+    engine = _p_engine([a, b], RegionMode({P}))  # first_hit.
+    engine.open(INFO)
+    _stream(engine, range(2))
+    engine.reconfigure(mode=RegionMode({P}, "all"))
+    _stream(engine, range(2, 4))
+    engine.reconfigure(mode=RegionMode({P}, "first_hit"))
+    _stream(engine, range(4, 6))
+    engine.close()
+    assert a.seen == list(range(6))
+    assert b.seen == [2, 3]
+
+
+def test_refiner_cannot_satisfy_its_own_consumes() -> None:
+    with pytest.raises(ValueError, match="consumes persons"):
+        _p_engine([FakeDetector()], RegionMode({M, P}, "all"), refiners=[FakeRefiner({P}, {P})])
+
+
+def test_refiner_sees_the_mask_a_detector_produced() -> None:
+    def fill(frame: Frame) -> Detections:
+        mask = np.zeros((H, W), dtype=bool)
+        mask.flat[: frame.index + 1] = True
+        return Detections(mask=mask)
+
+    refiner = FakeRefiner({MASK}, {P})
+    _p_run(3, [ResultDetector({MASK}, fill)], RegionMode({MASK, P}, "all"), refiners=[refiner])
+    sums = [None if d.mask is None else int(d.mask.sum()) for _, d in refiner.calls]
+    assert sums == [1, 2, 3]
+    assert all(not d.mask.flags.writeable for _, d in refiner.calls)  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("consumes", "provides", "match"),
+    [
+        ({"bogus"}, {P}, "consumes holds 'bogus'"),
+        ({"persons"}, {P}, "consumes holds 'persons'"),
+        (None, {P}, "consumes must be a set"),
+        ({M}, [P], "provides must be a set"),
+        ({M}, (P,), "provides must be a set"),
+        ({M}, {P, 1}, "provides holds 1"),
+    ],
+    ids=["bogus", "plain_string", "none", "list", "tuple", "int_member"],
+)
+def test_refiner_attribute_types_rejected_as_value_error(
+    consumes: object, provides: object, match: str
+) -> None:
+    refiner = FakeRefiner({M}, {P})
+    refiner.consumes = consumes  # type: ignore[assignment]
+    refiner.provides = provides  # type: ignore[assignment]
+    with pytest.raises(ValueError, match=match) as info:
+        _p_engine([FakeDetector()], RegionMode({M, P}, "all"), refiners=[refiner])
+    assert "Refiner FakeRefiner" in str(info.value)
+    engine = _p_engine([FakeDetector()], RegionMode({M, P}, "all"))
+    engine.open(INFO)
+    with pytest.raises(ValueError, match=match):
+        engine.reconfigure(refiners=[refiner])
+    assert engine.refiners == () and engine.is_open
+    engine.close()
+
+
+def test_refiner_attribute_that_raises_is_a_value_error() -> None:
+    class Hostile(FakeRefiner):
+        @property
+        def consumes(self) -> frozenset[DetectionKind]:  # type: ignore[override]
+            raise RuntimeError("consumes broke")
+
+        @consumes.setter
+        def consumes(self, value: object) -> None:
+            pass
+
+    class Missing:
+        provides = frozenset({P})
+
+        def refine(self, frame: Frame, detections: Detections) -> Detections:
+            return Detections()
+
+        def reset(self) -> None:
+            pass
+
+    for refiner in (Hostile({M}, {P}), Missing()):
+        with pytest.raises(ValueError, match="reading consumes"):
+            _p_engine(
+                [FakeDetector()], RegionMode({M, P}, "all"), refiners=[refiner]  # type: ignore[list-item]
+            )
+
+
+def test_duplicate_refiner_rejected() -> None:
+    refiner = FakeRefiner({M}, {P})
+    mode = RegionMode({M, P}, "all")
+    with pytest.raises(ValueError, match="more than once"):
+        _p_engine([FakeDetector()], mode, refiners=[refiner, refiner])
+    engine = _p_engine([FakeDetector()], mode, refiners=[refiner])
+    engine.open(INFO)
+    with pytest.raises(ValueError, match="more than once"):
+        engine.reconfigure(refiners=[refiner, FakeRefiner({M}, {P}), refiner])
+    assert engine.refiners == (refiner,) and refiner.resets == 1
+    _stream(engine, range(2))
+    engine.close()
+    assert [i for i, _ in refiner.calls] == [0, 1]

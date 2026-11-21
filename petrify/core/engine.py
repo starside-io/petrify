@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Generic, TypeVar
@@ -286,7 +286,8 @@ class Engine:
     Fail closed: a detector, refiner, mode, or stage error replaces that frame with
     a black image, and so do a malformed detector or refiner result, a mode or
     stage image that is not a ``numpy.ndarray`` with the input frame's shape and
-    dtype, and exceeding ``config.frame_budget_ms`` (detection plus render time,
+    dtype (or, on a frame whose final decision is subject present, that may share
+    memory with the input frame image), and exceeding ``config.frame_budget_ms`` (detection plus render time,
     measured with ``clock``). The budget is checked after the fact: a running
     detector or mode is never interrupted. A detection overrun is known before the
     frame enters the lookahead buffer, so it counts as a subject and freezes its
@@ -297,9 +298,12 @@ class Engine:
     detector or refiner provides any of them (every frame would otherwise pass
     through), when the mode's ``detect_policy`` is not a :data:`DetectPolicy`,
     when a kind in the mode's ``mandatory`` has no active detector or refiner,
-    when a refiner is active under the ``"first_hit"`` policy, and when an active
-    refiner consumes a kind no active detector or earlier active refiner
-    provides.
+    when ``mandatory`` is non-empty or a refiner is active under the
+    ``"first_hit"`` policy, when an active refiner consumes a kind no active
+    detector or earlier active refiner provides, when a refiner's ``consumes`` or
+    ``provides`` is not a set or frozenset of :class:`DetectionKind`, when the
+    same refiner object is given twice, and when reading any of these attributes
+    raises.
 
     A failure of a critical sink, of the observer, or any ``BaseException`` aborts
     the engine (every active sink aborted, pending frames discarded) and propagates.
@@ -845,11 +849,11 @@ class Engine:
             where = f"mode {self._mode.name}"
             try:
                 image = self._mode.render(frame, pending.detections, decision.final)
-                _check_image(image, frame.image)
+                _check_image(image, frame.image, decision.final)
                 for stage in self._stages:
                     where = f"stage {type(stage).__name__}"
                     image = stage.apply(frame, image)
-                    _check_image(image, frame.image)
+                    _check_image(image, frame.image, decision.final)
             except Exception as exc:
                 self._log_failure(frame.index, where, exc)
                 failed = True
@@ -939,8 +943,34 @@ class Engine:
 _POLICIES: tuple[DetectPolicy, ...] = ("first_hit", "all")
 
 
-def _kind_names(kinds: frozenset[DetectionKind]) -> str:
-    return ", ".join(sorted(kind.value for kind in kinds))
+def _kind_names(kinds: Iterable[object]) -> str:
+    """Return the kinds' values for a message; never raises on odd members."""
+    try:
+        return ", ".join(sorted(str(getattr(kind, "value", kind)) for kind in kinds))
+    except Exception:
+        return repr(kinds)
+
+
+def _read(owner: str, obj: object, attr: str, *default: object) -> object:
+    """Return ``getattr(obj, attr, *default)``; turn any error into ``ValueError``."""
+    try:
+        return getattr(obj, attr, *default)
+    except Exception as exc:
+        raise ValueError(f"{owner}: reading {attr} raised {exc!r}") from exc
+
+
+def _kind_set(owner: str, obj: object, attr: str) -> frozenset[DetectionKind]:
+    """Return ``obj.attr`` after checking it is a set or frozenset of DetectionKind."""
+    value = _read(owner, obj, attr)
+    if not isinstance(value, (set, frozenset)):
+        raise ValueError(
+            f"{owner} {attr} must be a set or frozenset of DetectionKind, "
+            f"got {type(value).__name__}"
+        )
+    for kind in value:
+        if not isinstance(kind, DetectionKind):
+            raise ValueError(f"{owner} {attr} holds {kind!r}, which is not a DetectionKind")
+    return frozenset(value)
 
 
 def _resolve(
@@ -949,70 +979,116 @@ def _resolve(
     """Return the active detectors, the active refiners, and whether the policy is first_hit.
 
     Raises ``ValueError`` for every configuration the engine rejects (see
-    :class:`Engine`); nothing is mutated, so callers can validate before a change.
+    :class:`Engine`), including any error raised while reading a component's
+    attributes; nothing is mutated, so callers can validate before a change.
     """
-    requires = mode.requires
-    active = tuple(d for d in detectors if d.provides & requires)
-    active_refiners = tuple(r for r in refiners if r.provides & requires)
-    if requires and not active and not active_refiners:
+    mode_label = f"Mode {_read('Mode', mode, 'name')!r}"
+    requires = _read(mode_label, mode, "requires")
+
+    seen: set[int] = set()
+    refiner_kinds: list[tuple[Refiner, str, frozenset[DetectionKind], frozenset[DetectionKind]]]
+    refiner_kinds = []
+    for refiner in refiners:
+        label = f"Refiner {type(refiner).__name__}"
+        if id(refiner) in seen:
+            raise ValueError(f"{label} is given more than once; pass each refiner once")
+        seen.add(id(refiner))
+        consumes = _kind_set(label, refiner, "consumes")
+        provides = _kind_set(label, refiner, "provides")
+        refiner_kinds.append((refiner, label, consumes, provides))
+
+    active_list: list[Detector] = []
+    available: set[DetectionKind] = set()
+    for detector in detectors:
+        try:
+            if detector.provides & requires:
+                active_list.append(detector)
+                available.update(detector.provides)
+        except Exception as exc:
+            raise ValueError(
+                f"Detector {type(detector).__name__}: cannot match provides against "
+                f"{mode_label} requires: {exc!r}"
+            ) from exc
+    active = tuple(active_list)
+    try:
+        active_refiners = tuple(entry for entry in refiner_kinds if entry[3] & requires)
+        needs = bool(requires)
+    except Exception as exc:
+        raise ValueError(f"{mode_label}: requires cannot be used as a set: {exc!r}") from exc
+    if needs and not active and not active_refiners:
         raise ValueError(
-            f"Mode {mode.name!r} requires {_kind_names(requires)} but no detector or "
+            f"{mode_label} requires {_kind_names(requires)} but no detector or "  # type: ignore[arg-type]
             "refiner provides any of them; every frame would pass through unprocessed"
         )
 
-    policy = getattr(mode, "detect_policy", "first_hit")
-    if not isinstance(policy, str) or policy not in _POLICIES:
+    policy = _read(mode_label, mode, "detect_policy", "first_hit")
+    try:
+        valid = isinstance(policy, str) and policy in _POLICIES
+        first_hit = bool(policy == "first_hit")
+    except Exception:
+        valid = False
+    if not valid:
         raise ValueError(
-            f"Mode {mode.name!r} has detect_policy {policy!r}; expected one of "
+            f"{mode_label} has detect_policy {policy!r}; expected one of "
             + ", ".join(repr(p) for p in _POLICIES)
         )
-    first_hit = policy == "first_hit"
 
-    available: set[DetectionKind] = set()
-    for detector in active:
-        available.update(detector.provides)
-    for refiner in active_refiners:
-        name = type(refiner).__name__
+    for _, label, consumes, provides in active_refiners:
         if first_hit:
             raise ValueError(
-                f"Refiner {name} is active but mode {mode.name!r} uses the 'first_hit' "
-                "detection policy, which skips detectors; refiners need 'all'"
+                f"{label} is active but {mode_label} uses the 'first_hit' detection "
+                "policy, which skips detectors; refiners need 'all'"
             )
-        missing = frozenset(refiner.consumes) - available
+        missing = consumes - available
         if missing:
             raise ValueError(
-                f"Refiner {name} consumes {_kind_names(missing)} but no active detector "
+                f"{label} consumes {_kind_names(missing)} but no active detector "
                 "or earlier refiner provides it"
             )
-        available.update(refiner.provides)
+        available.update(provides)
 
-    mandatory = getattr(mode, "mandatory", frozenset())
+    mandatory = _read(mode_label, mode, "mandatory", frozenset())
     try:
-        kinds = frozenset(mandatory)
-    except TypeError as exc:
-        raise ValueError(
-            f"Mode {mode.name!r} mandatory must be a set of DetectionKind: {exc}"
-        ) from exc
+        kinds = frozenset(mandatory)  # type: ignore[arg-type]
+    except Exception as exc:
+        raise ValueError(f"{mode_label} mandatory must be a set of DetectionKind: {exc!r}") from exc
     for kind in kinds:
         if not isinstance(kind, DetectionKind):
-            raise ValueError(f"Mode {mode.name!r} mandatory holds an unknown kind {kind!r}")
+            raise ValueError(f"{mode_label} mandatory holds {kind!r}, which is not a DetectionKind")
+    if kinds and first_hit:
+        raise ValueError(
+            f"{mode_label} has mandatory kinds ({_kind_names(kinds)}) but uses the "
+            "'first_hit' detection policy, which can skip their detectors; the mode must "
+            "declare detect_policy = \"all\""
+        )
     uncovered = kinds - available
     if uncovered:
         raise ValueError(
-            f"Mode {mode.name!r} requires {_kind_names(uncovered)} as mandatory but no "
+            f"{mode_label} requires {_kind_names(uncovered)} as mandatory but no "
             "active detector or refiner provides it"
         )
-    return active, active_refiners, first_hit
+    return active, tuple(entry[0] for entry in active_refiners), first_hit
 
 
-def _check_image(image: object, like: np.ndarray) -> None:
-    """Raise ``ValueError`` unless ``image`` is an ndarray with ``like``'s shape and dtype."""
+def _check_image(image: object, like: np.ndarray, subject_present: bool) -> None:
+    """Raise ``ValueError`` unless ``image`` is a valid output for the input image ``like``.
+
+    It must be an ndarray with ``like``'s shape and dtype, and on a frame whose
+    final decision is subject present it must not possibly share memory with
+    ``like`` (``np.may_share_memory``, a bounds check), so the input pixels of a
+    frozen frame cannot reach the sinks.
+    """
     if type(image) is not np.ndarray:
         raise ValueError(f"output image must be a numpy.ndarray, got {type(image).__name__}")
     if image.shape != like.shape or image.dtype != like.dtype:
         raise ValueError(
             f"output image has shape {image.shape} and dtype {image.dtype}; "
             f"the input frame has shape {like.shape} and dtype {like.dtype}"
+        )
+    if subject_present and np.may_share_memory(image, like):
+        raise ValueError(
+            "output image may share memory with the input frame on a frame where a "
+            "subject is present"
         )
 
 
