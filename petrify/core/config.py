@@ -107,6 +107,8 @@ class EngineConfig:
     lookahead: int = 10  # Frames of delay; file mode sets it to the gap fill.
     cold_start_frames: int = 50
     fail_closed: Literal["black"] = "black"
+    # Per-frame time budget for detection plus rendering; None disables it.
+    frame_budget_ms: float | None = None
 
     def __post_init__(self) -> None:
         if self.lookahead < 0:
@@ -114,6 +116,10 @@ class EngineConfig:
         if self.cold_start_frames < 0:
             raise ValueError(
                 f"EngineConfig.cold_start_frames must be >= 0, got {self.cold_start_frames}"
+            )
+        if self.frame_budget_ms is not None and not self.frame_budget_ms > 0:
+            raise ValueError(
+                f"EngineConfig.frame_budget_ms must be > 0 or None, got {self.frame_budget_ms}"
             )
 
 

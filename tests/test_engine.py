@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import ClassVar
 
 import numpy as np
@@ -17,8 +17,10 @@ from petrify.core import (
     EngineConfig,
     EngineStats,
     Frame,
+    FrameMeta,
     FrameTrace,
     Mode,
+    Output,
     Sink,
     Source,
     SourceInfo,
@@ -124,9 +126,12 @@ class FakeStage:
 
 
 class FakeSink:
-    def __init__(self, fail_write_at: int | None = None) -> None:
+    def __init__(self, fail_write_at: int | None = None, *, critical: bool = True) -> None:
+        self.critical = critical
         self.events: list[str] = []
         self.written: list[tuple[int, np.ndarray]] = []
+        self.received: list[np.ndarray] = []  # The arrays exactly as passed to write.
+        self.metas: list[object] = []
         self.info: SourceInfo | None = None
         self.fail_write_at = fail_write_at
 
@@ -134,10 +139,12 @@ class FakeSink:
         self.info = info
         self.events.append("open")
 
-    def write(self, frame: Frame, image: np.ndarray) -> None:
-        if frame.index == self.fail_write_at:
+    def write(self, image: np.ndarray, meta: FrameMeta) -> None:
+        if meta.index == self.fail_write_at:
             raise OSError("sink broke")
-        self.written.append((frame.index, image.copy()))
+        self.metas.append(meta)
+        self.received.append(image)
+        self.written.append((meta.index, image.copy()))
 
     def close(self) -> None:
         self.events.append("close")
@@ -156,19 +163,20 @@ def _run(
     lookahead: int = 0,
     cold_start: int = 0,
     source: Source | None = None,
+    budget_ms: float | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> tuple[EngineStats, list[FrameTrace], list[FakeSink]]:
     traces: list[FrameTrace] = []
     sink_list = list(sinks) if sinks is not None else [FakeSink()]
-    engine = Engine(
-        source or FakeSource(n),
-        detectors,
-        mode or FakeMode(),
-        stages,
-        sink_list,
-        EngineConfig(lookahead=lookahead, cold_start_frames=cold_start),
-        traces.append,
+    config = EngineConfig(
+        lookahead=lookahead, cold_start_frames=cold_start, frame_budget_ms=budget_ms
     )
-    stats = engine.run()
+    engine = (
+        Engine(detectors, mode or FakeMode(), stages, sink_list, config, traces.append)
+        if clock is None
+        else Engine(detectors, mode or FakeMode(), stages, sink_list, config, traces.append, clock)
+    )
+    stats = engine.run(source or FakeSource(n))
     return stats, traces, sink_list  # type: ignore[return-value]
 
 
@@ -214,10 +222,8 @@ def test_stateless_detectors_short_circuit_in_order() -> None:
 def test_detector_not_required_by_mode_never_called() -> None:
     persons = FakeDetector(kind=DetectionKind.PERSONS, stateful=True)
     motion = FakeDetector(hits=[1])
-    engine = Engine(
-        FakeSource(3), [persons, motion], FakeMode(), [], [FakeSink()], EngineConfig(lookahead=0)
-    )
-    engine.run()
+    engine = Engine([persons, motion], FakeMode(), [], [FakeSink()], EngineConfig(lookahead=0))
+    engine.run(FakeSource(3))
     assert persons.seen == []
     assert persons.resets == 0
     assert engine.detectors == (motion,)
@@ -342,11 +348,9 @@ def test_observer_error_aborts_sinks() -> None:
         raise ValueError("observer broke")
 
     sink = FakeSink()
-    engine = Engine(
-        FakeSource(3), [FakeDetector()], FakeMode(), [], [sink], EngineConfig(lookahead=0), observer
-    )
+    engine = Engine([FakeDetector()], FakeMode(), [], [sink], EngineConfig(lookahead=0), observer)
     with pytest.raises(ValueError, match="observer broke"):
-        engine.run()
+        engine.run(FakeSource(3))
     assert sink.events == ["open", "abort"]
 
 
@@ -466,3 +470,473 @@ def test_abort_interrupt_still_aborts_every_sink_then_reraises(
     for sink in sinks:
         assert sink.events == ["open", "abort"]
     assert any("failed to abort" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Step API
+# ---------------------------------------------------------------------------
+
+
+def _frame(i: int) -> Frame:
+    return Frame(image=_image(i), index=i, timestamp=i / INFO.fps, source=INFO)
+
+
+def _engine(
+    detectors: Sequence[Detector],
+    sinks: Sequence[Sink],
+    *,
+    mode: Mode | None = None,
+    stages: Sequence[Stage] = (),
+    lookahead: int = 0,
+    cold_start: int = 0,
+    observer: Callable[[FrameTrace], None] | None = None,
+) -> Engine:
+    config = EngineConfig(lookahead=lookahead, cold_start_frames=cold_start)
+    return Engine(detectors, mode or FakeMode(), stages, sinks, config, observer)
+
+
+def test_step_outputs_and_tail_match_sink_writes() -> None:
+    sink = FakeSink()
+    traces: list[FrameTrace] = []
+    engine = _engine(
+        [FakeDetector(hits=[3])], [sink], stages=[FakeStage()], lookahead=3, observer=traces.append
+    )
+    engine.open(INFO)
+    outputs: list[Output] = []
+    for i in range(7):
+        released = engine.step(_frame(i))
+        if i < 3:
+            assert released == []
+        else:
+            assert [o.meta.index for o in released] == [i - 3]
+        outputs.extend(released)
+    tail = engine.flush()
+    assert [o.meta.index for o in tail] == [4, 5, 6]
+    outputs.extend(tail)
+    stats = engine.close()
+
+    assert stats.frames == 7
+    assert [o.meta.index for o in outputs] == list(range(7))
+    assert [o.trace for o in outputs] == traces
+    assert [o.meta for o in outputs] == sink.metas
+    for out, received, (index, image) in zip(outputs, sink.received, sink.written):
+        assert out.image is received
+        assert out.meta.index == index
+        assert np.array_equal(out.image, image)
+        assert out.meta == FrameMeta(index=index, timestamp=index / INFO.fps, source=INFO)
+    assert sink.events == ["open", "close"]
+
+
+def test_close_without_flush_still_writes_tail() -> None:
+    sink = FakeSink()
+    engine = _engine([FakeDetector()], [sink], lookahead=2)
+    engine.open(INFO)
+    for i in range(4):
+        engine.step(_frame(i))
+    assert [i for i, _ in sink.written] == [0, 1]
+    stats = engine.close()
+    assert [i for i, _ in sink.written] == [0, 1, 2, 3]
+    assert stats.frames == 4
+    assert sink.events == ["open", "close"]
+
+
+def test_run_and_manual_steps_are_identical() -> None:
+    def build() -> tuple[Engine, FakeSink, list[FrameTrace]]:
+        sink = FakeSink()
+        traces: list[FrameTrace] = []
+        engine = _engine(
+            [FakeDetector(hits=[4, 9], fail=[6]), FakeDetector(stateful=True)],
+            [sink],
+            mode=FakeMode(fail=[11]),
+            stages=[FakeStage()],
+            lookahead=2,
+            cold_start=1,
+            observer=traces.append,
+        )
+        return engine, sink, traces
+
+    run_engine, run_sink, run_traces = build()
+    run_stats = run_engine.run(FakeSource(14))
+
+    step_engine, step_sink, step_traces = build()
+    step_engine.open(INFO)
+    for frame in FakeSource(14):
+        step_engine.step(frame)
+    step_engine.flush()
+    step_stats = step_engine.close()
+
+    assert run_stats == step_stats
+    assert run_traces == step_traces
+    assert run_sink.events == step_sink.events == ["open", "close"]
+    assert run_sink.metas == step_sink.metas
+    assert len(run_sink.written) == len(step_sink.written) == 14
+    for (ri, rimg), (si, simg) in zip(run_sink.written, step_sink.written):
+        assert ri == si
+        assert np.array_equal(rimg, simg)
+
+
+def test_abort_mid_stream_stops_all_writes() -> None:
+    sinks = [FakeSink(), FakeSink(critical=False)]
+    engine = _engine([FakeDetector()], sinks, lookahead=2)
+    engine.open(INFO)
+    for i in range(5):
+        engine.step(_frame(i))
+    engine.abort()
+    assert not engine.is_open
+    for sink in sinks:
+        assert sink.events == ["open", "abort"]
+        assert [i for i, _ in sink.written] == [0, 1, 2]
+    with pytest.raises(RuntimeError, match="not open"):
+        engine.step(_frame(5))
+    with pytest.raises(RuntimeError, match="not open"):
+        engine.close()
+    engine.abort()
+    for sink in sinks:
+        assert sink.events == ["open", "abort"]
+        assert len(sink.written) == 3
+
+
+def test_double_open_raises() -> None:
+    sink = FakeSink()
+    engine = _engine([FakeDetector()], [sink])
+    engine.open(INFO)
+    with pytest.raises(RuntimeError, match="already open"):
+        engine.open(INFO)
+    assert engine.is_open
+    assert sink.events == ["open"]
+    engine.close()
+
+
+def test_calls_before_open_raise_and_abort_is_safe() -> None:
+    sink = FakeSink()
+    engine = _engine([FakeDetector()], [sink])
+    with pytest.raises(RuntimeError, match="not open"):
+        engine.step(_frame(0))
+    with pytest.raises(RuntimeError, match="not open"):
+        engine.flush()
+    with pytest.raises(RuntimeError, match="not open"):
+        engine.close()
+    engine.abort()
+    engine.abort()
+    assert sink.events == []
+
+
+def test_step_after_flush_raises() -> None:
+    engine = _engine([FakeDetector()], [FakeSink()], lookahead=1)
+    engine.open(INFO)
+    engine.step(_frame(0))
+    engine.flush()
+    with pytest.raises(RuntimeError, match="flushed"):
+        engine.step(_frame(1))
+    engine.close()
+
+
+def test_reopen_after_close_starts_a_fresh_stream() -> None:
+    sink = FakeSink()
+    detector = FakeDetector(stateful=True)
+    engine = _engine([detector], [sink])
+    engine.open(INFO)
+    engine.step(_frame(0))
+    engine.close()
+    engine.open(INFO)
+    (out,) = engine.step(_frame(0))
+    assert out.trace.index == 0
+    stats = engine.close()
+    assert stats.frames == 1
+    assert detector.resets == 2
+    assert sink.events == ["open", "close", "open", "close"]
+
+
+def test_failed_open_leaves_engine_closed_and_abort_safe() -> None:
+    class BadOpen(FakeSink):
+        def open(self, info: SourceInfo) -> None:
+            raise OSError("cannot open")
+
+    good, bad = FakeSink(), BadOpen()
+    engine = _engine([FakeDetector()], [good, bad])
+    with pytest.raises(OSError, match="cannot open"):
+        engine.open(INFO)
+    assert not engine.is_open
+    engine.abort()
+    assert good.events == ["open", "abort"]
+    assert bad.events == []
+
+
+def test_step_error_aborts_engine() -> None:
+    sink = FakeSink(fail_write_at=1)
+    engine = _engine([FakeDetector()], [sink])
+    engine.open(INFO)
+    engine.step(_frame(0))
+    with pytest.raises(OSError, match="sink broke"):
+        engine.step(_frame(1))
+    assert not engine.is_open
+    assert sink.events == ["open", "abort"]
+
+
+def test_engine_without_sinks_returns_outputs() -> None:
+    engine = _engine([FakeDetector(hits=[1])], [], stages=[FakeStage()])
+    engine.open(INFO)
+    outputs = [o for i in range(3) for o in engine.step(_frame(i))]
+    stats = engine.close()
+    assert [o.meta.index for o in outputs] == [0, 1, 2]
+    assert np.all(outputs[1].image == BACKGROUND_VALUE + 1)
+    assert np.array_equal(outputs[0].image, _image(0) + 1)
+    assert stats.frames == 3
+
+
+# ---------------------------------------------------------------------------
+# Sinks never receive the raw frame
+# ---------------------------------------------------------------------------
+
+
+class ConstantMode:
+    """Always renders a constant image, never the input pixels."""
+
+    name = "constant"
+    requires: ClassVar[frozenset[DetectionKind]] = frozenset({DetectionKind.MOTION})
+
+    def render(self, frame: Frame, detections: Detections, subject_present: bool) -> np.ndarray:
+        return np.full_like(frame.image, 42)
+
+
+def test_sinks_never_receive_raw_pixels() -> None:
+    frames = [_frame(i) for i in range(6)]
+    sink = FakeSink()
+    engine = _engine([FakeDetector(hits=[2], fail=[4])], [sink], mode=ConstantMode(), lookahead=1)
+    engine.open(INFO)
+    for frame in frames:
+        engine.step(frame)
+    engine.close()
+
+    assert len(sink.received) == len(frames)
+    for frame, image, meta in zip(frames, sink.received, sink.metas):
+        assert not np.shares_memory(image, frame.image)
+        assert not np.array_equal(image, frame.image)
+        assert isinstance(meta, FrameMeta)
+        assert not hasattr(meta, "image")
+        assert meta == frame.meta
+
+
+def test_frame_meta_property() -> None:
+    frame = _frame(3)
+    assert frame.meta == FrameMeta(index=3, timestamp=3 / INFO.fps, source=INFO)
+
+
+# ---------------------------------------------------------------------------
+# Sink failure isolation
+# ---------------------------------------------------------------------------
+
+
+def test_non_critical_write_failure_is_dropped(caplog: pytest.LogCaptureFixture) -> None:
+    critical, flaky = FakeSink(), FakeSink(fail_write_at=2, critical=False)
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, traces, _ = _run(5, [FakeDetector()], sinks=[critical, flaky])
+    assert [i for i, _ in critical.written] == list(range(5))
+    assert critical.events == ["open", "close"]
+    assert [i for i, _ in flaky.written] == [0, 1]
+    assert flaky.events == ["open", "abort"]
+    assert stats.sink_failures == 1
+    assert stats.frames == 5 and stats.failed_closed == 0
+    assert len(traces) == 5
+    dropped = [r for r in caplog.records if "dropped" in r.getMessage()]
+    assert len(dropped) == 1
+
+
+def test_non_critical_open_failure_is_dropped() -> None:
+    class BadOpen(FakeSink):
+        def open(self, info: SourceInfo) -> None:
+            raise OSError("cannot open")
+
+    critical, flaky = FakeSink(), BadOpen(critical=False)
+    stats, _, _ = _run(4, [FakeDetector()], sinks=[flaky, critical])
+    assert [i for i, _ in critical.written] == list(range(4))
+    assert critical.events == ["open", "close"]
+    assert flaky.events == ["abort"]
+    assert flaky.written == []
+    assert stats.sink_failures == 1
+
+
+def test_non_critical_close_failure_is_dropped() -> None:
+    class BadClose(FakeSink):
+        def close(self) -> None:
+            self.events.append("close")
+            raise OSError("cannot close")
+
+    flaky, critical = BadClose(critical=False), FakeSink()
+    stats, _, _ = _run(4, [FakeDetector()], sinks=[flaky, critical])
+    assert [i for i, _ in critical.written] == list(range(4))
+    assert critical.events == ["open", "close"]
+    assert flaky.events == ["open", "close", "abort"]
+    assert stats.sink_failures == 1
+
+
+def test_critical_failure_aborts_non_critical_sinks_too() -> None:
+    preview, recording = FakeSink(critical=False), FakeSink(fail_write_at=2)
+    with pytest.raises(OSError, match="sink broke"):
+        _run(5, [FakeDetector()], sinks=[preview, recording])
+    assert preview.events == ["open", "abort"]
+    assert recording.events == ["open", "abort"]
+    assert [i for i, _ in preview.written] == [0, 1, 2]  # Written before the recording failed.
+
+
+def test_all_sinks_failing_on_write_raises() -> None:
+    sinks = [FakeSink(fail_write_at=1, critical=False), FakeSink(fail_write_at=3, critical=False)]
+    with pytest.raises(RuntimeError, match="Every sink failed"):
+        _run(6, [FakeDetector()], sinks=sinks)
+    for sink in sinks:
+        assert sink.events == ["open", "abort"]
+
+
+def test_all_sinks_failing_on_open_raises() -> None:
+    class BadOpen(FakeSink):
+        def open(self, info: SourceInfo) -> None:
+            raise OSError("cannot open")
+
+    sinks = [BadOpen(critical=False), BadOpen(critical=False)]
+    engine = _engine([FakeDetector()], sinks)
+    with pytest.raises(RuntimeError, match="Every sink failed"):
+        engine.open(INFO)
+    assert not engine.is_open
+    for sink in sinks:
+        assert sink.events == ["abort"]
+
+
+def test_all_sinks_failing_on_close_raises() -> None:
+    class BadClose(FakeSink):
+        def close(self) -> None:
+            raise OSError("cannot close")
+
+    sinks = [BadClose(critical=False), BadClose(critical=False)]
+    with pytest.raises(RuntimeError, match="Every sink failed"):
+        _run(2, [FakeDetector()], sinks=sinks)
+    for sink in sinks:
+        assert sink.events == ["open", "abort"]
+
+
+# ---------------------------------------------------------------------------
+# Per-frame time budget
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    """Manual clock: only the fakes below advance it, so timings are exact."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class SlowDetector(FakeDetector):
+    """Advances ``clock`` by ``costs[index]`` seconds when it runs on that frame."""
+
+    def __init__(
+        self, clock: FakeClock, costs: dict[int, float], hits: Sequence[int] = ()
+    ) -> None:
+        super().__init__(hits)
+        self.clock = clock
+        self.costs = costs
+
+    def detect(self, frame: Frame) -> Detections:
+        self.clock.now += self.costs.get(frame.index, 0.0)
+        return super().detect(frame)
+
+
+class SlowMode(FakeMode):
+    """Advances ``clock`` by ``costs[index]`` seconds when rendering that frame."""
+
+    def __init__(self, clock: FakeClock, costs: dict[int, float]) -> None:
+        super().__init__()
+        self.clock = clock
+        self.costs = costs
+
+    def render(self, frame: Frame, detections: Detections, subject_present: bool) -> np.ndarray:
+        self.clock.now += self.costs.get(frame.index, 0.0)
+        return super().render(frame, detections, subject_present)
+
+
+def test_slow_detection_fails_closed_and_freezes_neighbors(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    mode = FakeMode()
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, traces, sinks = _run(
+            8,
+            [SlowDetector(clock, {3: 0.050})],
+            mode=mode,
+            lookahead=2,
+            budget_ms=20.0,
+            clock=clock,
+        )
+    images = dict(sinks[0].written)
+    assert _is_black(images[3], _image(3))
+    assert not np.any(images[3] == 100 + 3)
+    assert traces[3].failed_closed and traces[3].raw
+    assert [t.index for t in traces if t.failed_closed] == [3]
+    assert [i for i in range(8) if traces[i].final] == [1, 2, 3, 4, 5]
+    for i in (1, 2, 4, 5):
+        assert np.all(images[i] == BACKGROUND_VALUE)
+    assert 3 not in [i for i, _ in mode.calls]
+    assert stats == EngineStats(
+        frames=8, frozen=4, passed_through=3, failed_closed=1, over_budget=1
+    )
+    assert any("over budget" in r.getMessage() for r in caplog.records)
+
+
+def test_slow_render_fails_closed() -> None:
+    clock = FakeClock()
+    mode = SlowMode(clock, {2: 0.030})
+    stats, traces, sinks = _run(4, [FakeDetector()], mode=mode, budget_ms=20.0, clock=clock)
+    images = dict(sinks[0].written)
+    assert _is_black(images[2], _image(2))
+    assert not np.any(images[2] == 100 + 2)
+    assert [t.failed_closed for t in traces] == [False, False, True, False]
+    assert not traces[2].raw
+    assert stats.over_budget == 1 and stats.failed_closed == 1
+    assert stats.frozen + stats.passed_through + stats.failed_closed == stats.frames
+
+
+def test_budget_counts_detection_plus_render() -> None:
+    clock = FakeClock()
+    detector = SlowDetector(clock, {1: 0.012})
+    mode = SlowMode(clock, {1: 0.012})
+    stats, traces, sinks = _run(3, [detector], mode=mode, budget_ms=20.0, clock=clock)
+    assert [t.failed_closed for t in traces] == [False, True, False]
+    assert not dict(sinks[0].written)[1].any()
+    assert stats.over_budget == 1
+
+
+def test_under_budget_is_unaffected() -> None:
+    clock = FakeClock()
+    costs = {i: 0.009 for i in range(6)}
+    budget_run = _run(
+        6,
+        [SlowDetector(clock, costs, hits=[2])],
+        mode=SlowMode(clock, costs),
+        stages=[FakeStage()],
+        lookahead=1,
+        budget_ms=20.0,
+        clock=clock,
+    )
+    plain_run = _run(6, [FakeDetector(hits=[2])], stages=[FakeStage()], lookahead=1)
+    assert budget_run[0] == plain_run[0]
+    assert budget_run[0].over_budget == 0
+    assert budget_run[1] == plain_run[1]
+    for (bi, bimg), (pi, pimg) in zip(budget_run[2][0].written, plain_run[2][0].written):
+        assert bi == pi and np.array_equal(bimg, pimg)
+
+
+def test_no_budget_disables_the_check() -> None:
+    clock = FakeClock()
+    costs = {i: 10.0 for i in range(4)}
+    stats, traces, _ = _run(
+        4,
+        [SlowDetector(clock, costs)],
+        mode=SlowMode(clock, costs),
+        budget_ms=None,
+        clock=clock,
+    )
+    assert stats.over_budget == 0 and stats.failed_closed == 0
+    assert not any(t.failed_closed for t in traces)

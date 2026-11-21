@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 
 from petrify.core.config import EncodeConfig
-from petrify.core.frame import Frame, SourceInfo
+from petrify.core.frame import FrameMeta, SourceInfo
 from petrify.encoder import ffmpeg_encode
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,8 @@ class FileSink:
     ``abort`` discards the temporary file without encoding. ``close`` and
     ``abort`` are idempotent and do nothing when ``open`` never succeeded.
     """
+
+    critical = True
 
     def __init__(
         self,
@@ -71,7 +73,7 @@ class FileSink:
         self._writer = writer
         self._temp_path = temp_path
 
-    def write(self, frame: Frame, image: np.ndarray) -> None:
+    def write(self, image: np.ndarray, meta: FrameMeta) -> None:
         """Append one output image."""
         if self._writer is None:
             raise RuntimeError("FileSink is not open")

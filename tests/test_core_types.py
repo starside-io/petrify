@@ -34,6 +34,7 @@ from petrify.core import (
     EngineConfig,
     Face,
     Frame,
+    FrameMeta,
     Mode,
     PersonHogConfig,
     PetrifyConfig,
@@ -83,6 +84,15 @@ def test_frame_constructs_and_is_frozen() -> None:
     assert frame.source.fps == 25.0
     with pytest.raises(dataclasses.FrozenInstanceError):
         frame.index = 1  # type: ignore[misc]
+
+
+def test_frame_meta_has_no_pixels_and_is_frozen() -> None:
+    frame = _frame()
+    meta = frame.meta
+    assert meta == FrameMeta(index=0, timestamp=0.0, source=_info())
+    assert not hasattr(meta, "image")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        meta.index = 1  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +324,18 @@ def test_negative_cold_start_rejected() -> None:
         EngineConfig(cold_start_frames=-1)
 
 
+def test_frame_budget_defaults_to_disabled() -> None:
+    assert EngineConfig().frame_budget_ms is None
+    assert _config().engine.frame_budget_ms is None
+    assert EngineConfig(frame_budget_ms=33.3).frame_budget_ms == 33.3
+
+
+@pytest.mark.parametrize("budget", [0.0, -5.0, float("nan")])
+def test_non_positive_frame_budget_rejected(budget: float) -> None:
+    with pytest.raises(ValueError, match="frame_budget_ms"):
+        EngineConfig(frame_budget_ms=budget)
+
+
 def test_config_frozen() -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         PetrifyConfig().detector = "both"  # type: ignore[misc]
@@ -349,10 +371,12 @@ class _DummyStage:
 
 
 class _DummySink:
+    critical = True
+
     def open(self, info: SourceInfo) -> None:
         pass
 
-    def write(self, frame: Frame, image: np.ndarray) -> None:
+    def write(self, image: np.ndarray, meta: FrameMeta) -> None:
         pass
 
     def close(self) -> None:

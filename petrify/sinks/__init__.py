@@ -19,5 +19,6 @@
 from __future__ import annotations
 
 from petrify.sinks.file import FileSink
+from petrify.sinks.threaded import ThreadedSink
 
-__all__ = ["FileSink"]
+__all__ = ["FileSink", "ThreadedSink"]

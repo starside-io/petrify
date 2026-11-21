@@ -36,6 +36,15 @@ class SourceInfo:
     uri: str | None = None
 
 
+@dataclass(frozen=True)
+class FrameMeta:
+    """A frame's position and origin, without its pixels (what sinks receive)."""
+
+    index: int  # 0-based position in the stream.
+    timestamp: float  # Seconds from stream start.
+    source: SourceInfo
+
+
 @dataclass(frozen=True, eq=False)
 class Frame:
     """One decoded frame: BGR uint8 image (H x W x 3) plus its position in the stream."""
@@ -44,3 +53,8 @@ class Frame:
     index: int  # 0-based position in the stream.
     timestamp: float  # Seconds from stream start.
     source: SourceInfo
+
+    @property
+    def meta(self) -> FrameMeta:
+        """This frame's metadata, without the image."""
+        return FrameMeta(index=self.index, timestamp=self.timestamp, source=self.source)

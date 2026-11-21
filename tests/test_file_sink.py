@@ -69,7 +69,7 @@ def test_open_write_close_encodes_once(tmp_path: Path, monkeypatch: pytest.Monke
     assert temp_path is not None and temp_path.endswith(".mp4")
     for i in range(5):
         f = _frame(i)
-        sink.write(f, f.image)
+        sink.write(f.image, f.meta)
     sink.close()
 
     assert len(spy.calls) == 1
@@ -123,7 +123,7 @@ def test_abort_removes_temp_without_encoding(
     temp_path = sink._temp_path
     assert temp_path is not None
     f = _frame(0)
-    sink.write(f, f.image)
+    sink.write(f.image, f.meta)
     sink.abort()
     assert spy.calls == []
     assert not os.path.exists(temp_path)
@@ -181,6 +181,10 @@ def test_close_and_abort_without_open(tmp_path: Path, monkeypatch: pytest.Monkey
 
 def test_satisfies_sink_protocol(tmp_path: Path) -> None:
     assert isinstance(_sink(tmp_path), Sink)
+
+
+def test_file_sink_is_critical(tmp_path: Path) -> None:
+    assert _sink(tmp_path).critical is True
 
 
 def test_writer_constructor_error_removes_temp_and_reraises(

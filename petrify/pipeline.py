@@ -545,7 +545,6 @@ def run_file(
                     observer(trace)
 
             engine = Engine(
-                source,
                 detectors,
                 EraseMode(background),
                 [RoiOverlay(roi)],
@@ -553,7 +552,7 @@ def run_file(
                 config.engine,
                 on_frame,
             )
-            stats = engine.run()
+            stats = engine.run(source)
     finally:
         source.close()
 

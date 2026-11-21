@@ -24,7 +24,7 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from petrify.core.detections import DetectionKind, Detections
-from petrify.core.frame import Frame, SourceInfo
+from petrify.core.frame import Frame, FrameMeta, SourceInfo
 
 
 @runtime_checkable
@@ -72,11 +72,20 @@ class Stage(Protocol):
 
 @runtime_checkable
 class Sink(Protocol):
-    """Consumes output images."""
+    """Consumes output images.
+
+    A sink only ever receives the processed output image and the frame's metadata,
+    never the input frame. ``abort`` must be safe after a failed ``open``.
+    """
+
+    # True when a failure of this sink must abort the whole run (for example a file
+    # recording). A non-critical sink (for example a preview) that fails is aborted
+    # and dropped while the run continues.
+    critical: bool
 
     def open(self, info: SourceInfo) -> None: ...
 
-    def write(self, frame: Frame, image: np.ndarray) -> None: ...
+    def write(self, image: np.ndarray, meta: FrameMeta) -> None: ...
 
     def close(self) -> None: ...
 
