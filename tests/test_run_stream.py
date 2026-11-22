@@ -253,14 +253,14 @@ def test_erase_mode_requires_differ_exactly_when_model_backed(
     strategy: str, bg_diff: bool, expected: bool
 ) -> None:
     seen: list[bool] = []
-    real = pipeline.EraseMode
+    real = pipeline.EraseMode.__init__
 
-    def spy(background: Any, **kwargs: Any) -> Any:
+    def spy(self: Any, background: Any, **kwargs: Any) -> Any:
         seen.append(kwargs["require_background_diff"])
-        return real(background, **kwargs)
+        return real(self, background, **kwargs)
 
     overrides: dict[str, Any] = {} if bg_diff else {"background_diff": None}
-    with mock.patch.object(pipeline, "EraseMode", side_effect=spy):
+    with mock.patch("petrify.modes.erase.EraseMode.__init__", autospec=True, side_effect=spy):
         run_stream(FakeSource(Scene(total=60)), _live_config(strategy, **overrides),
                    OutputConfig(), sinks=[ListSink()])
     assert seen == [expected]
@@ -1559,7 +1559,7 @@ def test_t2_processed_web_sink_gets_only_engine_output_with_raw_preview_on() -> 
     processed = _RecordingMjpegSink()
     raw = _RecordingMjpegSink()
     config = _live_config("calibrate")
-    with mock.patch.object(pipeline, "EraseMode", _ConstantMode):
+    with mock.patch("petrify.modes.erase.EraseMode", _ConstantMode):
         report = run_stream(src, config, OutputConfig(), web_sink=processed, raw_preview=raw)
     assert report.stats.failed_closed == 0  # Every frame came from the mode.
     assert len(processed.jpegs) == len(raw.jpegs) == len(src.yielded) == 60

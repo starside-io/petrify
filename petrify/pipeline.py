@@ -26,7 +26,7 @@ import signal
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType, TracebackType
@@ -40,13 +40,28 @@ from petrify.background.calibrate import CalibratedBackground, frames_for
 from petrify.background.locked import locked_background
 from petrify.background.running import RunningBackground
 from petrify.background.vetting import person_free
-from petrify.core.config import PetrifyConfig
+from petrify.core.config import OptionValue, PetrifyConfig, mode_options_from
+from petrify.core.detections import DetectionKind
 from petrify.core.engine import Engine, EngineStats, FrameTrace
-from petrify.core.frame import Frame
-from petrify.core.plugin import BackgroundModel, Detector, Sink, Source, Stage
+from petrify.core.frame import Frame, SourceInfo
+from petrify.core.plugin import (
+    BackgroundModel,
+    Detector,
+    Mode,
+    ModeContext,
+    ModeFactory,
+    Refiner,
+    Sink,
+    Source,
+    Stage,
+    _describe_error,
+    resolve_options,
+)
+from petrify.core.registry import ModeLoadError, build_mode, load_mode
 from petrify.detectors.bgdiff import BackgroundDiffer
 from petrify.detectors.motion import MotionDetector
 from petrify.detectors.person_hog import PersonDetector
+from petrify.detectors.tracker import TrackerRefiner
 from petrify.encoder import ffmpeg_encode
 from petrify.modes.erase import EraseMode
 from petrify.roi_detect import WarmupRoiDetector, auto_detect_roi
@@ -941,34 +956,145 @@ class _Components:
     """What :func:`run_stream` built from a config, kept so a later change can reuse it.
 
     ``background`` (the locked image or the online model) is built once and never
-    rebuilt: rebuilding it would discard the learned background.
+    rebuilt: rebuilding it would discard the learned background. It is None when
+    the mode does not use a background. ``roi_stage`` is None when the mode does
+    not allow the ROI overlay. ``factory`` is the loaded mode factory, ``options``
+    its resolved options and ``requires`` what the mode requires for them.
     """
 
     config: PetrifyConfig
     motion: MotionDetector | None
     person: PersonDetector | None
     differ: BackgroundDiffer | None
-    background: np.ndarray | BackgroundModel
-    mode: EraseMode
-    roi_stage: Stage
+    background: np.ndarray | BackgroundModel | None
+    mode: Mode
+    roi_stage: Stage | None
+    factory: ModeFactory
+    options: Mapping[str, OptionValue]
+    requires: frozenset[DetectionKind]
+    refiners: tuple[Refiner, ...]
+    source: SourceInfo
 
     @property
     def detectors(self) -> list[Detector]:
         """The detector list in the engine's order: motion, person, background differ."""
         return [d for d in (self.motion, self.person, self.differ) if d is not None]
 
+    @property
+    def stages(self) -> list[Stage]:
+        """The stage list: the ROI stage when the mode allows it, else nothing."""
+        return [self.roi_stage] if self.roi_stage is not None else []
+
+
+def _mode_options(factory: ModeFactory, config: PetrifyConfig) -> dict[str, OptionValue]:
+    """Resolve ``config.mode_options`` against the factory's options, defaults filled in.
+
+    Raises ``ValueError`` for an unknown option, an invalid value, or a value that
+    resolving would change (for example ``5.0`` for an int option): every value in
+    the config must already be in its declared type.
+    """
+    given = config.mode_options_dict()
+    options = resolve_options(factory.options, given)
+    for name, value in given.items():
+        resolved = options[name]
+        if type(resolved) is not type(value) or resolved != value:
+            raise ValueError(
+                f"mode option {name!r} is {value!r} in the config, which is not its "
+                f"declared form {resolved!r}"
+            )
+    return options
+
+
+def _mode_requires(
+    factory: ModeFactory, options: Mapping[str, OptionValue]
+) -> frozenset[DetectionKind]:
+    """Return ``factory.requires(options)``.
+
+    A ``ValueError`` from the factory propagates (the settings are not acceptable);
+    any other error, or a result that is not a frozenset of DetectionKind, raises
+    :class:`ModeLoadError` (the plugin is faulty), as in :func:`build_mode`.
+    """
+    try:
+        kinds = factory.requires(options)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ModeLoadError(
+            f"mode {factory.name!r}: requires failed: {_describe_error(exc)}"
+        ) from exc
+    if not isinstance(kinds, frozenset) or not all(isinstance(k, DetectionKind) for k in kinds):
+        raise ModeLoadError(
+            f"mode {factory.name!r}: requires must return a frozenset of DetectionKind"
+        )
+    return kinds
+
+
+def _mode_context(
+    source: SourceInfo,
+    config: PetrifyConfig,
+    factory: ModeFactory,
+    options: Mapping[str, OptionValue],
+    background: np.ndarray | BackgroundModel | None,
+) -> ModeContext:
+    """Return the context :func:`build_mode` gets: options filled in, background if needed."""
+    filled = mode_options_from(options)
+    ctx_config = (
+        config if filled == config.mode_options else dataclasses.replace(config, mode_options=filled)
+    )
+    return ModeContext(
+        source, ctx_config, options, background if factory.needs_background else None
+    )
+
+
+def _wants(detector: type, requires: frozenset[DetectionKind]) -> bool:
+    """True when a built-in detector class provides a kind the mode requires."""
+    return bool(detector.provides & requires)  # type: ignore[attr-defined]
+
+
+DIFFER_WITHOUT_BACKGROUND_ERROR = (
+    "The mode {mode!r} requires the background differ but does not use a background, "
+    "and the differ needs one to compare against; turn the background differ off "
+    "(--no-bg-diff) for this mode"
+)
+
 
 def _frame_detectors(
-    config: PetrifyConfig,
+    config: PetrifyConfig, requires: frozenset[DetectionKind]
 ) -> tuple[MotionDetector | None, PersonDetector | None]:
-    """Build the motion and person detectors ``config.detector`` selects."""
+    """Build the motion and person detectors ``config.detector`` selects and the mode requires."""
     motion = None
     person = None
-    if config.detector in ("motion", "both"):
+    if config.detector in ("motion", "both") and _wants(MotionDetector, requires):
         motion = MotionDetector.from_config(config.motion)
-    if config.detector in ("person", "both"):
+    if config.detector in ("person", "both") and _wants(PersonDetector, requires):
         person = PersonDetector.from_config(config.person)
     return motion, person
+
+
+def _refiners(config: PetrifyConfig, requires: frozenset[DetectionKind]) -> tuple[Refiner, ...]:
+    """Build the tracker refiners for the kinds the mode requires, or none without a tracker."""
+    tracker = config.tracker
+    if tracker is None:
+        return ()
+    refiners: list[Refiner] = []
+    if DetectionKind.PERSONS in requires:
+        refiners.append(TrackerRefiner.from_config(DetectionKind.PERSONS, tracker))
+    if DetectionKind.FACES in requires:
+        refiners.append(
+            TrackerRefiner.from_config(
+                DetectionKind.FACES, tracker, landmarks=DetectionKind.LANDMARKS in requires
+            )
+        )
+    return tuple(refiners)
+
+
+def _tracked_kinds(requires: frozenset[DetectionKind]) -> tuple[bool, bool, bool]:
+    """What :func:`_refiners` builds for ``requires``: persons, faces, landmarks."""
+    return (
+        DetectionKind.PERSONS in requires,
+        DetectionKind.FACES in requires,
+        DetectionKind.LANDMARKS in requires,
+    )
 
 
 def _background_differ(
@@ -1003,18 +1129,54 @@ def _requires_differ(
 
 
 def _build_components(source: Source, config: PetrifyConfig) -> tuple[_Components, int | None]:
-    """Build the detectors, ROI stage, background and mode at startup.
+    """Build the mode factory, detectors, ROI stage, background, mode and refiners at startup.
 
-    Same order as :func:`run_file`: detectors, ROI, background, then the
-    background differ. Returns the components and the locked background's index.
+    The factory for ``config.mode`` is loaded from the registry first; a
+    :class:`ModeLoadError` propagates unchanged. Then, in the same order as
+    :func:`run_file`: detectors, ROI, background, the background differ, and the
+    mode built with :func:`build_mode`. A built-in detector is built only when
+    the config enables it and it provides a kind the mode requires. The
+    background is built only when the factory needs one, and the ROI stage only
+    when the factory allows the overlay. Raises ``ValueError`` when the settings
+    cannot work with the mode. Returns the components and the locked
+    background's index.
     """
-    motion, person = _frame_detectors(config)
+    factory = load_mode(config.mode)
+    options = _mode_options(factory, config)
+    requires = _mode_requires(factory, options)
+    wants_differ = DetectionKind.BACKGROUND_DIFF in requires
+    if wants_differ and not factory.needs_background and config.background_diff is not None:
+        raise ValueError(DIFFER_WITHOUT_BACKGROUND_ERROR.format(mode=config.mode))
+    motion, person = _frame_detectors(config, requires)
     logger.info("Detector mode: %s", config.detector)
-    roi_stage = _roi_stage(source, config)
-    background, bg_idx = _background_for(source, config)
-    differ = _background_differ(background, config, source.info.live)
-    mode = EraseMode(background, require_background_diff=_requires_differ(background, differ))
-    components = _Components(config, motion, person, differ, background, mode, roi_stage)
+    roi_stage: Stage | None = None
+    if factory.roi_overlay:
+        roi_stage = _roi_stage(source, config)
+    else:
+        logger.info("ROI: not used, the mode %r does not allow the overlay", config.mode)
+    background: np.ndarray | BackgroundModel | None = None
+    bg_idx: int | None = None
+    differ: BackgroundDiffer | None = None
+    if factory.needs_background:
+        background, bg_idx = _background_for(source, config)
+        if wants_differ:
+            differ = _background_differ(background, config, source.info.live)
+    ctx = _mode_context(source.info, config, factory, options, background)
+    mode = build_mode(factory, ctx)
+    components = _Components(
+        config=config,
+        motion=motion,
+        person=person,
+        differ=differ,
+        background=background,
+        mode=mode,
+        roi_stage=roi_stage,
+        factory=factory,
+        options=options,
+        requires=requires,
+        refiners=_refiners(config, requires),
+        source=source.info,
+    )
     return components, bg_idx
 
 
@@ -1024,47 +1186,88 @@ def _rebuild(old: _Components, new: PetrifyConfig) -> tuple[_Components, dict[st
     Only what changed is rebuilt; an unchanged detector is reused (the engine
     still resets every detector when the detector list changes). The background
     model or image is always kept, and a model-backed differ is rebuilt from that
-    same model. The erase mode is replaced, around the same background model,
-    whenever its ``require_background_diff`` must change, so the flag always
-    matches whether a model-backed differ is in the detector list. At runtime the
-    ROI is either a manual box or disabled. Raises ``ValueError`` for an invalid
-    combination; nothing is installed then.
+    same model. The mode is rebuilt with :func:`build_mode` and the current mode
+    as ``previous``, so the factory keeps the same object when nothing it depends
+    on changed (for erase: the same background and ``require_background_diff``).
+    Whenever the detectors change, the refiners are handed over too, so the
+    engine resets them. At runtime the ROI is either a manual box or disabled, and
+    stays absent for a mode without the overlay. The mode itself cannot change.
+
+    Raises ``ValueError`` for an invalid combination, including a faulty plugin
+    (its :class:`ModeLoadError` becomes a ``ValueError``); nothing is installed then.
     """
+    try:
+        return _rebuild_components(old, new)
+    except ModeLoadError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _rebuild_components(
+    old: _Components, new: PetrifyConfig
+) -> tuple[_Components, dict[str, Any]]:
     cfg = old.config
+    if new.mode != cfg.mode:
+        raise ValueError(
+            f"The mode cannot be changed during a run (from {cfg.mode!r} to {new.mode!r}); "
+            "start a new run with the other mode"
+        )
+    factory = old.factory
+    options = _mode_options(factory, new)
+    requires = _mode_requires(factory, options)
     motion: MotionDetector | None = None
-    if new.detector in ("motion", "both"):
+    if new.detector in ("motion", "both") and _wants(MotionDetector, requires):
         motion = old.motion
         if motion is None or new.motion != cfg.motion:
             motion = MotionDetector.from_config(new.motion)
     person: PersonDetector | None = None
-    if new.detector in ("person", "both"):
+    if new.detector in ("person", "both") and _wants(PersonDetector, requires):
         person = old.person
         if person is None or new.person != cfg.person:
             person = PersonDetector.from_config(new.person)
-    differ = old.differ
-    if new.background_diff != cfg.background_diff:
-        differ = None
-        if new.background_diff is not None:
+    differ: BackgroundDiffer | None = None
+    if new.background_diff is not None and DetectionKind.BACKGROUND_DIFF in requires:
+        differ = old.differ
+        if differ is None or new.background_diff != cfg.background_diff:
+            if old.background is None:
+                raise ValueError(DIFFER_WITHOUT_BACKGROUND_ERROR.format(mode=new.mode))
             if isinstance(old.background, np.ndarray):
                 differ = BackgroundDiffer.from_config(old.background, new.background_diff)
             else:
                 differ = BackgroundDiffer.from_model(old.background, new.background_diff)
-    mode = old.mode
-    require = _requires_differ(old.background, differ)
-    if require != mode.require_background_diff:
-        mode = EraseMode(old.mode.model, require_background_diff=require)
+    ctx = _mode_context(old.source, new, factory, options, old.background)
+    mode = build_mode(factory, ctx, old.mode)
     roi_stage = old.roi_stage
-    if new.roi != cfg.roi:
+    if roi_stage is not None and new.roi != cfg.roi:
         roi_stage = RoiOverlay(new.roi.box if new.roi.mode == "manual" else None)
+    refiners = old.refiners
+    if new.tracker != cfg.tracker or _tracked_kinds(requires) != _tracked_kinds(old.requires):
+        refiners = _refiners(new, requires)
 
-    built = _Components(new, motion, person, differ, old.background, mode, roi_stage)
+    built = _Components(
+        config=new,
+        motion=motion,
+        person=person,
+        differ=differ,
+        background=old.background,
+        mode=mode,
+        roi_stage=roi_stage,
+        factory=factory,
+        options=options,
+        requires=requires,
+        refiners=refiners,
+        source=old.source,
+    )
     kwargs: dict[str, Any] = {}
-    if [id(d) for d in built.detectors] != [id(d) for d in old.detectors]:
+    detectors_changed = [id(d) for d in built.detectors] != [id(d) for d in old.detectors]
+    if detectors_changed:
         kwargs["detectors"] = built.detectors
+    refiners_changed = [id(r) for r in refiners] != [id(r) for r in old.refiners]
+    if refiners_changed or (detectors_changed and refiners):
+        kwargs["refiners"] = list(refiners)
     if mode is not old.mode:
         kwargs["mode"] = mode
     if roi_stage is not old.roi_stage:
-        kwargs["stages"] = [roi_stage]
+        kwargs["stages"] = built.stages
     if new.engine != cfg.engine:
         kwargs["config"] = new.engine
     return built, kwargs
@@ -1176,16 +1379,26 @@ class _Publisher:
         background = BackgroundState(strategy=config.background.strategy)
         roi = None
         if components is not None:
-            model = components.mode.model
-            try:
-                ready = model.current() is not None
-            except Exception:  # noqa: BLE001 (a failing model is simply not ready)
-                ready = False
-            background = BackgroundState(
-                strategy=config.background.strategy,
-                ready=ready,
-                rejected=int(getattr(model, "rejected", 0) or 0),
-            )
+            # A plugin mode need not have a ``model``; fall back to the built background.
+            model = getattr(components.mode, "model", None)
+            if model is None:
+                model = components.background
+            if isinstance(model, np.ndarray):
+                background = BackgroundState(strategy=config.background.strategy, ready=True)
+            elif model is not None:
+                try:
+                    ready = model.current() is not None
+                except Exception:  # noqa: BLE001 (a failing model is simply not ready)
+                    ready = False
+                try:
+                    rejected = int(getattr(model, "rejected", 0) or 0)
+                except Exception:  # noqa: BLE001 (a plugin attribute that is not a count)
+                    rejected = 0
+                background = BackgroundState(
+                    strategy=config.background.strategy,
+                    ready=ready,
+                    rejected=rejected,
+                )
             roi = getattr(components.roi_stage, "roi", None)
         info = self._source.info
         self._control.publish(
@@ -1405,10 +1618,20 @@ def run_stream(
                 if observer is not None:
                     observer(trace)
 
-            stages: list[Stage] = [components.roi_stage]
-            engine = Engine(
-                components.detectors, components.mode, stages, sink_list, config.engine, on_frame
-            )
+            try:
+                engine = Engine(
+                    components.detectors,
+                    components.mode,
+                    components.stages,
+                    sink_list,
+                    config.engine,
+                    on_frame,
+                    refiners=components.refiners,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"The settings cannot run with the mode {config.mode!r}: {exc}"
+                ) from exc
             after_step: Callable[[], None] | None = None
             if control is not None and publisher is not None:
                 publisher.attach(components, engine)
