@@ -825,3 +825,520 @@ def test_importing_the_cli_does_not_import_the_web_stack() -> None:
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          check=True)
     assert out.stdout.strip() == "[]"
+
+
+# ---------------------------------------------------------------------------
+# petrify run: mode selection from the registry (T12)
+# ---------------------------------------------------------------------------
+
+T12_MODULE = "t12cli_kinds"
+T12_OTHER = "t12cli_other"
+T12_BROKEN = "t12cli_broken"
+T12_SLOW = "t12cli_slow"
+T12_DIST = "petrify-t12-cli"
+T12_ORIGIN = f"{T12_DIST} 0.1"
+
+_T12_SOURCE = '''
+import numpy as np
+
+from petrify.core.detections import DetectionKind
+from petrify.core.plugin import OptionSpec
+
+
+class KindsMode:
+    detect_policy = "all"
+    mandatory = frozenset()
+
+    def __init__(self, name):
+        self.name = name
+        self.requires = frozenset({DetectionKind.PERSONS})
+
+    def render(self, frame, detections, subject_present):
+        return np.zeros_like(frame.image)
+
+
+class KindsFactory:
+    needs_background = False
+    roi_overlay = False
+
+    def __init__(self, name, summary, options):
+        self.name = name
+        self.summary = summary
+        self.options = options
+
+    def requires(self, options):
+        return frozenset({DetectionKind.PERSONS})
+
+    def mandatory(self, options):
+        return frozenset()
+
+    def weakened(self, options):
+        return ()
+
+    def create(self, ctx, previous=None):
+        return KindsMode(self.name)
+
+
+KINDS = KindsFactory("kinds", "One option of each kind, for tests.", (
+    OptionSpec("flag", "bool", False, "a flag", runtime=True),
+    OptionSpec("count", "int", 3, "a count", minimum=1, maximum=10),
+    OptionSpec("ratio", "float", 0.5, "a ratio", minimum=0.0),
+    OptionSpec("style", "choice", "flat", "a style", choices=("flat", "round")),
+    OptionSpec("parts", "choices", ("head",), "some parts", choices=("head", "hands", "feet")),
+))
+DUP = KindsFactory("dup", "Registered twice.", ())
+'''
+
+_T12_ENTRY_POINTS = {
+    "kinds": f"{T12_MODULE}:KINDS",
+    "other": f"{T12_OTHER}:FACTORY",
+    "broken": f"{T12_BROKEN}:FACTORY",
+    "slow": f"{T12_SLOW}:FACTORY",
+    "dup": f"{T12_MODULE}:DUP",
+    "erase": f"{T12_OTHER}:FACTORY",
+    "Bad-Name": f"{T12_OTHER}:FACTORY",
+    "badvalue": "not a target",
+}
+_T12_MODULES = (T12_MODULE, T12_OTHER, T12_BROKEN, T12_SLOW)
+
+
+def _t12_dist(root: Path, name: str, version: str, entries: dict[str, str]) -> None:
+    info = root / f"{name.replace('-', '_')}-{version}.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+    lines = "".join(f"{key} = {target}\n" for key, target in entries.items())
+    (info / "entry_points.txt").write_text(f"[petrify.modes]\n{lines}")
+
+
+@pytest.fixture
+def t12_plugins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Install fake distributions with plugin modes on a temporary ``sys.path`` entry.
+
+    Each plugin module leaves a marker file when imported, so a test can tell
+    whether it was imported even after ``sys.modules`` is cleaned.
+    """
+    root = tmp_path / "site"
+    root.mkdir()
+    _t12_dist(root, T12_DIST, "0.1", _T12_ENTRY_POINTS)
+    _t12_dist(root, "petrify-t12-rival", "2.0", {"dup": f"{T12_OTHER}:FACTORY"})
+
+    def marker(name: str) -> str:
+        return f"open({str(root / ('imported_' + name))!r}, 'w').close()\n"
+
+    (root / f"{T12_MODULE}.py").write_text(marker(T12_MODULE) + _T12_SOURCE)
+    (root / f"{T12_OTHER}.py").write_text(marker(T12_OTHER) + "FACTORY = None\n")
+    (root / f"{T12_BROKEN}.py").write_text(
+        marker(T12_BROKEN) + "raise KeyError('broken at import\\nsecond line')\n"
+    )
+    (root / f"{T12_SLOW}.py").write_text(
+        marker(T12_SLOW) + "import time\ntime.sleep(5)\nFACTORY = None\n"
+    )
+    monkeypatch.syspath_prepend(str(root))
+    try:
+        yield root
+    finally:
+        for name in _T12_MODULES:
+            sys.modules.pop(name, None)
+
+
+def _imported(root: Path, name: str) -> bool:
+    return name in sys.modules or (root / f"imported_{name}").exists()
+
+
+def _run_args(*extra: str) -> list[str]:
+    return ["run", "--source", IN, "--output", OUT, *extra]
+
+
+def _usage_error(argv: list[str], capsys: pytest.CaptureFixture[str]) -> str:
+    with pytest.raises(SystemExit) as excinfo:
+        main(argv)
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "usage: petrify run" in err
+    return err
+
+
+def test_t12_plugin_mode_reaches_run_stream(
+    t12_plugins: Path, run_stream: mock.MagicMock
+) -> None:
+    assert main(_run_args("--mode", "kinds")) == 0
+    _, config, _ = run_stream.call_args.args
+    assert config.mode == "kinds"
+    # Every declared option is stored, defaults filled in, in its declared type.
+    assert config.mode_options == (
+        ("count", 3), ("flag", False), ("parts", ("head",)), ("ratio", 0.5), ("style", "flat"),
+    )
+    assert not _imported(t12_plugins, T12_OTHER)
+
+
+def test_t12_default_mode_is_erase(run_stream: mock.MagicMock) -> None:
+    assert main(_run_args()) == 0
+    _, config, _ = run_stream.call_args.args
+    assert (config.mode, config.mode_options) == ("erase", ())
+    assert main(_run_args("--mode", "erase")) == 0
+    assert run_stream.call_args.args[1].mode == "erase"
+
+
+def test_t12_unknown_mode_lists_the_selectable_modes(
+    t12_plugins: Path, run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    err = _usage_error(_run_args("--mode", "shadow"), capsys)
+    listed = err.split("invalid choice", 1)[1]
+    for name in ("erase", "kinds", "broken", "slow", "other"):
+        assert name in listed
+    # Unselectable entries are not offered.
+    assert "dup" not in listed and "Bad-Name" not in listed and "badvalue" not in listed
+    run_stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("name", "reason"),
+    [
+        ("dup", "ambiguous: the mode name 'dup' is registered more than once"),
+        ("Bad-Name", "invalid mode name"),
+        ("badvalue", "invalid entry point value"),
+    ],
+)
+def test_t12_unselectable_mode_gives_its_reason(
+    t12_plugins: Path,
+    run_stream: mock.MagicMock,
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+    reason: str,
+) -> None:
+    err = _usage_error(_run_args("--mode", name), capsys)
+    assert "invalid choice" not in err
+    assert f"argument --mode: the mode {name!r} cannot be selected" in err
+    assert reason in err
+    assert T12_ORIGIN in err
+    run_stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("assignment", "key", "value"),
+    [
+        ("flag=yes", "flag", True),
+        ("flag=OFF", "flag", False),
+        ("count=7", "count", 7),
+        ("ratio=2", "ratio", 2.0),
+        ("ratio=0.25", "ratio", 0.25),
+        ("style=round", "style", "round"),
+        ("parts=feet,head", "parts", ("feet", "head")),
+        ("parts=", "parts", ()),
+    ],
+)
+def test_t12_mode_option_lands_in_the_config_in_its_declared_type(
+    t12_plugins: Path, run_stream: mock.MagicMock, assignment: str, key: str, value: object
+) -> None:
+    assert main(_run_args("--mode", "kinds", "--mode-option", assignment)) == 0
+    options = run_stream.call_args.args[1].mode_options_dict()
+    assert options[key] == value
+    assert type(options[key]) is type(value)
+    assert set(options) == {"flag", "count", "ratio", "style", "parts"}
+
+
+def test_t12_several_mode_options(t12_plugins: Path, run_stream: mock.MagicMock) -> None:
+    argv = _run_args("--mode", "kinds", "--mode-option", "count=2", "--mode-option", "flag=1")
+    assert main(argv) == 0
+    options = run_stream.call_args.args[1].mode_options_dict()
+    assert (options["count"], options["flag"]) == (2, True)
+
+
+@pytest.mark.parametrize(
+    ("assignments", "message"),
+    [
+        (["size=3"], "unknown mode option 'size'"),
+        (["count=abc"], "option 'count' must be a whole number"),
+        (["count=11"], "option 'count' must be at most 10"),
+        (["ratio=nan"], "option 'ratio' must be a number"),
+        (["flag=maybe"], "option 'flag' must be true or false"),
+        (["style=square"], "option 'style' must be one of flat, round"),
+        (["parts=head,head"], "option 'parts' must not repeat a choice"),
+        (["count=2", "count=3"], "mode option 'count' is given more than once"),
+        (["count"], "mode options must be written KEY=VALUE, got 'count'"),
+    ],
+)
+def test_t12_mode_option_usage_errors(
+    t12_plugins: Path,
+    run_stream: mock.MagicMock,
+    capsys: pytest.CaptureFixture[str],
+    assignments: list[str],
+    message: str,
+) -> None:
+    argv = _run_args("--mode", "kinds")
+    for assignment in assignments:
+        argv += ["--mode-option", assignment]
+    err = _usage_error(argv, capsys)
+    assert "petrify run: error: --mode-option: " in err
+    assert message in err
+    assert (
+        "Options of the mode 'kinds': flag (bool), count (int), ratio (float), "
+        "style (choice), parts (choices)"
+    ) in err
+    run_stream.assert_not_called()
+    petrify.sources.open_source.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_t12_mode_option_with_erase_is_a_usage_error(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    err = _usage_error(_run_args("--mode-option", "x=1"), capsys)
+    assert "--mode-option: the mode 'erase' has no options" in err
+    run_stream.assert_not_called()
+
+
+def test_t12_list_modes_alone(t12_plugins: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    with mock.patch.object(petrify.sources, "open_source") as open_source:
+        assert main(["run", "--list-modes"]) == 0
+    open_source.assert_not_called()
+    captured = capsys.readouterr()
+    assert "Freeze the world" not in captured.err
+    out = captured.out
+    lines = out.splitlines()
+    assert lines[0] == "Modes (select one with --mode NAME):"
+    assert lines[1] == (
+        "  erase (built in): Show the clean background while a subject is present, "
+        "the live frame otherwise."
+    )
+    assert f"  kinds (plugin {T12_ORIGIN})" in lines
+    assert f"  broken (plugin {T12_ORIGIN})" in lines
+    assert f"  slow (plugin {T12_ORIGIN})" in lines
+    assert (
+        f"  erase (plugin {T12_ORIGIN}): not selectable: shadowed by the built-in mode "
+        "'erase'; it can never be selected"
+    ) in lines
+    assert any(
+        line.startswith("  dup (plugin petrify-t12-rival 2.0): not selectable: ambiguous")
+        for line in lines
+    )
+    assert any(
+        line.startswith(f"  Bad-Name (plugin {T12_ORIGIN}): not selectable: invalid mode name")
+        for line in lines
+    )
+    assert any(
+        line.startswith(f"  badvalue (plugin {T12_ORIGIN}): not selectable: invalid entry point")
+        for line in lines
+    )
+    # A plugin's summary needs its code, so it is not shown, and nothing was imported.
+    assert "One option of each kind" not in out
+    assert "Options" not in out
+    for name in _T12_MODULES:
+        assert not _imported(t12_plugins, name)
+
+
+def test_t12_list_modes_with_a_plugin_mode_prints_its_options(
+    t12_plugins: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["run", "--list-modes", "--mode", "kinds"]) == 0
+    out = capsys.readouterr().out
+    detail = out.split("\n\n", 1)[1]
+    assert detail == (
+        f"Mode kinds (plugin {T12_ORIGIN}): One option of each kind, for tests.\n"
+        "Options (set with --mode-option NAME=VALUE):\n"
+        "  flag\n    kind: bool\n    default: false\n"
+        "    changeable while running: yes\n    help: a flag\n"
+        "  count\n    kind: int\n    default: 3\n    range: 1 to 10\n"
+        "    changeable while running: no\n    help: a count\n"
+        "  ratio\n    kind: float\n    default: 0.5\n    range: at least 0.0\n"
+        "    changeable while running: no\n    help: a ratio\n"
+        "  style\n    kind: choice\n    default: flat\n    choices: flat, round\n"
+        "    changeable while running: no\n    help: a style\n"
+        "  parts\n    kind: choices\n    default: head\n    choices: head, hands, feet\n"
+        "    changeable while running: no\n    help: some parts\n"
+    )
+    assert _imported(t12_plugins, T12_MODULE)
+    for name in (T12_OTHER, T12_BROKEN, T12_SLOW):
+        assert not _imported(t12_plugins, name)
+
+
+def test_t12_list_modes_with_erase(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["run", "--list-modes", "--mode", "erase"]) == 0
+    assert capsys.readouterr().out.endswith(
+        "\n\nMode erase (built in): Show the clean background while a subject is present, "
+        "the live frame otherwise.\nOptions: none\n"
+    )
+
+
+def test_t12_list_modes_with_a_broken_plugin(
+    t12_plugins: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    assert main(["run", "--list-modes", "--mode", "broken"]) == 1
+    assert f"  broken (plugin {T12_ORIGIN})" in capsys.readouterr().out
+    (record,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    message = record.getMessage()
+    assert message.startswith(f"Fatal error: mode 'broken' ({T12_ORIGIN}) could not be imported")
+    assert "\n" not in message
+
+
+def test_t12_list_modes_selects_the_run_form() -> None:
+    from petrify.cli import _run_form_argv
+
+    assert _run_form_argv(["run", "--list-modes"]) == ["--list-modes"]
+    assert _run_form_argv(["--verbose", "run", "--list-modes", "--mode", "x"]) == [
+        "--verbose", "--list-modes", "--mode", "x"]
+    assert _run_form_argv(["--mode-option", "run", "x.mp4", "--list-modes"]) is None
+
+
+def test_t12_source_is_required_without_list_modes(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parser = _build_run_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        _resolve_run(parser, parser.parse_args(["--output", OUT]))
+    assert excinfo.value.code == 2
+    assert "the following arguments are required: --source" in capsys.readouterr().err
+    run_stream.assert_not_called()
+
+
+@pytest.mark.parametrize("verbose", [False, True], ids=["quiet", "verbose"])
+def test_t12_broken_plugin_is_a_one_line_error(
+    t12_plugins: Path,
+    run_stream: mock.MagicMock,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    verbose: bool,
+) -> None:
+    argv = _run_args("--mode", "broken", *(["--verbose"] if verbose else []))
+    assert main(argv) == 1
+    (record,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    message = record.getMessage()
+    assert message.startswith(f"Fatal error: mode 'broken' ({T12_ORIGIN}) could not be imported")
+    assert "KeyError" in message and "\n" not in message
+    # A traceback only on the CLI's existing verbose path.
+    assert bool(record.exc_info) is verbose
+    if not verbose:
+        assert "Traceback" not in capsys.readouterr().err + caplog.text
+    run_stream.assert_not_called()
+    petrify.sources.open_source.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_t12_mode_error_from_run_stream_is_reported_the_same_way(
+    t12_plugins: Path, run_stream: mock.MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    from petrify.core.registry import ModeLoadError
+
+    run_stream.side_effect = ModeLoadError("mode 'kinds': create failed: RuntimeError: bug\nx")
+    assert main(_run_args("--mode", "kinds")) == 1
+    (record,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert record.getMessage() == (
+        "Fatal error: mode 'kinds': create failed: RuntimeError: bug x "
+        f"(mode 'kinds', {T12_ORIGIN})"
+    )
+    assert not record.exc_info
+
+
+def _trust_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "installed plugin" in r.getMessage()]
+
+
+def test_t12_trust_warning_for_a_plugin_mode(
+    t12_plugins: Path, run_stream: mock.MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    assert main(_run_args("--mode", "kinds")) == 0
+    assert _trust_warnings(caplog) == [
+        f"The mode 'kinds' comes from the installed plugin {T12_ORIGIN}. It runs in the "
+        "petrify process with petrify's permissions and receives the unprocessed frames, "
+        "people included."
+    ]
+
+
+def test_t12_no_trust_warning_for_erase(
+    t12_plugins: Path, run_stream: mock.MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    assert main(_run_args()) == 0
+    assert main(_run_args("--mode", "erase")) == 0
+    assert _trust_warnings(caplog) == []
+    for name in _T12_MODULES:
+        assert not _imported(t12_plugins, name)
+
+
+def test_t12_tracker_flags_reach_the_config() -> None:
+    from petrify.core.config import TrackerConfig
+
+    assert _resolved(["--source", IN, "--output", OUT])[0].tracker is None
+    assert _resolved(["--source", IN, "--output", OUT, "--track"])[0].tracker == TrackerConfig()
+    config, _ = _resolved(["--source", IN, "--output", OUT, "--track-hold", "40"])
+    assert config.tracker == TrackerConfig(hold_frames=40)
+    config, _ = _resolved(["--source", IN, "--output", OUT, "--track", "--track-hold", "0"])
+    assert config.tracker == TrackerConfig(hold_frames=0)
+    assert TrackerConfig().hold_frames == 15  # The default the --track-hold help names.
+    assert "(implies --track). Default: 15." in " ".join(
+        _build_run_parser().format_help().split())
+
+
+@pytest.mark.parametrize("value", ["-1", "10001"])
+def test_t12_track_hold_out_of_range_is_a_usage_error(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str], value: str
+) -> None:
+    err = _usage_error(_run_args("--track-hold", value), capsys)
+    assert "--track-hold: TrackerConfig.hold_frames must be a whole number from 0 to 10000" in err
+    run_stream.assert_not_called()
+
+
+def test_t12_tracker_with_erase_is_a_clear_startup_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import cv2
+    import numpy as np
+
+    from tests.test_run_stream import ListSink
+
+    for i in range(3):
+        cv2.imwrite(str(tmp_path / f"f{i:03d}.png"), np.full((256, 320, 3), 90, np.uint8))
+    with mock.patch.object(petrify.pipeline, "_build_sinks", return_value=[ListSink()]):
+        code = main(["run", "--source", str(tmp_path), "--preview", "--track",
+                     "--background", "running"])
+    assert code == 1
+    (record,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert record.getMessage().startswith(
+        "Fatal error: The settings cannot run with the mode 'erase': "
+    )
+    assert "\n" not in record.getMessage()
+    assert not record.exc_info
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_t12_model_dir_reaches_the_config(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from petrify.core.config import ModelConfig
+
+    assert _resolved(["--source", IN, "--output", OUT])[0].models == ModelConfig()
+    config, _ = _resolved(["--source", IN, "--output", OUT, "--model-dir", "/opt/models"])
+    assert config.models == ModelConfig(dir="/opt/models")
+    assert main(_run_args("--model-dir", "/opt/models")) == 0
+    assert run_stream.call_args.args[1].models == ModelConfig(dir="/opt/models")
+    err = _usage_error(_run_args("--model-dir", " "), capsys)
+    assert "--model-dir: ModelConfig.dir must be None or a path" in err
+
+
+def test_t12_file_form_ignores_broken_and_slow_plugins(
+    t12_plugins: Path, run_file: mock.MagicMock
+) -> None:
+    import petrify.core.registry
+
+    with mock.patch.object(
+        petrify.core.registry, "list_modes", side_effect=AssertionError("discovery ran")
+    ):
+        assert main([IN, OUT]) == 0
+        assert main(["run", OUT]) == 0
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--help"])
+        assert excinfo.value.code == 0
+    assert run_file.call_count == 2
+    assert run_file.call_args_list[0].args[2] == PetrifyConfig()
+    for name in _T12_MODULES:
+        assert not _imported(t12_plugins, name)
+
+
+def test_t12_building_the_run_parser_does_not_discover_modes() -> None:
+    import petrify.core.registry
+
+    # Only the run form's own help lists the choices and so discovers the modes.
+    with mock.patch.object(
+        petrify.core.registry, "list_modes", side_effect=AssertionError("discovery ran")
+    ):
+        _build_run_parser().format_usage()
+        args = _build_run_parser().parse_args(["--source", IN, "--mode", "erase"])
+    assert args.mode == "erase"

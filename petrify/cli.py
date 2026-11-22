@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any
 from petrify import __version__
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from petrify.core.config import PetrifyConfig
     from petrify.pipeline import OutputConfig
 
@@ -457,8 +459,16 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# Modes ``petrify run --mode`` accepts. Only the built-in erase mode exists so far.
+# Built-in modes ``petrify run --mode`` accepts; installed plugins may add more (see
+# _ModeCatalog).
 RUN_MODES = ("erase",)
+
+# The mode used when --mode is not given.
+_DEFAULT_MODE = "erase"
+
+# TrackerConfig.hold_frames default, for the --track-hold help text (importing the
+# config here would slow down every invocation).
+_TRACK_HOLD_DEFAULT = 15
 
 # Default --lookahead: the file form's --gap-fill default for a file or image folder
 # and for a stream URL (CCTV, where a subject may enter slowly), a short delay for a
@@ -482,7 +492,77 @@ _LIVE_KINDS = ("camera", "stream")
 _WEB_PORT = 8765
 
 
-def _build_run_parser() -> argparse.ArgumentParser:
+def _one_line(value: object) -> str:
+    """Return ``value`` as text on one line, with control characters replaced by spaces."""
+    text = "".join(ch if ch.isprintable() else " " for ch in str(value))
+    return " ".join(text.split())
+
+
+class _ModeCatalog:
+    """The modes ``--mode`` accepts, discovered on first use.
+
+    It serves as the ``choices`` of ``--mode``: membership and iteration cover the
+    selectable modes only, so an unknown name gets argparse's usual "invalid
+    choice" error listing them. Discovery (:func:`petrify.core.registry.list_modes`)
+    runs only when the run form needs it, never while the parser is built, so the
+    file form and ``--help`` do not pay for it. A built-in name never needs it.
+    Discovery reads entry point metadata alone and imports no plugin.
+    """
+
+    def __init__(self) -> None:
+        self._entries: tuple[Any, ...] | None = None
+
+    def entries(self) -> tuple[Any, ...]:
+        """Every listed mode (``ModeEntry``), selectable or not."""
+        if self._entries is None:
+            from petrify.core.registry import list_modes  # noqa: PLC0415
+
+            self._entries = list_modes()
+        return self._entries
+
+    def selectable(self) -> list[str]:
+        """The names ``--mode`` accepts, in listing order."""
+        names: list[str] = []
+        for entry in self.entries():
+            if entry.problem is None and entry.name not in names:
+                names.append(entry.name)
+        return names
+
+    def selected(self, name: str) -> Any:
+        """The selectable entry named ``name``, or None."""
+        for entry in self.entries():
+            if entry.name == name and entry.problem is None:
+                return entry
+        return None
+
+    def __contains__(self, name: object) -> bool:
+        return name in RUN_MODES or name in self.selectable()
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.selectable())
+
+    def check_name(self, text: str) -> str:
+        """The ``--mode`` type: reject a listed but unselectable name with its reason.
+
+        Any other name is returned unchanged; argparse then checks it against the
+        selectable names.
+        """
+        if text in RUN_MODES:
+            return text
+        matching = [entry for entry in self.entries() if entry.name == text]
+        if matching and all(entry.problem is not None for entry in matching):
+            reasons = "; ".join(
+                f"{_one_line(entry.origin)}: {_one_line(entry.problem)}" for entry in matching
+            )
+            raise argparse.ArgumentTypeError(
+                f"the mode {_one_line(text)!r} cannot be selected: {reasons}"
+            )
+        return text
+
+
+def _build_run_parser(modes: _ModeCatalog | None = None) -> argparse.ArgumentParser:
+    """Build the run form's parser; ``modes`` is the catalog ``--mode`` selects from."""
+    catalog = modes if modes is not None else _ModeCatalog()
     parser = argparse.ArgumentParser(
         prog="petrify run",
         description=(
@@ -513,21 +593,53 @@ def _build_run_parser() -> argparse.ArgumentParser:
 
     # -- Source and mode ----------------------------------------------------
     src_group = parser.add_argument_group("Source and Mode")
+    # Required, except with --list-modes; _resolve_run reports it missing.
     src_group.add_argument(
         "--source",
-        required=True,
+        default=None,
         metavar="SPEC",
         help=(
             "What to read: a video file path, an image folder or glob (for example "
             "'frames/*.png'), camera:N for webcam number N, or an rtsp://, rtsps://, "
-            "http:// or https:// stream URL. A bare number is a file name, not a camera."
+            "http:// or https:// stream URL. A bare number is a file name, not a camera. "
+            "Required, except with --list-modes."
         ),
     )
     src_group.add_argument(
         "--mode",
-        choices=RUN_MODES,
-        default="erase",
-        help="Processing mode. 'erase': freeze the subject out of the scene. Default: erase.",
+        type=catalog.check_name,
+        choices=catalog,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Processing mode. 'erase' (built in): freeze the subject out of the scene. "
+            "Installed plugins can add modes; a plugin mode is ordinary Python code that "
+            "runs in the petrify process and receives the unprocessed frames, so install "
+            "only plugins you trust. --list-modes shows the available modes. "
+            "Default: erase."
+        ),
+    )
+    src_group.add_argument(
+        "--mode-option",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        dest="mode_option",
+        help=(
+            "Set an option of the selected mode; repeat it for several options. "
+            "--list-modes --mode NAME shows a mode's options. The erase mode has none."
+        ),
+    )
+    src_group.add_argument(
+        "--list-modes",
+        action="store_true",
+        default=False,
+        dest="list_modes",
+        help=(
+            "Print the available modes and exit; needs no --source. With --mode NAME, "
+            "also print that mode's options. No plugin is imported except the one "
+            "named by --mode."
+        ),
     )
     src_group.add_argument(
         "--fps",
@@ -686,6 +798,40 @@ def _build_run_parser() -> argparse.ArgumentParser:
     )
     _add_detector_group(parser)
 
+    # -- Tracking and models ------------------------------------------------
+    track_group = parser.add_argument_group("Tracking and Models")
+    track_group.add_argument(
+        "--track",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable the box tracker: a person or face box is held for a few frames after "
+            "the detector stops finding it. Only for modes that use boxes; the erase "
+            "mode does not accept it."
+        ),
+    )
+    track_group.add_argument(
+        "--track-hold",
+        type=int,
+        default=None,
+        metavar="N",
+        dest="track_hold",
+        help=(
+            "Frames a tracked box is held after its last detection (implies --track). "
+            f"Default: {_TRACK_HOLD_DEFAULT}."
+        ),
+    )
+    track_group.add_argument(
+        "--model-dir",
+        default=None,
+        metavar="DIR",
+        dest="model_dir",
+        help=(
+            "Directory searched first for detector model files. The detectors "
+            "available so far need no model files."
+        ),
+    )
+
     # -- Background reference -----------------------------------------------
     bg_group = parser.add_argument_group("Background Reference")
     bg_group.add_argument(
@@ -757,10 +903,12 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
     Every problem is reported with ``parser.error`` (exit code 2). No message holds
     the source spec, which may be a URL with credentials.
     """
-    from petrify.core.config import PetrifyConfig  # noqa: PLC0415
+    from petrify.core.config import ModelConfig, PetrifyConfig, TrackerConfig  # noqa: PLC0415
     from petrify.pipeline import OutputConfig, _same_file  # noqa: PLC0415
     from petrify.sources import source_kind  # noqa: PLC0415
 
+    if args.source is None:
+        parser.error("the following arguments are required: --source")
     if args.run_gap_fill is not None:
         parser.error("--gap-fill is not a petrify run option; use --lookahead (same meaning)")
     try:
@@ -837,6 +985,19 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
     if args.calibrate_seconds is not None and background != "calibrate":
         parser.error("--calibrate-seconds requires --background calibrate")
 
+    tracker: TrackerConfig | None = None
+    if args.track_hold is not None:
+        try:
+            tracker = TrackerConfig(hold_frames=args.track_hold)
+        except ValueError as exc:
+            parser.error(f"--track-hold: {exc}")
+    elif args.track:
+        tracker = TrackerConfig()
+    try:
+        models = ModelConfig(dir=args.model_dir)
+    except ValueError as exc:
+        parser.error(f"--model-dir: {exc}")
+
     base = PetrifyConfig.from_namespace(args)
     bg_changes: dict[str, object] = {
         "strategy": background,
@@ -863,6 +1024,9 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
         engine=dataclasses.replace(
             base.engine, lookahead=lookahead, frame_budget_ms=args.frame_budget_ms
         ),
+        mode=args.mode or _DEFAULT_MODE,
+        tracker=tracker,
+        models=models,
     )
     outputs = OutputConfig(
         file=None if args.output is None else Path(args.output),
@@ -882,17 +1046,162 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
+_TRUST_WARNING = (
+    "The mode {name!r} comes from the installed plugin {origin}. It runs in the petrify "
+    "process with petrify's permissions and receives the unprocessed frames, people "
+    "included."
+)
+
+
+def _load_mode(catalog: _ModeCatalog, name: str) -> tuple[Any, Any]:
+    """Load the mode ``name``; return its factory and its entry (None for a built-in).
+
+    Raises ``ModeLoadError``. Only the selected mode's code is imported.
+    """
+    from petrify.core.registry import load_mode  # noqa: PLC0415
+
+    if name in RUN_MODES:
+        return load_mode(name), None
+    return load_mode(name, catalog.entries()), catalog.selected(name)
+
+
+def _mode_failure(exc: BaseException, name: str, entry: Any) -> str:
+    """The one-line error for a mode that cannot be loaded or built, naming its origin."""
+    text = _one_line(exc)
+    origin = "built in" if entry is None else _one_line(entry.origin)
+    if origin not in text:
+        text = f"{text} (mode {_one_line(name)!r}, {origin})"
+    return text
+
+
+def _option_summary(specs: tuple[Any, ...]) -> str:
+    return ", ".join(f"{spec.name} ({spec.kind})" for spec in specs)
+
+
+def _mode_options_config(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, factory: Any, config: PetrifyConfig
+) -> PetrifyConfig:
+    """Return ``config`` with the ``--mode-option`` values of the loaded mode.
+
+    Every declared option is stored, defaults filled in, each in its declared type.
+    Every problem is a usage error (``parser.error``, exit code 2).
+    """
+    from petrify.core.config import mode_options_from  # noqa: PLC0415
+    from petrify.core.plugin import resolve_option_text  # noqa: PLC0415
+
+    specs = factory.options
+    if args.mode_option and not specs:
+        parser.error(f"--mode-option: the mode {config.mode!r} has no options")
+    try:
+        options = resolve_option_text(specs, args.mode_option)
+    except ValueError as exc:
+        parser.error(
+            f"--mode-option: {_one_line(exc)}. Options of the mode {config.mode!r}: "
+            f"{_option_summary(specs)}"
+        )
+    return dataclasses.replace(config, mode_options=mode_options_from(options))
+
+
+def _format_value(value: object) -> str:
+    """An option value as it would be written after ``--mode-option KEY=``."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, tuple):
+        return ",".join(value) if value else "(empty)"
+    return _one_line(value)
+
+
+def _option_lines(spec: Any) -> list[str]:
+    lines = [f"  {spec.name}", f"    kind: {spec.kind}", f"    default: {_format_value(spec.default)}"]
+    if spec.kind in ("choice", "choices"):
+        lines.append(f"    choices: {', '.join(spec.choices)}")
+    elif spec.kind in ("int", "float"):
+        if spec.minimum is not None and spec.maximum is not None:
+            bounds = f"{spec.minimum} to {spec.maximum}"
+        elif spec.minimum is not None:
+            bounds = f"at least {spec.minimum}"
+        elif spec.maximum is not None:
+            bounds = f"at most {spec.maximum}"
+        else:
+            bounds = "any"
+        lines.append(f"    range: {bounds}")
+    lines.append(f"    changeable while running: {'yes' if spec.runtime else 'no'}")
+    lines.append(f"    help: {_one_line(spec.help)}")
+    return lines
+
+
+def _list_modes(catalog: _ModeCatalog, name: str | None) -> int:
+    """Print the modes, and the options of the mode ``name`` when given; return the exit code.
+
+    Only built-in modes and the mode ``name`` are imported: a plugin's summary is
+    shown only for the mode ``name``, since reading it needs the plugin's code.
+    """
+    from petrify.core.registry import ModeLoadError, load_mode  # noqa: PLC0415
+
+    lines = ["Modes (select one with --mode NAME):"]
+    for entry in catalog.entries():
+        shown = _one_line(entry.name)
+        if entry.builtin:
+            try:
+                summary = _one_line(load_mode(entry.name).summary)
+            except ModeLoadError as exc:
+                summary = f"cannot be loaded: {_one_line(exc)}"
+            lines.append(f"  {shown} (built in): {summary}")
+            continue
+        line = f"  {shown} (plugin {_one_line(entry.origin)})"
+        if entry.problem is not None:
+            line += f": not selectable: {_one_line(entry.problem)}"
+        lines.append(line)
+    print("\n".join(lines), flush=True)
+    if name is None:
+        return 0
+    try:
+        factory, entry = _load_mode(catalog, name)
+    except ModeLoadError as exc:
+        logging.getLogger(__name__).error(
+            "Fatal error: %s", _mode_failure(exc, name, catalog.selected(name))
+        )
+        return 1
+    origin = "built in" if entry is None else f"plugin {_one_line(entry.origin)}"
+    lines = ["", f"Mode {name} ({origin}): {_one_line(factory.summary)}"]
+    if factory.options:
+        lines.append("Options (set with --mode-option NAME=VALUE):")
+        for spec in factory.options:
+            lines.extend(_option_lines(spec))
+    else:
+        lines.append("Options: none")
+    print("\n".join(lines), flush=True)
+    return 0
+
+
 def _run_main(argv: list[str]) -> int:
     """``petrify run``: open the source, run the streaming engine, return an exit code."""
-    parser = _build_run_parser()
+    catalog = _ModeCatalog()
+    parser = _build_run_parser(catalog)
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
+    if args.list_modes:
+        return _list_modes(catalog, args.mode)
     settings = _resolve_run(parser, args)
 
+    from petrify.core.registry import ModeLoadError  # noqa: PLC0415
     from petrify.pipeline import output_overwrites_input, run_stream  # noqa: PLC0415
     from petrify.sources import display_spec, open_source  # noqa: PLC0415
 
     log = logging.getLogger(__name__)
+    mode_name = settings.config.mode
+    # The mode is loaded before the source is opened, to validate its options.
+    try:
+        factory, mode_entry = _load_mode(catalog, mode_name)
+    except ModeLoadError as exc:
+        log.error("Fatal error: %s", _mode_failure(exc, mode_name, catalog.selected(mode_name)),
+                  exc_info=args.verbose)
+        return 1
+    settings = dataclasses.replace(
+        settings, config=_mode_options_config(parser, args, factory, settings.config)
+    )
+    if mode_entry is not None:
+        log.warning(_TRUST_WARNING.format(name=mode_name, origin=_one_line(mode_entry.origin)))
     if args.web:
         from petrify.server.app import require_web  # noqa: PLC0415
 
@@ -912,7 +1221,7 @@ def _run_main(argv: list[str]) -> int:
             "Source: %s (%s), mode: %s",
             display_spec(source.info.uri or ""),
             settings.kind,
-            args.mode,
+            mode_name,
         )
         # Failed-closed frames still exit 0 (they are written black and logged), and
         # so does a live run ended with Ctrl-C: its outputs were finalized. A missing
@@ -929,6 +1238,11 @@ def _run_main(argv: list[str]) -> int:
     except KeyboardInterrupt:
         log.info("Interrupted by user; the run was aborted.")
         return 130
+    except ModeLoadError as exc:
+        # The same one-line report as a mode that fails to load above.
+        log.error("Fatal error: %s", _mode_failure(exc, mode_name, mode_entry),
+                  exc_info=args.verbose)
+        return 1
     except Exception as exc:  # noqa: BLE001
         log.error("Fatal error: %s", exc, exc_info=args.verbose)
         return 1
@@ -982,8 +1296,8 @@ def _run_form_argv(argv: list[str]) -> list[str] | None:
     """Return the run form's arguments when ``argv`` selects it, else None.
 
     The run form is selected when the first non-option argument is ``run`` and the
-    other arguments contain ``--source`` (or ``-h`` / ``--help``); the ``run`` word
-    is removed and the options around it are kept, so ``petrify --verbose run
+    other arguments contain ``--source`` (or ``--list-modes``, ``-h`` / ``--help``);
+    the ``run`` word is removed and the options around it are kept, so ``petrify --verbose run
     --source ...`` works. Option values are skipped when looking for the first
     non-option argument. Anything else is the file form, so a file named ``run``
     still works there: ``petrify run out.mp4``.
@@ -1007,7 +1321,8 @@ def _run_form_argv(argv: list[str]) -> list[str] | None:
             return None
         rest = argv[:i] + argv[i + 1 :]
         wants_run = any(
-            a in ("--source", "-h", "--help") or a.startswith("--source=") for a in rest
+            a in ("--source", "--list-modes", "-h", "--help") or a.startswith("--source=")
+            for a in rest
         )
         return rest if wants_run else None
     return None
@@ -1029,9 +1344,9 @@ _BANNER = r"""
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.  Returns an exit code (0 = success)."""
     # Print banner to stderr before parse_args so it shows on every real run.
-    # Suppress it for --help / --version (pure informational flags).
+    # Suppress it for --help / --version / --list-modes (pure informational flags).
     _argv = sys.argv[1:] if argv is None else argv
-    if not any(f in _argv for f in ("-h", "--help", "--version")):
+    if not any(f in _argv for f in ("-h", "--help", "--version", "--list-modes")):
         print(_BANNER, file=sys.stderr)
 
     run_argv = _run_form_argv(_argv)
