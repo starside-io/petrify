@@ -29,7 +29,7 @@ import numpy as np
 from petrify.core.config import MAX_DILATE_PX, SegmentConfig
 from petrify.core.detections import DetectionKind, Detections
 from petrify.core.frame import Frame
-from petrify.models import SEGMENT_MODEL, load_model_bytes
+from petrify.models import SEGMENT_MODEL, load_model
 
 MODEL = SEGMENT_MODEL
 """Pinned identity of the PP-HumanSeg model file."""
@@ -267,6 +267,16 @@ class PersonSegmenter:
             "min_area_share", min_area_share, low_closed=True, high_closed=True
         )
         self._net = cv2.dnn.readNetFromONNX(np.frombuffer(bytes(model), dtype=np.uint8))
+        self._model_path: Path | None = None
+
+    @property
+    def model_path(self) -> Path | None:
+        """The model file this detector was built from, or None when built from bytes.
+
+        Set by :meth:`from_config` from the path the verified bytes were read
+        from, so a caller can report it without reading the file again.
+        """
+        return self._model_path
 
     @classmethod
     def from_config(cls, config: SegmentConfig, model_dirs: Sequence[Path]) -> PersonSegmenter:
@@ -280,13 +290,15 @@ class PersonSegmenter:
         petrify.models.ModelError
             If the file is missing, unreadable, or fails the SHA-256 check.
         """
-        data = load_model_bytes(MODEL, path=config.model_path, dirs=model_dirs)
-        return cls(
-            data,
+        loaded = load_model(MODEL, path=config.model_path, dirs=model_dirs)
+        segmenter = cls(
+            loaded.data,
             threshold=config.threshold,
             dilate_px=config.dilate_px,
             min_area_share=config.min_area_share,
         )
+        segmenter._model_path = loaded.path
+        return segmenter
 
     def detect(self, frame: Frame) -> Detections:
         """Return detections with only ``mask`` set.

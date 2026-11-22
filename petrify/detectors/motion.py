@@ -108,7 +108,7 @@ class MotionDetector:
     def motion_score(self, frame: np.ndarray) -> float:
         """Return raw foreground contour area without thresholding.
 
-        Useful for background scanning — compare scores across candidate frames
+        Useful for background scanning: compare scores across candidate frames
         to pick the one with the least detectable motion.
         """
         small = self._maybe_downsample(frame)

@@ -33,7 +33,7 @@ class TestEdgeXExtent:
         h, w = 30, 200
         # Simulate a timestamp strip: alternating black/white columns to mimic
         # text glyphs (each glyph produces a Laplacian edge at its left and right
-        # boundary).  Columns 5–79 contain text; columns 80+ are empty background.
+        # boundary).  Columns 5 to 79 contain text; columns 80+ are empty background.
         frame = np.zeros((h, w, 3), dtype=np.uint8)
         # Alternate 5-pixel black/white blocks in the "text" region
         for x in range(5, 80, 10):
@@ -42,14 +42,14 @@ class TestEdgeXExtent:
         cap = self._make_cap_stub([frame, frame, frame])
         far_x = _edge_x_extent(cap, 3, 0, h, from_left=True, frame_w=w,
                                 edge_threshold=50, gap_tolerance=15, n_edge_samples=3)
-        # Should stop inside the text region (last hot column ≈ x=74–79)
+        # Should stop inside the text region (last hot column ≈ x=74 to 79)
         assert 65 <= far_x <= 85, f"Expected ~75, got {far_x}"
 
     def test_returns_fallback_when_no_edges(self) -> None:
         from petrify.roi_detect import _edge_x_extent
 
         h, w = 30, 200
-        # Uniform grey frame — no edges at all
+        # Uniform grey frame: no edges at all
         frame = np.full((h, w, 3), 128, dtype=np.uint8)
 
         cap = self._make_cap_stub([frame])

@@ -51,7 +51,9 @@ def _add_roi_group(parser: argparse.ArgumentParser) -> argparse._ArgumentGroup:
             "When not set, petrify auto-detects the timestamp region by analysing "
             "which pixels change consistently every second.  The detected value is "
             "printed so you can hard-code it with this flag on future runs to skip "
-            "the scan entirely."
+            "the detection.  Exception: on a webcam (petrify run --source camera:N) "
+            "nothing is detected and no ROI is used unless this flag or --roi-auto "
+            "is given."
         ),
     )
     roi_group.add_argument(
@@ -61,7 +63,8 @@ def _add_roi_group(parser: argparse.ArgumentParser) -> argparse._ArgumentGroup:
         dest="no_roi",
         help=(
             "Disable timestamp ROI compositing entirely (and skip auto-detection). "
-            "Output will be a pure motion-freeze with no live clock overlay."
+            "Nothing from the live frame is pasted over the mode's output, so no live "
+            "clock is shown."
         ),
     )
     roi_group.add_argument(
@@ -236,7 +239,7 @@ def _add_bg_diff_arguments(bg_group: argparse._ArgumentGroup) -> None:
         metavar="INT",
         dest="bg_diff_pixel_threshold",
         help=(
-            "Per-pixel grayscale difference (0–255) above which a pixel is considered "
+            "Per-pixel grayscale difference (0 to 255) above which a pixel is considered "
             "changed by the static background differ.  25 suppresses sensor noise while "
             "detecting even dark clothing against a light background.  Default: 25."
         ),
@@ -341,7 +344,7 @@ def _add_encode_group(parser: argparse.ArgumentParser, hwaccel_help: str | None 
         metavar="INT",
         help=(
             "Constant Rate Factor quality setting (lower = better quality / larger "
-            "file).  Valid range: 0–51 for libx264/libx265.  Default: 23."
+            "file).  Valid range: 0 to 51 for libx264/libx265.  Default: 23."
         ),
     )
     encode_group.add_argument(
@@ -445,7 +448,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Frame index (0-based) to use as the locked background reference. "
             "When not set, the video is scanned automatically to find the latest "
-            "clean frame (no person detected) — typically from the end of the clip "
+            "clean frame (no person detected), typically from the end of the clip "
             "after the subject leaves. Override this when auto-detection picks the "
             "wrong frame."
         ),
@@ -697,7 +700,8 @@ def _build_run_parser(modes: _ModeCatalog | None = None) -> argparse.ArgumentPar
         default=False,
         help=(
             "Serve a local web page on 127.0.0.1 to watch the processed feed and change "
-            "the erase settings while the run is in progress (needs FastAPI and uvicorn: "
+            "the run's settings, the selected mode's options included, while the run is "
+            "in progress (needs FastAPI and uvicorn: "
             "pip install petrify[web]). The link is printed at start; it holds a "
             "per-run token and gives control of the run to whoever has it."
         ),
@@ -1381,9 +1385,11 @@ def _run_main(argv: list[str]) -> int:
         if args.web:
             _run_with_web(args, settings, source, factory=factory, modes=catalog.entries())
         elif args.realtime:
-            run_stream(source, settings.config, settings.outputs, realtime=True)
+            run_stream(
+                source, settings.config, settings.outputs, realtime=True, factory=factory
+            )
         else:
-            run_stream(source, settings.config, settings.outputs)
+            run_stream(source, settings.config, settings.outputs, factory=factory)
     except ModelError as exc:
         # Before FileNotFoundError: a missing model is a ModelNotFoundError, which is
         # also a FileNotFoundError, but it is a fatal error (exit 1), not a missing input.
@@ -1457,6 +1463,7 @@ def _run_with_web(
             raw_preview=raw,
             control=control,
             realtime=args.realtime,
+            factory=factory,
         )
     finally:
         handle.stop()
@@ -1471,6 +1478,37 @@ def _run_form_argv(argv: list[str]) -> list[str] | None:
     --source ...`` works. Option values are skipped when looking for the first
     non-option argument. Anything else is the file form, so a file named ``run``
     still works there: ``petrify run out.mp4``.
+    """
+    rest = _after_run_word(argv)
+    if rest is None:
+        return None
+    wants_run = any(
+        a in ("--source", "--list-modes", "-h", "--help") or a.startswith("--source=")
+        for a in rest
+    )
+    return rest if wants_run else None
+
+
+def _run_form_without_source(argv: list[str]) -> bool:
+    """True when ``argv`` starts with ``run`` and uses an option only the run form has.
+
+    Such a command is meant for ``petrify run`` but has no ``--source``, so it
+    would otherwise be read as the file form (an input file named ``run``) and
+    fail with an "unrecognized arguments" message that does not say what is
+    missing. A valid file form command never uses these options.
+    """
+    rest = _after_run_word(argv)
+    if rest is None:
+        return False
+    file_options = set(_build_parser()._option_string_actions)
+    run_only = set(_build_run_parser()._option_string_actions) - file_options
+    return any(a.split("=", 1)[0] in run_only for a in rest if a.startswith("--"))
+
+
+def _after_run_word(argv: list[str]) -> list[str] | None:
+    """Return ``argv`` without its first non-option argument when that is ``run``, else None.
+
+    Option values are skipped when looking for the first non-option argument.
     """
     actions = _build_run_parser()._option_string_actions
     i = 0
@@ -1489,12 +1527,7 @@ def _run_form_argv(argv: list[str]) -> list[str] | None:
             continue
         if token != "run":
             return None
-        rest = argv[:i] + argv[i + 1 :]
-        wants_run = any(
-            a in ("--source", "--list-modes", "-h", "--help") or a.startswith("--source=")
-            for a in rest
-        )
-        return rest if wants_run else None
+        return argv[:i] + argv[i + 1 :]
     return None
 
 
@@ -1522,6 +1555,12 @@ def main(argv: list[str] | None = None) -> int:
     run_argv = _run_form_argv(_argv)
     if run_argv is not None:
         return _run_main(run_argv)
+    if _run_form_without_source(_argv):
+        # parser.error exits with code 2, as for every other usage error.
+        _build_run_parser().error(
+            "petrify run requires --source (for example: petrify run --source INPUT "
+            "--output OUTPUT.mp4)"
+        )
 
     parser = _build_parser()
     args = parser.parse_args(argv)

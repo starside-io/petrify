@@ -127,7 +127,7 @@ class Compositor:
         x, y, w, h = self.roi
         fh, fw = background.shape[:2]
 
-        # Destination slice — clamp to frame bounds.
+        # Destination slice: clamp to frame bounds.
         x1 = max(0, x)
         y1 = max(0, y)
         x2 = min(fw, x + w)

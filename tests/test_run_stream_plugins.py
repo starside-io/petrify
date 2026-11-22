@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import sys
 import textwrap
 from collections.abc import Iterator
@@ -354,6 +355,45 @@ def test_tracker_with_erase_is_a_clear_startup_error() -> None:
     with pytest.raises(ValueError, match="mode 'erase'.*'first_hit'"):
         run_stream(FakeSource(), config, OutputConfig(), sinks=[sink])
     assert sink.opened == 0
+
+
+@pytest.mark.usefixtures("fake_person_check")
+@pytest.mark.parametrize("strategy", ["running", "calibrate"])
+def test_tracker_with_erase_is_rejected_before_any_frame_is_read(
+    strategy: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    source = FakeSource()
+    config = _live_config(strategy, tracker=TrackerConfig(), roi=RoiConfig(mode="auto"))
+    with (
+        caplog.at_level(logging.INFO),
+        pytest.raises(ValueError, match="the tracker \\(--track\\) is active"),
+    ):
+        pipeline._build_components(source, config)
+    assert source.yielded == []
+    assert not any("scan" in r.getMessage().lower() for r in caplog.records)
+    assert not any(r.getMessage().startswith("ROI:") for r in caplog.records)
+
+
+def test_a_given_factory_is_used_instead_of_loading_the_mode_again() -> None:
+    from petrify.modes.erase import ERASE
+
+    config = _live_config("running")
+    with (
+        mock.patch.object(pipeline, "load_mode", side_effect=AssertionError("loaded")),
+        mock.patch.object(pipeline, "person_free", side_effect=_fake_person_free),
+    ):
+        components, _ = pipeline._build_components(FakeSource(), config, ERASE)
+        run_stream(FakeSource(Scene(total=10)), config, OutputConfig(), sinks=[ListSink()],
+                   factory=ERASE)
+    assert components.factory is ERASE
+
+
+@pytest.mark.usefixtures("plugin")
+def test_a_factory_for_another_mode_is_refused() -> None:
+    from petrify.core.registry import load_mode
+
+    with pytest.raises(ValueError, match="does not match the configured mode 'erase'"):
+        pipeline._build_components(FakeSource(), _live_config("running"), load_mode("paint"))
 
 
 @pytest.mark.usefixtures("fake_persons", "plugin")

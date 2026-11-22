@@ -64,7 +64,7 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `docs/PLUGINS.md`, a guide to writing a mode plugin
 
 #### Tracking and models
-- `--track` and `--track-hold N` (default 15) in `petrify run`: a greedy IoU box tracker (`petrify.detectors.tracker`) that holds person boxes and faces for N frames after a miss, without moving them. The erase mode does not accept it
+- `--track` and `--track-hold N` (default 15) in `petrify run`: a greedy IoU box tracker (`petrify.detectors.tracker`) that holds person boxes and faces for N frames after a miss, without moving them. The erase mode does not accept it: the run stops with a `Fatal error:` line (exit code 1) before any frame is read
 - `--model-dir` and `petrify.models`: model files are looked up in an explicit path, `--model-dir`, `PETRIFY_MODEL_DIR`, then the per-user data directory, and loaded only when their size and SHA-256 match a pinned value. petrify never downloads anything
 - Config sections for the YuNet face, DNN person, and segmentation detectors
 - `petrify.background.any_person` combines several background sample checks into one
@@ -74,9 +74,10 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - NanoDet-Plus person detector (`petrify.detectors.person_dnn.PersonDnnDetector`, `--person-detector {hog,dnn}`, default `hog`, and `--dnn-score-threshold`, default 0.4). With `dnn` it replaces HOG for `--detector person` and `both`; the locked background pre-scan still uses HOG. Overlapping boxes are merged into their union, then padded by 10 percent of their width and 7 percent of their height on each side. It misses people smaller than about 110 px tall on a 1080p frame, and on the 640x480 demo clip takes about 34 ms per frame (about 77 ms at 1080p)
 - PP-HumanSeg person segmenter (`petrify.detectors.segment.PersonSegmenter`, `--segment`, `--segment-threshold`, default 0.5): a full-resolution person mask that keeps every pixel the model flagged when it is resized to the frame. It misses small, distant people and marks parts of empty scenes
 - The three model files are pinned in `petrify.models.KNOWN_MODELS` with their size, SHA-256, source (the OpenCV model zoo), and license: `face_detection_yunet_2023mar.onnx` (MIT), `object_detection_nanodet_2022nov.onnx` (Apache-2.0), and `human_segmentation_pphumanseg_2023mar.onnx` (Apache-2.0). `--model-dir` is now used. The log names the file each detector was loaded from
+- `petrify.models.load_model` returns a `LoadedModel` with the verified bytes and the path they were read from (`load_model_bytes` returns only the bytes). The model-based detectors expose that path as the read-only `model_path` (None when built directly from bytes)
 - `--background-check NAMES`: the detectors that check the samples of a `running` or `calibrate` background, from `hog`, `yunet`, and `dnn` (default `hog`). A warning names them when they reject 50 samples in a row and the background is still not ready
 - `petrify.background.detector_check` turns a frame detector into a background sample check
-- Warnings when `--person-detector dnn` is given with `--detector motion`, when `--faces`, `--segment`, or `--background-check` has no effect for the mode, and when the DNN person detector runs without the background differ
+- Warnings when `--person-detector dnn` is given with `--detector motion`, when `--faces`, `--segment`, or `--background-check` has no effect for the mode, and when the DNN person detector runs without the background differ. `--faces` and `--person-detector dnn` are not reported as having no effect when their settings are used by the `yunet` or `dnn` background sample check
 - The web page shows which person detector the run uses
 
 ### Changed
@@ -92,7 +93,8 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `Detections.merged` returns the union of both results (flags OR-ed, boxes and faces concatenated, masks OR-ed) instead of letting the other side's fields override this one's
 - `Detections.subject_present` also counts a face or a mask pixel as a subject
 - A mode or stage that returns something other than a `numpy.ndarray` with the input frame's shape and dtype, or, on a frame where a subject is present, an array that may share memory with the input image, now fails that frame closed
-- `petrify run` builds the mode through the registry: a detector is built only when the mode requires what it provides, the background only when the mode needs one, and the ROI stage only when the mode allows it
+- `petrify run` builds the mode through the registry: a detector is built only when the mode requires what it provides, the background only when the mode needs one, and the ROI stage only when the mode allows it. The mode is loaded once; `run_stream` accepts the loaded factory as `factory`
+- The `petrify run` startup line `Detector mode: <setting>` says when the mode does not require the motion or person detector the setting selects, and then lists the detectors built, for example `Detector mode: motion (not used: the mode 'facebox' does not require motion). Detectors built: FaceYuNetDetector`
 - `SegmentConfig.min_area_share` now accepts 0 and defaults to 0 (off). With the previous default a frame where the model flagged only part of a visible person counted as having no person
 - `BackgroundConfig.sample_checkers` no longer accepts `segment`: the segmenter marks parts of empty scenes, so as a check it would reject nearly every sample
 - Every model file a run needs, for its detectors and its background checks, is loaded and verified at startup, before any frame is read. A missing or corrupt model stops the run with one `Fatal error:` line (exit code 1); during a run, a settings change that needs one is rejected and the run continues
@@ -107,6 +109,7 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - Frames smaller than the HOG detection window (64x128) now produce a clear error instead of crashing the process
 - A negative `--gap-fill` is rejected
+- `petrify run` without `--source` but with an option only the run form has (for example `petrify run --output out.mp4`) is a usage error that says `petrify run` requires `--source` (exit code 2), instead of an "unrecognized arguments" error from the file form
 - A failed run never leaves an encoded output from partial frames
 
 ### Security
@@ -120,7 +123,7 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [0.1.0] — 2026-04-10
+## [0.1.0] - 2026-04-10
 
 ### Added
 
@@ -128,7 +131,7 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Two-pass architecture: **Pass 1** classifies every frame; **Pass 2** composites
 - **MOG2** adaptive background subtraction for motion detection
 - **HOG** person detector (`cv2.HOGDescriptor` with `getDefaultPeopleDetector()`) for stopped subjects
-- **BackgroundDiffer** — static diff against the locked clean reference frame; catches subjects that MOG2 adapts away (standing still) and tiny/partial subjects HOG misses (far away, cut off at frame edge)
+- **BackgroundDiffer**: static diff against the locked clean reference frame; catches subjects that MOG2 adapts away (standing still) and tiny/partial subjects HOG misses (far away, cut off at frame edge)
 - Temporal **gap fill** (`--gap-fill`): expand every detected region ±N frames to bridge missed detections mid-sequence
 - **Cold-start freeze**: unconditionally freeze the first 50 frames to cover the MOG2 warmup window
 - **MOG2 pre-warmup**: feed the locked background frame ×history times before classification to establish a trained baseline at frame 0
@@ -138,16 +141,16 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Auto background selection**: scans every 5th frame with HOG, locks the latest clean frame (no person) as the reference background
 
 #### CLI
-- `petrify INPUT OUTPUT` — zero-config entry point
-- `--roi X Y W H` / `--no-roi` — manual or disabled timestamp overlay
-- `--detector {motion,person,both}` — select active detectors
-- `--threshold`, `--history`, `--gap-fill`, `--downsample` — motion tuning
-- `--hog-min-confidence`, `--hog-min-box-area` — HOG tuning
-- `--bg-diff-pixel-threshold`, `--bg-diff-area-threshold`, `--no-bg-diff` — background differ tuning
-- `--background-frame N` — manual background frame override
-- `--roi-scan-samples`, `--roi-scan-min-freq`, `--roi-scan-edge-threshold`, `--roi-scan-edge-gap-tolerance` — ROI scan tuning
-- `--codec`, `--crf`, `--preset`, `--hwaccel` — FFmpeg encoding options
-- `--verbose` — DEBUG-level log output
+- `petrify INPUT OUTPUT`: zero-config entry point
+- `--roi X Y W H` / `--no-roi`: manual or disabled timestamp overlay
+- `--detector {motion,person,both}`: select active detectors
+- `--threshold`, `--history`, `--gap-fill`, `--downsample`: motion tuning
+- `--hog-min-confidence`, `--hog-min-box-area`: HOG tuning
+- `--bg-diff-pixel-threshold`, `--bg-diff-area-threshold`, `--no-bg-diff`: background differ tuning
+- `--background-frame N`: manual background frame override
+- `--roi-scan-samples`, `--roi-scan-min-freq`, `--roi-scan-edge-threshold`, `--roi-scan-edge-gap-tolerance`: ROI scan tuning
+- `--codec`, `--crf`, `--preset`, `--hwaccel`: FFmpeg encoding options
+- `--verbose`: DEBUG-level log output
 - ASCII art banner at startup with `Made with ❤️ by starside.io`
 
 #### Infrastructure

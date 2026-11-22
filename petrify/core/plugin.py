@@ -230,7 +230,7 @@ def _safe_text(value: object, *, use_repr: bool = True, limit: int = _TEXT_LIMIT
     return text
 
 
-def _describe_error(exc: BaseException) -> str:
+def describe_error(exc: BaseException) -> str:
     """Return ``"TypeName: message"`` for ``exc``, never raising, length capped."""
     return _safe_text(
         f"{_safe_text(type(exc).__name__, use_repr=False)}: {_safe_text(exc, use_repr=False)}",

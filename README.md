@@ -202,7 +202,7 @@ petrify run --source rtsp://camera.local/stream --output out.mp4 \
 petrify run --source 'frames/*.png' --fps 10 --output out.mp4
 ```
 
-The run form is selected when the first argument that is not an option is `run` and `--source` (or `--list-modes`) is given. Otherwise the arguments are `INPUT OUTPUT`, so a file named `run` still works: `petrify run out.mp4`.
+The run form is selected when the first argument that is not an option is `run` and `--source` (or `--list-modes`) is given. Otherwise the arguments are `INPUT OUTPUT`, so a file named `run` still works: `petrify run out.mp4`. A command that starts with `run` and uses an option only the run form has, but no `--source` (for example `petrify run --output out.mp4`), is a usage error that says `petrify run` requires `--source` (exit code 2).
 
 ### Modes and plugins
 
@@ -437,8 +437,10 @@ input video
          │
          ├── Erase: locked clean frame when a subject is present, live frame otherwise
          │
-         ├── ROI overlay: live timestamp pasted from the real frame (always)
-         │            timestamp keeps ticking regardless of freeze state
+         ├── ROI overlay: live timestamp pasted from the real frame on every frame
+         │            (erase allows it; a mode that does not allow the overlay
+         │            skips this stage), so the timestamp keeps ticking
+         │            regardless of freeze state
          │
          └── File sink → intermediate file → FFmpeg re-encode + audio mux
                                                      ↓
@@ -579,7 +581,7 @@ Speed scales with resolution and source frame rate. Low-FPS cameras (6fps) proce
 |---|---|---|---|
 | 480p | Real-time | Real-time | Real-time |
 | 720p | Real-time | Real-time | Real-time |
-| 1080p | 0.5–1x real-time | Real-time | Real-time |
+| 1080p | 0.5 to 1x real-time | Real-time | Real-time |
 | 4K | Needs GPU | Recommended | Recommended |
 
 - Use `--downsample 0.25` for 4K to reduce MOG2 cost.

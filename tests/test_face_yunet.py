@@ -37,6 +37,7 @@ from petrify.detectors.face_yunet import (
 )
 from petrify.models import (
     MODEL_DIR_ENV,
+    LoadedModel,
     ModelIntegrityError,
     ModelNotFoundError,
     load_model_bytes,
@@ -375,13 +376,25 @@ def test_detect_keeps_partly_off_frame_faces(fake_net: _FakeNet) -> None:
 def test_from_config_passes_the_config_settings_to_the_net(
     fake_net: _FakeNet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(face_yunet, "load_model_bytes", lambda spec, path, dirs: b"verified")
+    monkeypatch.setattr(
+        face_yunet,
+        "load_model",
+        lambda spec, path, dirs: LoadedModel(b"verified", tmp_path / MODEL.filename),
+    )
     config = FaceYuNetConfig(score_threshold=0.45, nms_threshold=0.7, top_k=123)
     det = FaceYuNetDetector.from_config(config, [tmp_path])
+    assert det.model_path == tmp_path / MODEL.filename
     (args,) = fake_net.created  # type: ignore[attr-defined]
     assert args[1].tobytes() == b"verified"
     assert args[4:7] == (0.45, 0.7, 123)
     assert (det.score_threshold, det.nms_threshold, det.top_k) == (0.45, 0.7, 123)
+
+
+def test_model_path_is_none_when_built_from_bytes_and_read_only(fake_net: _FakeNet) -> None:
+    det = FaceYuNetDetector(b"verified")
+    assert det.model_path is None
+    with pytest.raises(AttributeError):
+        det.model_path = Path("x")  # type: ignore[misc]
 
 
 @pytest.mark.parametrize("name", ["score_threshold", "nms_threshold", "top_k"])

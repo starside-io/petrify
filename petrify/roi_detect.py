@@ -16,9 +16,9 @@
 
 """Automatic timestamp ROI detection via frame-differencing + edge analysis.
 
-Algorithm — two passes
+Algorithm: two passes
 ----------------------
-**Pass 1 — frequency anchor** (finds the Y strip and which corner):
+**Pass 1: frequency anchor** (finds the Y strip and which corner):
 
 1. Sample ``n_samples`` pairs of frames, each pair spaced ~1 second apart.
 2. Build a per-pixel *change-frequency map*: fraction of pairs where the pixel
@@ -28,18 +28,18 @@ Algorithm — two passes
 5. Reject blobs by area (too large = person/vehicle; too small = noise).
 6. Score surviving candidates by change frequency + proximity to a corner
    (security-camera timestamps always live in a corner).
-7. The winner is the *anchor* — it accurately locates the **seconds** digits.
+7. The winner is the *anchor*: it accurately locates the **seconds** digits.
 
 Why only seconds?  Only the seconds digits tick every 1 s; minutes change
-every 60 s and hours every 3600 s — far below ``min_freq`` in a 60-pair scan.
+every 60 s and hours every 3600 s, far below ``min_freq`` in a 60-pair scan.
 The anchor gives us the correct Y band and which horizontal edge the timestamp
 is pressed against.
 
-**Pass 2 — edge-based X extension** (recovers the full timestamp width):
+**Pass 2: edge-based X extension** (recovers the full timestamp width):
 
 Given the anchor's Y band and corner side, extract that horizontal strip from
-a sample frame and run a Laplacian edge detector.  Every text character — even
-the static hours and camera-name label that never change — produces strong
+a sample frame and run a Laplacian edge detector.  Every text character (even
+the static hours and camera-name label that never change) produces strong
 spatial edges at the glyph boundaries.  Scanning column-by-column we find the
 outermost column with above-threshold edge energy, giving us the full text
 width in one cheap operation.
@@ -121,7 +121,7 @@ def find_anchor(
 
     if not contours:
         logger.warning(
-            "auto_detect_roi: no consistently-changing region found — ROI disabled."
+            "auto_detect_roi: no consistently-changing region found, ROI disabled."
         )
         return None
 
@@ -148,7 +148,7 @@ def find_anchor(
 
     if not candidates:
         logger.warning(
-            "auto_detect_roi: all candidates rejected by area/size filters — "
+            "auto_detect_roi: all candidates rejected by area/size filters, "
             "ROI disabled.  Try raising --roi-scan-max-area-frac."
         )
         return None
@@ -252,10 +252,10 @@ def edge_far_x(
         elif last_good >= 0:
             gap_count += 1
             if gap_count > gap_tolerance:
-                break   # first real gap after the text block — stop here
+                break   # first real gap after the text block: stop here
 
     if last_good < 0:
-        logger.debug("_edge_x_extent: no hot columns found — falling back.")
+        logger.debug("_edge_x_extent: no hot columns found, falling back.")
         return (frame_w - 1) if from_left else 0
 
     logger.debug("_edge_x_extent: far_x=%d  (from_left=%s)", last_good, from_left)
@@ -315,7 +315,7 @@ def _edge_x_extent(
     2. Scan columns from the near edge toward the far edge.  A column is "hot"
        if its max Laplacian energy exceeds ``edge_threshold``.
     3. Stop scanning at the **first gap wider than** ``gap_tolerance`` pixels.
-       Within a timestamp, inter-character gaps are typically 5–25 px; the
+       Within a timestamp, inter-character gaps are typically 5 to 25 px; the
        empty space after the last character is ≥ 40 px, so 30 px is a reliable
        separator.  Isolated hot scene-content columns past that gap are ignored.
 
@@ -370,7 +370,7 @@ def _edge_x_extent(
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     if edge_acc is None:
-        logger.debug("_edge_x_extent: no frames read — falling back.")
+        logger.debug("_edge_x_extent: no frames read, falling back.")
         return (frame_w - 1) if from_left else 0
 
     # Per-column max energy.
@@ -431,7 +431,7 @@ def auto_detect_roi(
         Maximum candidate area as a fraction of total frame area.  Blobs
         larger than this are assumed to be motion regions, not a timestamp.
     diff_threshold:
-        Grayscale difference (0–255) required to mark a pixel as changed.
+        Grayscale difference (0 to 255) required to mark a pixel as changed.
     close_kw, close_kh:
         Morphological-close kernel size for Pass 1.  Merges adjacent glyphs.
     snap_h_thresh:
@@ -461,13 +461,13 @@ def auto_detect_roi(
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 
     # ------------------------------------------------------------------
-    # Pass 1 — build frequency map, find seconds anchor
+    # Pass 1: build frequency map, find seconds anchor
     # ------------------------------------------------------------------
     pair_gap = max(1, round(fps))   # ~1-second gap so the clock ticks
 
     usable = total_frames - pair_gap
     if usable <= 0:
-        logger.warning("auto_detect_roi: video too short to sample — ROI disabled.")
+        logger.warning("auto_detect_roi: video too short to sample, ROI disabled.")
         return None
 
     step = max(1, usable // n_samples)
@@ -506,7 +506,7 @@ def auto_detect_roi(
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     if valid_pairs == 0:
-        logger.warning("auto_detect_roi: no valid frame pairs read — ROI disabled.")
+        logger.warning("auto_detect_roi: no valid frame pairs read, ROI disabled.")
         return None
 
     freq_map = accumulator / valid_pairs

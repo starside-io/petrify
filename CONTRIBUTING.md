@@ -1,6 +1,6 @@
 # Contributing to petrify
 
-Thank you for taking the time to contribute. petrify is an open-source project maintained by [starside.io](https://starside.io). All contributions — bug fixes, new features, documentation improvements, and test coverage — are welcome.
+Thank you for taking the time to contribute. petrify is an open-source project maintained by [starside.io](https://starside.io). All contributions (bug fixes, new features, documentation improvements, and test coverage) are welcome.
 
 ---
 
@@ -145,7 +145,7 @@ CI will reject PRs that fail the ruff lint pass. Run it locally before pushing.
 ## Opening a pull request
 
 1. Make sure `pytest` and `ruff check` pass locally.
-2. Update `CHANGELOG.md` — add a line under `## [Unreleased]` describing your change.
+2. Update `CHANGELOG.md`: add a line under `## [Unreleased]` describing your change.
 3. Push your branch and open a PR against `main`.
 4. Fill in the PR template. Link any related issue with `Closes #<n>`.
 5. A maintainer will review within a few days. Please respond to review comments promptly.

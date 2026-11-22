@@ -61,7 +61,7 @@ from petrify.core.plugin import (
     Sink,
     Source,
     Stage,
-    _describe_error,
+    describe_error,
     resolve_options,
 )
 from petrify.core.registry import ModeLoadError, build_mode, load_mode
@@ -80,9 +80,8 @@ from petrify.models import (
     ModelError,
     ModelSpec,
     model_dirs,
-    pop_loaded_path,
 )
-from petrify.modes.erase import EraseMode
+from petrify.modes.erase import ERASE, EraseMode
 from petrify.roi_detect import WarmupRoiDetector, auto_detect_roi
 from petrify.sinks import file as file_sinks
 from petrify.sinks.file import FfmpegPipeSink, FileSink
@@ -135,7 +134,7 @@ def _find_clean_background(
         if not ret:
             continue
         if not person_detector.is_person(frame):
-            # Keep updating — we want the LATEST clean frame.
+            # Keep updating: we want the LATEST clean frame.
             best_idx = idx
             best_frame = frame.copy()
 
@@ -143,7 +142,7 @@ def _find_clean_background(
 
     if best_frame is None:
         logger.warning(
-            "Background scan found no person-free frame — falling back to frame 0. "
+            "Background scan found no person-free frame, falling back to frame 0. "
             "Consider specifying --background-frame manually."
         )
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -167,21 +166,21 @@ def _classify_frames(
     person_detector: PersonDetector | None,
     bg_differ: BackgroundDiffer | None = None,
 ) -> list[bool]:
-    """First pass — classify every frame as *has subject* (True) or *clean* (False).
+    """First pass: classify every frame as *has subject* (True) or *clean* (False).
 
     A frame is marked as containing a subject when at least one of the enabled
     detectors fires.  Detectors are run in order and short-circuit once one fires:
 
     * ``motion`` (MOG2): fast, catches moving subjects.
     * ``person`` (HOG): catches stopped subjects that MOG2 adapted away.
-    * ``bg_differ`` (static diff): compares against the locked clean background —
+    * ``bg_differ`` (static diff): compares against the locked clean background,
       catches subjects that are both stopped AND have been absorbed by MOG2, as well
       as tiny/partial subjects that HOG misses (e.g. person far down corridor, or
       body partially cut off at frame edge).
 
     Returns a ``list[bool]`` indexed by frame number (0 … total_frames-1).
     """
-    logger.info("Pass 1 — classifying %d frames...", total_frames)
+    logger.info("Pass 1: classifying %d frames...", total_frames)
 
     if motion_detector is not None:
         motion_detector.reset()
@@ -214,7 +213,7 @@ def _classify_frames(
 
     n_subject = sum(has_subject)
     logger.info(
-        "Pass 1 done — subject detected in %d / %d frames (%.1f%%)",
+        "Pass 1 done: subject detected in %d / %d frames (%.1f%%)",
         n_subject,
         total_frames,
         100.0 * n_subject / total_frames if total_frames else 0,
@@ -252,12 +251,12 @@ def _freeze_cold_start(has_subject: list[bool], warmup_frames: int = 50) -> list
 
     MOG2 has two cold-start failure modes:
 
-    1. **Frame 0 init spike** — the very first frame produces a huge spurious
+    1. **Frame 0 init spike**: the very first frame produces a huge spurious
        foreground mask (MOG2 initialises with no prior history), which is
-       then immediately discarded, leaving frames 1–N with a nearly-empty
+       then immediately discarded, leaving frames 1 to N with a nearly-empty
        background model and artificially low motion scores.
 
-    2. **Warmup lag** — for the first ``history`` frames MOG2 hasn't seen
+    2. **Warmup lag**: for the first ``history`` frames MOG2 hasn't seen
        enough samples to reliably distinguish foreground from background, so
        slow motion (person getting out of a car) is missed entirely.
 
@@ -271,7 +270,7 @@ def _freeze_cold_start(has_subject: list[bool], warmup_frames: int = 50) -> list
     n = min(warmup_frames, len(filled))
     for i in range(n):
         filled[i] = True
-    logger.info("Cold-start freeze: frames 0–%d forced (MOG2 warmup window)", n - 1)
+    logger.info("Cold-start freeze: frames 0 to %d forced (MOG2 warmup window)", n - 1)
     return filled
 
 
@@ -282,7 +281,7 @@ def _freeze_cold_start(has_subject: list[bool], warmup_frames: int = 50) -> list
 def run(args: argparse.Namespace) -> None:
     """Execute the full two-pass petrify pipeline.
 
-    Pass 1 — Classification
+    Pass 1: Classification
     -----------------------
     Every frame is classified as *has subject* or *clean* using the
     configured detector(s).  The resulting boolean list is then expanded by
@@ -295,9 +294,9 @@ def run(args: argparse.Namespace) -> None:
     Otherwise the video is scanned to find the *latest* clean frame
     (no person detected) which is locked as the frozen background for the
     entire output.  For security-camera footage the scene is typically clear
-    at the end of the clip — this auto-detection handles that correctly.
+    at the end of the clip. This auto-detection handles that correctly.
 
-    Pass 2 — Compositing
+    Pass 2: Compositing
     --------------------
     Each frame is either frozen (background + live timestamp ROI) or passed
     through unchanged based on the classification from Pass 1.
@@ -379,7 +378,7 @@ def run(args: argparse.Namespace) -> None:
         )
         if roi is None:
             logger.warning(
-                "ROI auto-detection found nothing — running without timestamp overlay. "
+                "ROI auto-detection found nothing, running without timestamp overlay. "
                 "Use --roi X Y W H to set it manually, or --no-roi to silence this warning."
             )
 
@@ -412,7 +411,7 @@ def run(args: argparse.Namespace) -> None:
         )
 
     # ------------------------------------------------------------------
-    # Pass 1 — classify every frame
+    # Pass 1: classify every frame
     # ------------------------------------------------------------------
     # Build static background differ (always on unless --no-bg-diff is set).
     # This catches subjects that MOG2 has adapted away (standing still) and
@@ -437,11 +436,11 @@ def run(args: argparse.Namespace) -> None:
     has_subject = _freeze_cold_start(has_subject)
 
     # ------------------------------------------------------------------
-    # Pass 2 — compositing
+    # Pass 2: compositing
     # ------------------------------------------------------------------
     fd, temp_path = tempfile.mkstemp(suffix=".mp4")
     os.close(fd)
-    logger.info("Pass 2 — compositing frames -> %s", temp_path)
+    logger.info("Pass 2: compositing frames -> %s", temp_path)
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(temp_path, fourcc, fps, (width, height))
@@ -460,7 +459,7 @@ def run(args: argparse.Namespace) -> None:
             if not ret:
                 break
 
-            # Track B: live ROI (timestamp) — always from real frame
+            # Track B: live ROI (timestamp), always from real frame
             live_roi = compositor.extract_roi(frame)
 
             # Track A: background selection
@@ -481,7 +480,7 @@ def run(args: argparse.Namespace) -> None:
     total_processed = frames_frozen + frames_pass
     if total_processed > 0:
         logger.info(
-            "Pass 2 done — frozen=%d (%.1f%%)  pass-through=%d (%.1f%%)",
+            "Pass 2 done: frozen=%d (%.1f%%)  pass-through=%d (%.1f%%)",
             frames_frozen, 100.0 * frames_frozen / total_processed,
             frames_pass,  100.0 * frames_pass  / total_processed,
         )
@@ -1157,7 +1156,7 @@ def _mode_requires(
         raise
     except Exception as exc:
         raise ModeLoadError(
-            f"mode {factory.name!r}: requires failed: {_describe_error(exc)}"
+            f"mode {factory.name!r}: requires failed: {describe_error(exc)}"
         ) from exc
     if not isinstance(kinds, frozenset) or not all(isinstance(k, DetectionKind) for k in kinds):
         raise ModeLoadError(
@@ -1225,20 +1224,20 @@ class _ModelDetectors:
         key = (cls, settings)
         found = self._built.get(key)
         if found is None:
-            spec = _MODEL_OF[cls]
-            pop_loaded_path(spec)  # Drop a path left by an earlier load.
             found = cls.from_config(settings, self.dirs)  # type: ignore[attr-defined]
             self._built[key] = found
-            path = pop_loaded_path(spec)
+            # from_config records the file it read, so naming it here reads nothing.
+            path = found.model_path  # type: ignore[attr-defined]
             logger.info(
                 "Detector %s ready: model %s loaded and verified",
                 cls.__name__,
-                path if path is not None else spec.filename,
+                path if path is not None else _MODEL_OF[cls].filename,
             )
         return found  # type: ignore[no-any-return]
 
 
-# The model file each detector class loads, to report where it was found.
+# The model file each detector class loads, named in the ready line when a detector
+# was not built by from_config and so carries no path.
 _MODEL_OF: dict[type, ModelSpec] = {
     FaceYuNetDetector: FACE_YUNET_MODEL,
     PersonDnnDetector: PERSON_DNN_MODEL,
@@ -1396,10 +1395,19 @@ def _requires_differ(
 def _warn_unused(
     config: PetrifyConfig, factory: ModeFactory, requires: frozenset[DetectionKind]
 ) -> None:
-    """Log a warning for each detector setting that has no effect in this run."""
-    if config.person_dnn is not None and config.detector == "motion":
+    """Log a warning for each detector setting that has no effect in this run.
+
+    A detector section that configures a background sample checker the run
+    builds does take effect, so it is not reported as having none.
+    """
+    checkers = config.background.sample_checkers if _uses_sample_check(factory, config) else ()
+    if config.person_dnn is not None and config.detector == "motion" and "dnn" not in checkers:
         logger.warning(DNN_NOT_USED_WARNING)
-    if config.faces is not None and not _wants(FaceYuNetDetector, requires):
+    if (
+        config.faces is not None
+        and not _wants(FaceYuNetDetector, requires)
+        and "yunet" not in checkers
+    ):
         logger.warning(FACES_NOT_USED_WARNING.format(mode=config.mode))
     if config.segment is not None and not _wants(PersonSegmenter, requires):
         logger.warning(SEGMENT_NOT_USED_WARNING.format(mode=config.mode))
@@ -1408,10 +1416,50 @@ def _warn_unused(
         logger.warning(BACKGROUND_CHECK_NOT_USED_WARNING.format(mode=config.mode))
 
 
-def _build_components(source: Source, config: PetrifyConfig) -> tuple[_Components, int | None]:
+TRACKER_FIRST_HIT_ERROR = (
+    "The settings cannot run with the mode {mode!r}: the tracker (--track) is active "
+    "but the mode uses the 'first_hit' detection policy, which skips detectors; "
+    "refiners need 'all'. Remove --track for this mode"
+)
+
+
+def _detector_line(
+    config: PetrifyConfig,
+    motion: MotionDetector | None,
+    person: PersonDetector | PersonDnnDetector | None,
+    faces: FaceYuNetDetector | None,
+    segment: PersonSegmenter | None,
+) -> str:
+    """The startup line that reports ``config.detector`` and the detectors the run built.
+
+    It is ``Detector mode: <setting>`` when the setting's motion and person
+    detectors were all built. When the mode does not require one of them it is
+    not built, and the line says so and lists the detectors that were built, so
+    the log never claims a detector that does not run.
+    """
+    wanted = (
+        ("motion", config.detector in ("motion", "both"), motion),
+        ("person boxes", config.detector in ("person", "both"), person),
+    )
+    missing = [label for label, want, built in wanted if want and built is None]
+    if not missing:
+        return f"Detector mode: {config.detector}"
+    built_names = [type(d).__name__ for d in (motion, person, faces, segment) if d is not None]
+    scope = "not used" if motion is None and person is None else f"{missing[0]} not used"
+    return (
+        f"Detector mode: {config.detector} ({scope}: the mode {config.mode!r} does not "
+        f"require {' or '.join(missing)}). Detectors built: "
+        f"{', '.join(built_names) if built_names else 'none'}"
+    )
+
+
+def _build_components(
+    source: Source, config: PetrifyConfig, factory: ModeFactory | None = None
+) -> tuple[_Components, int | None]:
     """Build the mode factory, detectors, ROI stage, background, mode and refiners at startup.
 
-    The factory for ``config.mode`` is loaded from the registry first; a
+    The factory for ``config.mode`` is loaded from the registry first, unless
+    the caller passes the one it already loaded as ``factory``; a
     :class:`ModeLoadError` propagates unchanged. Then, in the same order as
     :func:`run_file`: detectors, ROI, background, the background differ, and the
     mode built with :func:`build_mode`. A built-in detector is built only when
@@ -1426,16 +1474,28 @@ def _build_components(source: Source, config: PetrifyConfig) -> tuple[_Component
     built, which are the first steps that read frames, so a missing or corrupt
     model fails the run with :class:`~petrify.models.ModelError` within seconds.
     """
-    factory = load_mode(config.mode)
+    if factory is None:
+        factory = load_mode(config.mode)
+    elif factory.name != config.mode:
+        raise ValueError(
+            f"The mode factory {factory.name!r} does not match the configured mode "
+            f"{config.mode!r}"
+        )
     options = _mode_options(factory, config)
     requires = _mode_requires(factory, options, config)
     wants_differ = DetectionKind.BACKGROUND_DIFF in requires
     if wants_differ and not factory.needs_background and config.background_diff is not None:
         raise ValueError(DIFFER_WITHOUT_BACKGROUND_ERROR.format(mode=config.mode))
+    refiners = _refiners(config, requires)
+    # The engine rejects active refiners under 'first_hit', but only once the mode
+    # is built, which for erase is after the background scan has read frames. The
+    # built-in erase mode's policy is a class constant, so it is checked here.
+    if refiners and factory is ERASE and EraseMode.detect_policy == "first_hit":
+        raise ValueError(TRACKER_FIRST_HIT_ERROR.format(mode=config.mode))
     models = _ModelDetectors(config)
     motion, person, faces, segment = _frame_detectors(config, requires, models)
     sample_check = _sample_check(config, models) if _uses_sample_check(factory, config) else None
-    logger.info("Detector mode: %s", config.detector)
+    logger.info("%s", _detector_line(config, motion, person, faces, segment))
     if person is not None and config.person_dnn is not None:
         logger.info("Person detector: DNN (NanoDet-Plus) in place of HOG")
     _warn_unused(config, factory, requires)
@@ -1468,7 +1528,7 @@ def _build_components(source: Source, config: PetrifyConfig) -> tuple[_Component
         factory=factory,
         options=options,
         requires=requires,
-        refiners=_refiners(config, requires),
+        refiners=refiners,
         source=source.info,
         models=models,
     )
@@ -1835,6 +1895,7 @@ def run_stream(
     realtime: bool = False,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    factory: ModeFactory | None = None,
 ) -> RunReport:
     """Run the streaming engine on any source and write to the selected outputs.
 
@@ -1864,6 +1925,10 @@ def run_stream(
     - ``realtime=True`` on a non-live source processes frames no faster than
       their timestamps (``clock`` and ``sleep`` do the pacing). It changes no
       output frame. It is ignored on a live source.
+
+    ``factory`` is the factory of ``config.mode`` when the caller has already
+    loaded it, so the mode is not loaded a second time; by default it is loaded
+    from the registry.
 
     Raises ``ValueError`` when ``outputs.file`` is the input file, or one of the
     images of an image folder source, and :class:`FfmpegNotFoundError` before any
@@ -1897,7 +1962,7 @@ def run_stream(
         if raw_tap is not None:
             logger.warning(RAW_PREVIEW_WARNING)
 
-        components, bg_idx = _build_components(source, config)
+        components, bg_idx = _build_components(source, config, factory)
         live = source.info.live
 
         def should_stop() -> bool:

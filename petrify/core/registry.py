@@ -53,9 +53,9 @@ from petrify.core.plugin import (
     ModeContext,
     ModeFactory,
     OptionSpec,
-    _describe_error,
     _safe_text,
     check_option_specs,
+    describe_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,7 +140,7 @@ def _discover() -> list[EntryPoint]:
     try:
         dists = iter(importlib.metadata.distributions())
     except Exception as exc:
-        logger.warning("Mode plugin discovery failed: %s", _describe_error(exc))
+        logger.warning("Mode plugin discovery failed: %s", describe_error(exc))
         return found
     while True:
         try:
@@ -148,7 +148,7 @@ def _discover() -> list[EntryPoint]:
         except StopIteration:
             break
         except Exception as exc:
-            logger.warning("Mode plugin discovery stopped early: %s", _describe_error(exc))
+            logger.warning("Mode plugin discovery stopped early: %s", describe_error(exc))
             break
         name = _distribution_name(dist)
         if name is not None:
@@ -168,7 +168,7 @@ def _discover() -> list[EntryPoint]:
                 "Skipping distribution %s while looking for modes: its entry points "
                 "cannot be read (%s)",
                 shown,
-                _describe_error(exc),
+                describe_error(exc),
             )
             continue
         found.extend(entries)
@@ -278,7 +278,7 @@ def list_modes(entry_points: Iterable[EntryPoint] | None = None) -> tuple[ModeEn
                 problem = f"shadowed by the built-in mode {name!r}; it can never be selected"
             candidates.append(ModeEntry(name, target, distribution, version, False, problem))
     except Exception as exc:
-        logger.warning("Listing mode plugins stopped early: %s", _describe_error(exc))
+        logger.warning("Listing mode plugins stopped early: %s", describe_error(exc))
 
     by_name: dict[str, list[ModeEntry]] = {}
     for entry in candidates:
@@ -335,7 +335,7 @@ def _import_target(entry: ModeEntry) -> object:
         obj: object = importlib.import_module(module_name)
     except (Exception, SystemExit) as exc:
         raise ModeLoadError(
-            f"{label} could not be imported from {_short(module_name)}: {_describe_error(exc)}"
+            f"{label} could not be imported from {_short(module_name)}: {describe_error(exc)}"
         ) from exc
     for part in attr.split("."):
         try:
@@ -346,7 +346,7 @@ def _import_target(entry: ModeEntry) -> object:
             ) from exc
         except (Exception, SystemExit) as exc:
             raise ModeLoadError(
-                f"{label}: reading {_short(entry.target)} failed: {_describe_error(exc)}"
+                f"{label}: reading {_short(entry.target)} failed: {describe_error(exc)}"
             ) from exc
     return obj
 
@@ -394,7 +394,7 @@ def _load_entry(entry: ModeEntry) -> ModeFactory:
     except (Exception, SystemExit) as exc:
         raise ModeLoadError(
             f"mode {_short(entry.name)} ({entry.origin}): checking the factory failed: "
-            f"{_describe_error(exc)}"
+            f"{describe_error(exc)}"
         ) from exc
 
 
@@ -475,13 +475,13 @@ def _call(label: str, factory: ModeFactory, method: str, *args: object) -> objec
     try:
         bound = getattr(factory, method)
     except Exception as exc:
-        raise ModeLoadError(f"{label}: reading {method} failed: {_describe_error(exc)}") from exc
+        raise ModeLoadError(f"{label}: reading {method} failed: {describe_error(exc)}") from exc
     try:
         return bound(*args)
     except ValueError:
         raise
     except Exception as exc:
-        raise ModeLoadError(f"{label}: {method} failed: {_describe_error(exc)}") from exc
+        raise ModeLoadError(f"{label}: {method} failed: {describe_error(exc)}") from exc
 
 
 def _check_context(
@@ -563,7 +563,7 @@ def build_mode(factory: ModeFactory, ctx: ModeContext, previous: Mode | None = N
             )
         builtin = _is_builtin_factory(factory)
     except Exception as exc:
-        raise ModeLoadError(f"the factory is not usable: {_describe_error(exc)}") from exc
+        raise ModeLoadError(f"the factory is not usable: {describe_error(exc)}") from exc
     label = f"mode {_short(name)}"
 
     _check_context(label, name, specs, needs_background, ctx)
@@ -580,7 +580,7 @@ def build_mode(factory: ModeFactory, ctx: ModeContext, previous: Mode | None = N
         raise
     except Exception as exc:
         raise ModeLoadError(
-            f"{label}: checking the built mode failed: {_describe_error(exc)}"
+            f"{label}: checking the built mode failed: {describe_error(exc)}"
         ) from exc
     return mode  # type: ignore[return-value]
 

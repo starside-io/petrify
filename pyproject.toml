@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "petrify"
 version = "0.1.0"
-description = "Freeze the world. Keep the clock ticking. — background-freeze pipeline with live timestamp overlay for security camera footage."
+description = "Freeze the world. Keep the clock ticking. Background-freeze pipeline with live timestamp overlay for security camera footage."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [{ name = "starside.io", email = "hello@starside.io" }]
@@ -40,7 +40,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# petrify calls ffmpeg directly via subprocess — install the system binary:
+# petrify calls ffmpeg directly via subprocess, so install the system binary:
 #   macOS:   brew install ffmpeg
 #   Ubuntu:  apt install ffmpeg
 #   Windows: https://ffmpeg.org/download.html

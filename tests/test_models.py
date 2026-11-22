@@ -16,10 +16,12 @@ from petrify import models
 from petrify.models import (
     KNOWN_MODELS,
     MODEL_DIR_ENV,
+    LoadedModel,
     ModelError,
     ModelIntegrityError,
     ModelNotFoundError,
     ModelSpec,
+    load_model,
     load_model_bytes,
     model_dirs,
     user_model_dir,
@@ -214,6 +216,52 @@ def test_model_dirs_drops_duplicates_keeping_order(tmp_path: Path) -> None:
 def test_returns_exact_file_bytes(tmp_path: Path) -> None:
     _place(tmp_path / "d")
     assert load_model_bytes(_spec(), dirs=[tmp_path / "d"]) == PAYLOAD
+
+
+def test_load_model_returns_the_bytes_and_the_path_they_came_from(tmp_path: Path) -> None:
+    target = _place(tmp_path / "b")
+    loaded = load_model(_spec(), dirs=[tmp_path / "a", tmp_path / "b"])
+    assert loaded == LoadedModel(data=PAYLOAD, path=target)
+    explicit = _place(tmp_path / "x", name="renamed.bin")
+    assert load_model(_spec(), path=explicit, dirs=[tmp_path / "b"]).path == explicit
+
+
+def test_load_model_reads_the_file_once_and_returns_the_hashed_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The bytes handed back must be the bytes that were hashed: one open, no re-read.
+    _place(tmp_path / "d")
+    spec = _spec()
+    opened: list[object] = []
+    hashed: list[bytes] = []
+    real_open, real_sha = os.open, hashlib.sha256
+
+    def counting_open(path: object, *args: object) -> int:
+        opened.append(path)
+        return real_open(path, *args)  # type: ignore[arg-type]
+
+    def recording_sha(data: bytes) -> object:
+        hashed.append(data)
+        return real_sha(data)
+
+    monkeypatch.setattr(models.os, "open", counting_open)
+    monkeypatch.setattr(models.hashlib, "sha256", recording_sha)
+    loaded = load_model(spec, dirs=[tmp_path / "d"])
+    assert opened == [tmp_path / "d" / FILENAME]
+    assert len(hashed) == 1 and hashed[0] is loaded.data
+
+
+def test_load_model_bytes_is_the_data_of_load_model(tmp_path: Path) -> None:
+    _place(tmp_path / "d")
+    spec = _spec()
+    assert load_model_bytes(spec, dirs=[tmp_path / "d"]) == load_model(
+        spec, dirs=[tmp_path / "d"]
+    ).data
+
+
+def test_the_models_module_keeps_no_record_of_loaded_paths() -> None:
+    assert not hasattr(models, "_LOADED_PATHS")
+    assert not hasattr(models, "pop_loaded_path")
 
 
 def test_lookup_order_across_the_three_sources(tmp_path: Path) -> None:

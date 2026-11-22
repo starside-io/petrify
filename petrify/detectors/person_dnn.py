@@ -16,7 +16,7 @@
 
 """Person boxes from the NanoDet-Plus object detector (OpenCV zoo, COCO classes).
 
-The model is loaded from bytes that :func:`petrify.models.load_model_bytes` has
+The model is loaded from bytes that :func:`petrify.models.load_model` has
 already checked against :data:`MODEL`, so the file on disk is never read again
 after verification. Pre and post processing are small pure functions
 (:func:`letterbox`, :func:`decode`, :func:`select_persons`, :func:`map_to_frame`,
@@ -48,7 +48,7 @@ import numpy as np
 from petrify.core.config import PersonDnnConfig
 from petrify.core.detections import Box, DetectionKind, Detections
 from petrify.core.frame import Frame
-from petrify.models import PERSON_DNN_MODEL, load_model_bytes
+from petrify.models import PERSON_DNN_MODEL, load_model
 
 MODEL = PERSON_DNN_MODEL
 
@@ -417,6 +417,16 @@ class PersonDnnDetector:
         self.pad_y = _check_pad("pad_y", pad_y)
         self._net = cv2.dnn.readNetFromONNX(np.frombuffer(model, dtype=np.uint8))
         self._output_names = tuple(self._net.getUnconnectedOutLayersNames())
+        self._model_path: Path | None = None
+
+    @property
+    def model_path(self) -> Path | None:
+        """The model file this detector was built from, or None when built from bytes.
+
+        Set by :meth:`from_config` from the path the verified bytes were read
+        from, so a caller can report it without reading the file again.
+        """
+        return self._model_path
 
     @classmethod
     def from_config(
@@ -434,14 +444,16 @@ class PersonDnnDetector:
             If the model file is missing, unreadable, or fails its size or
             SHA-256 check.
         """
-        data = load_model_bytes(MODEL, path=config.model_path, dirs=model_dirs)
-        return cls(
-            data,
+        loaded = load_model(MODEL, path=config.model_path, dirs=model_dirs)
+        detector = cls(
+            loaded.data,
             score_threshold=config.score_threshold,
             nms_threshold=config.nms_threshold,
             pad_x=config.pad_x,
             pad_y=config.pad_y,
         )
+        detector._model_path = loaded.path
+        return detector
 
     def detect(self, frame: Frame) -> Detections:
         """Return detections with only ``persons`` set (see :meth:`detect_boxes`)."""

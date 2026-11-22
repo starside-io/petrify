@@ -14,7 +14,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-"""petrify — cinemagraph-style motion-freeze video processor."""
+"""petrify: cinemagraph-style motion-freeze video processor."""
 
 __version__ = "0.1.0"
 __author__ = "petrify contributors"

@@ -30,7 +30,7 @@ class TestBackgroundDiffer:
     def test_slightly_noisy_frame_not_different(self) -> None:
         bg = _solid(240, 320, 100)
         noisy = bg.copy()
-        # Add ±5 noise — below pixel_threshold=25
+        # Add ±5 noise, below pixel_threshold=25
         noisy[:, :] = np.clip(noisy[:, :].astype(int) + 4, 0, 255).astype(np.uint8)
         differ = BackgroundDiffer(bg, pixel_threshold=25, area_threshold=200)
         assert not differ.is_different(noisy)
@@ -38,7 +38,7 @@ class TestBackgroundDiffer:
     def test_large_bright_patch_is_different(self) -> None:
         bg = _solid(240, 320, 50)
         frame = bg.copy()
-        # Paint a 60×60 bright block in the centre — large foreground
+        # Paint a 60×60 bright block in the centre: large foreground
         frame[90:150, 130:190] = 255
         differ = BackgroundDiffer(bg, pixel_threshold=25, area_threshold=200)
         assert differ.is_different(frame)
@@ -46,7 +46,7 @@ class TestBackgroundDiffer:
     def test_tiny_patch_below_area_threshold_not_different(self) -> None:
         bg = _solid(240, 320, 50)
         frame = bg.copy()
-        # Paint a 5×5 block — small noise, below area_threshold=200
+        # Paint a 5×5 block: small noise, below area_threshold=200
         frame[100:105, 100:105] = 255
         differ = BackgroundDiffer(bg, pixel_threshold=25, area_threshold=200)
         assert not differ.is_different(frame)

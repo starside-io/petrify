@@ -29,7 +29,7 @@ import numpy as np
 from petrify.core.config import FaceYuNetConfig
 from petrify.core.detections import Box, DetectionKind, Detections, Face
 from petrify.core.frame import Frame
-from petrify.models import FACE_YUNET_MODEL, load_model_bytes
+from petrify.models import FACE_YUNET_MODEL, load_model
 
 MODEL = FACE_YUNET_MODEL
 """Pinned identity of the YuNet 2023mar face detection model."""
@@ -183,6 +183,7 @@ class FaceYuNetDetector:
         if self._net is None:
             raise RuntimeError("cv2.FaceDetectorYN.create returned no detector")
         self._input_size: tuple[int, int] = _INITIAL_SIZE
+        self._model_path: Path | None = None
 
     # Read-only: the net takes the settings at creation, so a later assignment
     # would look effective while changing nothing.
@@ -201,6 +202,15 @@ class FaceYuNetDetector:
         """Candidates kept before non-maximum suppression, passed at creation."""
         return self._top_k
 
+    @property
+    def model_path(self) -> Path | None:
+        """The model file this detector was built from, or None when built from bytes.
+
+        Set by :meth:`from_config` from the path the verified bytes were read
+        from, so a caller can report it without reading the file again.
+        """
+        return self._model_path
+
     @classmethod
     def from_config(
         cls, config: FaceYuNetConfig, dirs: Sequence[Path] = ()
@@ -215,13 +225,15 @@ class FaceYuNetDetector:
         petrify.models.ModelError
             If the file is missing, unreadable, or fails the size or SHA-256 check.
         """
-        data = load_model_bytes(MODEL, path=config.model_path, dirs=dirs)
-        return cls(
-            data,
+        loaded = load_model(MODEL, path=config.model_path, dirs=dirs)
+        detector = cls(
+            loaded.data,
             score_threshold=config.score_threshold,
             nms_threshold=config.nms_threshold,
             top_k=config.top_k,
         )
+        detector._model_path = loaded.path
+        return detector
 
     def detect(self, frame: Frame) -> Detections:
         """Return detections with only ``faces`` set, each face carrying five landmarks.

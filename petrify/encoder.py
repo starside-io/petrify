@@ -82,7 +82,7 @@ def ffmpeg_encode(
         FFmpeg video codec name (e.g. ``libx264``, ``libx265``, ``h264_videotoolbox``).
     crf:
         Constant Rate Factor quality setting (lower = better quality / larger
-        file).  Valid range depends on the codec; 0–51 for libx264/libx265.
+        file).  Valid range depends on the codec; 0 to 51 for libx264/libx265.
     preset:
         FFmpeg preset string (e.g. ``ultrafast``, ``medium``, ``slow``).
         Ignored for some hardware-accelerated codecs.

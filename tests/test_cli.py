@@ -32,6 +32,7 @@ from petrify.core.config import (
 )
 from petrify.core.engine import EngineStats
 from petrify.core.frame import SourceInfo
+from petrify.modes.erase import ERASE
 from petrify.pipeline import OutputConfig, RunReport
 
 IN = "in.mp4"
@@ -227,11 +228,40 @@ def test_k1_run_without_source_is_the_file_form(
         main(["run"])
     assert excinfo.value.code == 2
     assert "INPUT OUTPUT" in capsys.readouterr().err
-    with pytest.raises(SystemExit) as excinfo:
-        main(["run", "--output", OUT])
-    assert excinfo.value.code == 2
-    assert "unrecognized arguments: --output" in capsys.readouterr().err
     run_file.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["run", "--output", OUT],
+        ["run", f"--output={OUT}"],
+        ["--verbose", "run", "--preview"],
+        ["run", OUT, "--mode", "erase"],
+    ],
+)
+def test_run_with_a_run_only_option_and_no_source_is_a_usage_error(
+    run_file: mock.MagicMock,
+    run_stream: mock.MagicMock,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+) -> None:
+    # Meant for petrify run but without --source: say what is missing, not
+    # "unrecognized arguments" from the file form.
+    with pytest.raises(SystemExit) as excinfo:
+        main(argv)
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "petrify run: error: petrify run requires --source" in err
+    assert "unrecognized arguments" not in err
+    run_file.assert_not_called()
+    run_stream.assert_not_called()
+
+
+def test_a_file_named_run_still_uses_the_file_form(run_file: mock.MagicMock) -> None:
+    assert main(["run", OUT, "--no-roi", "--verbose"]) == 0
+    run_file.assert_called_once()
+    assert run_file.call_args.args[:2] == ("run", OUT)
 
 
 # ---------------------------------------------------------------------------
@@ -717,12 +747,13 @@ def test_web_help_mentions_the_raw_feed_and_realtime(capsys: pytest.CaptureFixtu
 def test_run_without_web_calls_run_stream_exactly_as_before(run_stream: mock.MagicMock) -> None:
     assert main(["run", "--source", IN, "--output", OUT]) == 0
     assert len(run_stream.call_args.args) == 3
-    assert run_stream.call_args.kwargs == {}
+    # The factory the CLI loaded is passed on, so the mode is loaded only once.
+    assert run_stream.call_args.kwargs == {"factory": ERASE}
 
 
 def test_realtime_without_web_reaches_run_stream(run_stream: mock.MagicMock) -> None:
     assert main(["run", "--source", IN, "--output", OUT, "--realtime"]) == 0
-    assert run_stream.call_args.kwargs == {"realtime": True}
+    assert run_stream.call_args.kwargs == {"realtime": True, "factory": ERASE}
 
 
 def _web_run(argv: list[str], capsys: pytest.CaptureFixture[str],
@@ -767,6 +798,7 @@ def test_web_startup_line_is_printed_once_and_is_the_only_place_of_the_token(
     assert isinstance(kwargs["web_sink"], MjpegSink)
     assert kwargs["raw_preview"] is None
     assert kwargs["realtime"] is False
+    assert kwargs["factory"] is ERASE
     assert "petrify-web" in rs.seen["threads"]  # type: ignore[attr-defined]
     # The server was stopped when the run ended.
     assert "petrify-web" not in [t.name for t in threading.enumerate()]

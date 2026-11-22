@@ -39,7 +39,7 @@ from petrify.core.frame import Frame
 from petrify.core.registry import ENTRY_POINT_GROUP, ModeLoadError
 from petrify.detectors import FaceYuNetDetector, PersonDnnDetector, PersonSegmenter
 from petrify.detectors.person_hog import PersonDetector
-from petrify.models import ModelIntegrityError, ModelNotFoundError
+from petrify.models import LoadedModel, ModelIntegrityError, ModelNotFoundError
 from petrify.pipeline import (
     BACKGROUND_CHECK_NOT_USED_WARNING,
     DNN_NOT_USED_WARNING,
@@ -201,11 +201,14 @@ class FakeModelDetector:
 
     stateful = False
 
-    def __init__(self, cls: type, settings: object, dirs: Any) -> None:
+    def __init__(
+        self, cls: type, settings: object, dirs: Any, model_path: Path | None = None
+    ) -> None:
         self.provides = cls.provides  # type: ignore[attr-defined]
         self.settings = settings
         self.dirs = tuple(dirs)
         self.kind = cls
+        self.model_path = model_path
 
     def detect(self, frame: Frame) -> Detections:
         seen = _shows_subject(frame.image)
@@ -737,7 +740,9 @@ def test_from_config_forwards_the_pads(monkeypatch: pytest.MonkeyPatch) -> None:
 
     from petrify.detectors import person_dnn
 
-    monkeypatch.setattr(person_dnn, "load_model_bytes", lambda spec, path=None, dirs=(): b"x")
+    monkeypatch.setattr(
+        person_dnn, "load_model", lambda spec, path=None, dirs=(): LoadedModel(b"x", Path("m"))
+    )
 
     class Net:
         def getUnconnectedOutLayersNames(self) -> tuple[str, ...]:  # noqa: N802 (OpenCV API)
@@ -746,6 +751,11 @@ def test_from_config_forwards_the_pads(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cv2.dnn, "readNetFromONNX", lambda buffer: Net())
     det = PersonDnnDetector.from_config(PersonDnnConfig(pad_x=0.3, pad_y=0.0), [])
     assert (det.pad_x, det.pad_y) == (0.3, 0.0)
+    assert det.model_path == Path("m")
+    direct = PersonDnnDetector(b"x")
+    assert direct.model_path is None
+    with pytest.raises(AttributeError):
+        direct.model_path = Path("x")  # type: ignore[misc]
 
 
 def test_config_to_dict_with_the_new_detectors_is_plain_json() -> None:
@@ -907,19 +917,96 @@ def test_background_check_with_erase_does_not_warn(
     assert not any("--background-check has no effect" in w for w in _warnings(caplog))
 
 
-def test_the_ready_line_names_the_model_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.usefixtures("fake_person_check")
+@pytest.mark.parametrize("sample_check", [True, False], ids=["checked", "unchecked"])
+def test_faces_used_by_the_yunet_sample_check_do_not_warn(
+    builds: ModelBuilds, caplog: pytest.LogCaptureFixture, sample_check: bool
 ) -> None:
-    from petrify.models import load_model_bytes
+    # With erase on an online background, --faces sets the yunet checker's
+    # threshold, so it does take effect; without the sample check it does not.
+    background = BackgroundConfig(
+        strategy="running", sample_checkers=("hog", "yunet"), sample_check=sample_check
+    )
+    config = _live_config("running", faces=FaceYuNetConfig(), background=background)
+    with caplog.at_level(logging.WARNING, logger="petrify.pipeline"):
+        pipeline._build_components(FakeSource(), config)
+    warned = FACES_NOT_USED_WARNING.format(mode="erase") in _warnings(caplog)
+    assert warned is not sample_check
+
+
+@pytest.mark.usefixtures("fake_person_check")
+@pytest.mark.parametrize("sample_check", [True, False], ids=["checked", "unchecked"])
+def test_dnn_used_by_the_dnn_sample_check_does_not_warn(
+    builds: ModelBuilds, caplog: pytest.LogCaptureFixture, sample_check: bool
+) -> None:
+    background = BackgroundConfig(
+        strategy="running", sample_checkers=("hog", "dnn"), sample_check=sample_check
+    )
+    config = _live_config(
+        "running", detector="motion", person_dnn=PersonDnnConfig(), background=background
+    )
+    with caplog.at_level(logging.WARNING, logger="petrify.pipeline"):
+        pipeline._build_components(FakeSource(), config)
+    assert (DNN_NOT_USED_WARNING in _warnings(caplog)) is not sample_check
+
+
+def _infos(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and r.name == "petrify.pipeline"]
+
+
+@pytest.mark.usefixtures("fake_person_check")
+@pytest.mark.parametrize("detector", ["motion", "person", "both"])
+def test_the_detector_line_keeps_its_wording_when_every_detector_is_built(
+    caplog: pytest.LogCaptureFixture, detector: str
+) -> None:
+    with caplog.at_level(logging.INFO, logger="petrify.pipeline"):
+        pipeline._build_components(FakeSource(), _live_config("running", detector=detector))
+    assert f"Detector mode: {detector}" in _infos(caplog)
+
+
+@pytest.mark.usefixtures("plugin")
+@pytest.mark.parametrize(
+    ("mode", "detector", "line"),
+    [
+        ("faces", "motion",
+         "Detector mode: motion (not used: the mode 'faces' does not require motion). "
+         "Detectors built: FakeModelDetector"),
+        ("faces", "both",
+         "Detector mode: both (not used: the mode 'faces' does not require motion or "
+         "person boxes). Detectors built: FakeModelDetector"),
+        ("persons", "both",
+         "Detector mode: both (motion not used: the mode 'persons' does not require "
+         "motion). Detectors built: PersonDetector"),
+        ("faces", "person",
+         "Detector mode: person (not used: the mode 'faces' does not require person "
+         "boxes). Detectors built: FakeModelDetector"),
+    ],
+)
+def test_the_detector_line_states_the_detectors_actually_built(
+    builds: ModelBuilds, caplog: pytest.LogCaptureFixture, mode: str, detector: str,
+    line: str,
+) -> None:
+    config = _plugin_config(mode, detector=detector, faces=FaceYuNetConfig())
+    with caplog.at_level(logging.INFO, logger="petrify.pipeline"):
+        pipeline._build_components(FakeSource(), config)
+    infos = _infos(caplog)
+    assert line in infos
+    assert f"Detector mode: {detector}" not in infos
+
+
+def test_the_ready_line_names_the_model_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from petrify.models import load_model
     from tests.test_models import _place, _spec
 
     spec = _spec()
     model_file = _place(tmp_path / "models")
-    monkeypatch.setitem(pipeline._MODEL_OF, PersonDnnDetector, spec)
 
     def from_config(settings: object, dirs: Any = ()) -> FakeModelDetector:
-        load_model_bytes(spec, dirs=dirs)
-        return FakeModelDetector(PersonDnnDetector, settings, dirs)
+        loaded = load_model(spec, dirs=dirs)
+        return FakeModelDetector(PersonDnnDetector, settings, dirs, model_path=loaded.path)
 
     config = _live_config("running", models=ModelConfig(dir=str(tmp_path / "models")))
     models = pipeline._ModelDetectors(config)
@@ -933,18 +1020,21 @@ def test_the_ready_line_names_the_model_file(
     ]
 
 
-def test_pop_loaded_path_reports_the_file_once(tmp_path: Path) -> None:
-    from petrify.models import load_model_bytes, pop_loaded_path
-    from tests.test_models import _place, _spec
-
-    spec = _spec()
-    target = _place(tmp_path / "b")
-    load_model_bytes(spec, dirs=[tmp_path / "a", tmp_path / "b"])
-    assert pop_loaded_path(spec) == target
-    assert pop_loaded_path(spec) is None
-    with pytest.raises(ModelNotFoundError):
-        load_model_bytes(spec, dirs=[tmp_path / "a"])
-    assert pop_loaded_path(spec) is None
+def test_the_ready_line_falls_back_to_the_file_name_without_a_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = _live_config("running")
+    models = pipeline._ModelDetectors(config)
+    fake = FakeModelDetector(PersonDnnDetector, PersonDnnConfig(), ())
+    with (
+        mock.patch.object(PersonDnnDetector, "from_config", return_value=fake),
+        caplog.at_level(logging.INFO, logger="petrify.pipeline"),
+    ):
+        models.get(PersonDnnDetector, PersonDnnConfig())
+    filename = pipeline.PERSON_DNN_MODEL.filename
+    assert f"Detector PersonDnnDetector ready: model {filename} loaded and verified" in [
+        r.getMessage() for r in caplog.records
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1153,7 @@ def test_a_run_whose_check_rejects_every_sample_warns_and_stays_black(
 class _RaisingDetector:
     provides = frozenset({DetectionKind.PERSONS})
     stateful = False
+    model_path = None
 
     def __init__(self) -> None:
         self.calls = 0

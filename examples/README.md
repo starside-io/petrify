@@ -1,4 +1,4 @@
-# petrify — Usage Examples
+# petrify: Usage Examples
 
 This directory contains example commands and notes for common petrify use cases.
 

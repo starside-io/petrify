@@ -53,6 +53,7 @@ from petrify.detectors.person_dnn import (
 )
 from petrify.models import (
     MODEL_DIR_ENV,
+    LoadedModel,
     ModelIntegrityError,
     ModelNotFoundError,
     load_model_bytes,
@@ -603,7 +604,9 @@ def test_fake_network_nms_threshold_from_constructor(monkeypatch: pytest.MonkeyP
 
 def test_fake_network_thresholds_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
     image = np.zeros((416, 416, 3), dtype=np.uint8)
-    monkeypatch.setattr(pd, "load_model_bytes", lambda spec, path=None, dirs=(): b"fake")
+    monkeypatch.setattr(
+        pd, "load_model", lambda spec, path=None, dirs=(): LoadedModel(b"fake", Path("m"))
+    )
     outs_score = _two_anchor_outputs(second_col=20, second_score=0.45)
     outs_nms = _two_anchor_outputs(second_col=11, second_score=0.8)
 
@@ -856,6 +859,7 @@ def test_real_model_uses_the_verified_bytes(tmp_path: Path) -> None:
     det = PersonDnnDetector.from_config(PersonDnnConfig(), [tmp_path])
     copy.unlink()  # the detector must not need the file after construction
     assert det.detect(_frame(np.zeros((48, 64, 3), dtype=np.uint8))).persons == ()
+    assert det.model_path == copy
 
 
 # ---------------------------------------------------------------------------

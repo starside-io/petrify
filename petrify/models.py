@@ -156,20 +156,6 @@ KNOWN_MODELS: Mapping[str, ModelSpec] = MappingProxyType(
 )
 
 
-# Where each model was last loaded from, by key, until the caller takes it with
-# pop_loaded_path. Detectors receive only the bytes, so this is how the caller that
-# built a detector can report which file it used without reading it again.
-_LOADED_PATHS: dict[str, Path] = {}
-
-
-def pop_loaded_path(spec: ModelSpec) -> Path | None:
-    """Return and forget the file *spec* was last loaded from, or None.
-
-    Only a successful :func:`load_model_bytes` records a path.
-    """
-    return _LOADED_PATHS.pop(spec.key, None)
-
-
 def _home(env: Mapping[str, str]) -> Path:
     home = env.get("HOME", "")
     if home and Path(home).is_absolute():
@@ -333,10 +319,26 @@ def _read_checked(spec: ModelSpec, path: Path) -> bytes | None:
     return data
 
 
-def load_model_bytes(
+@dataclass(frozen=True)
+class LoadedModel:
+    """A verified model file: its bytes and the path they were read from.
+
+    Attributes
+    ----------
+    data:
+        The file's contents, exactly the bytes whose size and SHA-256 were checked.
+    path:
+        The file the bytes were read from, for reporting. It is never read again.
+    """
+
+    data: bytes
+    path: Path
+
+
+def load_model(
     spec: ModelSpec, *, path: str | Path | None = None, dirs: Sequence[Path] = ()
-) -> bytes:
-    """Find, verify, and return the bytes of the model file described by *spec*.
+) -> LoadedModel:
+    """Find and verify the model file described by *spec*; return its bytes and path.
 
     When *path* is given only that file is tried and *dirs* is ignored.
     Otherwise each directory in *dirs* is tried in order for
@@ -365,6 +367,12 @@ def load_model_bytes(
     for candidate in candidates:
         data = _read_checked(spec, candidate)
         if data is not None:
-            _LOADED_PATHS[spec.key] = candidate
-            return data
+            return LoadedModel(data=data, path=candidate)
     raise _not_found(spec, candidates)
+
+
+def load_model_bytes(
+    spec: ModelSpec, *, path: str | Path | None = None, dirs: Sequence[Path] = ()
+) -> bytes:
+    """Return only the verified bytes of :func:`load_model`; same lookup and errors."""
+    return load_model(spec, path=path, dirs=dirs).data

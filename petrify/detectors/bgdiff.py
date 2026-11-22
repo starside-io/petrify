@@ -14,7 +14,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-"""Static background differencing — compare every frame against a locked reference.
+"""Static background differencing: compare every frame against a locked reference.
 
 Why this is needed
 ------------------
@@ -30,7 +30,7 @@ incoming frame.  Because the reference never changes:
 
 * A person standing still is **always** detected (they are always different
   from the empty-corridor reference).
-* The check is cheap — one ``absdiff`` + threshold + contour area per frame.
+* The check is cheap: one ``absdiff`` + threshold + contour area per frame.
 * Lighting-noise is suppressed by a per-pixel grey threshold (default 25) and
   a minimum contour-area threshold (default 200 px² in downsampled space).
 """
@@ -60,7 +60,7 @@ class BackgroundDiffer:
         The clean background frame (BGR, any resolution).  It is downsampled
         internally alongside each query frame.
     pixel_threshold:
-        Per-pixel grayscale absolute difference (0–255) above which a pixel is
+        Per-pixel grayscale absolute difference (0 to 255) above which a pixel is
         marked as changed.  25 suppresses sensor noise while catching even low-
         contrast foreground (dark clothing against a light corridor wall).
     area_threshold:

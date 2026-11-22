@@ -43,6 +43,7 @@ from petrify.detectors.segment import (
 )
 from petrify.models import (
     MODEL_DIR_ENV,
+    LoadedModel,
     ModelIntegrityError,
     ModelNotFoundError,
     load_model_bytes,
@@ -632,15 +633,23 @@ def test_from_config_forwards_every_setting(
 ) -> None:
     seen: dict[str, object] = {}
 
-    def fake_load(spec: object, *, path: object = None, dirs: object = ()) -> bytes:
+    def fake_load(spec: object, *, path: object = None, dirs: object = ()) -> LoadedModel:
         seen.update(spec=spec, path=path, dirs=dirs)
-        return b"verified"
+        return LoadedModel(b"verified", Path("/a/m.onnx"))
 
-    monkeypatch.setattr(segment, "load_model_bytes", fake_load)
+    monkeypatch.setattr(segment, "load_model", fake_load)
     cfg = SegmentConfig(threshold=0.37, dilate_px=9, min_area_share=0.125, model_path="m.onnx")
     det = PersonSegmenter.from_config(cfg, [Path("/a")])
     assert (det.threshold, det.dilate_px, det.min_area_share) == (0.37, 9, 0.125)
     assert seen == {"spec": MODEL, "path": "m.onnx", "dirs": [Path("/a")]}
+    assert det.model_path == Path("/a/m.onnx")
+
+
+def test_model_path_is_none_when_built_from_bytes_and_read_only(fake_net: _FakeNet) -> None:
+    det = PersonSegmenter(b"verified")
+    assert det.model_path is None
+    with pytest.raises(AttributeError):
+        det.model_path = Path("x")  # type: ignore[misc]
 
 
 def test_garbage_model_bytes_raise_opencv_error() -> None:

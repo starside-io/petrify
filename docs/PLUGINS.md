@@ -411,12 +411,12 @@ $ petrify run --source camera.mp4 --mode facebox --faces --output out.mp4
 [INFO] petrify.sources.file: Input: camera.mp4  |  1920x1080 @ 25.00 fps  |  ~1169 frames
 [INFO] petrify.cli: Source: camera.mp4 (file), mode: facebox
 [INFO] petrify.pipeline: Detector FaceYuNetDetector ready: model .../face_detection_yunet_2023mar.onnx loaded and verified
-[INFO] petrify.pipeline: Detector mode: motion
+[INFO] petrify.pipeline: Detector mode: motion (not used: the mode 'facebox' does not require motion). Detectors built: FaceYuNetDetector
 [INFO] petrify.pipeline: ROI: not used, the mode 'facebox' does not allow the overlay
 [INFO] petrify.pipeline: Run done: frames=1169 frozen=1034 pass-through=135 failed-closed=0 (over budget 0) source-dropped=0 sink-failures=0
 ```
 
-YuNet found a face on 805 frames, and those frames have the face box painted. The other 229 frames counted as frozen are gap-filled or cold-start frames with no face of their own, and are covered whole. `Detector mode: motion` reports the `--detector` setting; MOG2 does not run, since the mode does not require motion.
+YuNet found a face on 805 frames, and those frames have the face box painted. The other 229 frames counted as frozen are gap-filled or cold-start frames with no face of their own, and are covered whole. The `Detector mode` line reports the `--detector` setting and says that MOG2 does not run, since the mode does not require motion; YuNet is the only detector built.
 
 ## What is not available yet
 

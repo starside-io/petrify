@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class PersonDetector:
     """Detect human presence in a frame using the OpenCV HOG + SVM descriptor.
 
-    No external model files are required — OpenCV ships the default people
+    No external model files are required: OpenCV ships the default people
     detector weights.  The detector is optimised for upright pedestrians and
     works on both colour and grayscale frames.
 
@@ -51,7 +51,7 @@ class PersonDetector:
         HOG window padding ``(px, py)`` in pixels.
     scale:
         Image pyramid scale factor.  1.05 = fine pyramid (slower, more
-        accurate); 1.1–1.2 = coarser pyramid (faster).
+        accurate); 1.1 to 1.2 = coarser pyramid (faster).
     min_confidence:
         Minimum detection weight (SVM score) required to accept a box.
         Higher values reduce false positives at the cost of recall.

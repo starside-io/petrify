@@ -26,7 +26,7 @@ class TestMotionDetector:
         frame = _solid(240, 320)
         md.is_motion(frame)
         md.reset()
-        # After reset the subtractor model is fresh — smoke test only
+        # After reset the subtractor model is fresh (smoke test only)
         result = md.is_motion(frame)
         assert isinstance(result, bool)
 
