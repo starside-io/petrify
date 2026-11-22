@@ -71,10 +71,18 @@ ORPHAN_HEAD_MASK_SHARE = Fraction(30, 100)
 """A person box whose head zone holds less than this share of mask pixels is an orphan."""
 
 HELD_GROWTH_PER_FRAME = Fraction(10, 100)
-"""Growth of a held face's padded rect per held frame, as a share of its size."""
+"""Growth of a held box's padded rect per held frame, as a share of its size."""
 
 HELD_GROWTH_CAP = Fraction(2)
-"""Largest growth factor of a held face's padded rect."""
+"""Largest growth factor of a held box's padded rect."""
+
+HELD_REGION_FRAMES: int = math.ceil((HELD_GROWTH_CAP - 1) / HELD_GROWTH_PER_FRAME)
+"""Held count at which a held box reaches the growth cap (10 with the constants above).
+
+A held box with a count below this still counts as a region. From this count on
+its cover stops growing while the subject may keep moving, so it no longer
+proves the subject is covered: it is still drawn, but it is not trusted.
+"""
 
 Primary = Literal["face", "mask", "bodybox"]
 PRIMARIES: frozenset[str] = frozenset({"face", "mask", "bodybox"})
@@ -192,11 +200,12 @@ def _outward(
 
 
 def held_growth(held_frames: int) -> Fraction:
-    """Return the growth factor for a face held unchanged for ``held_frames`` frames.
+    """Return the growth factor for a box held unchanged for ``held_frames`` frames.
 
     The factor grows by :data:`HELD_GROWTH_PER_FRAME` per held frame, linearly,
-    and stops at :data:`HELD_GROWTH_CAP`. Zero held frames gives 1 (no growth).
-    Pass the result as ``grow`` to :func:`pad_face`.
+    and stops at :data:`HELD_GROWTH_CAP`, which it reaches at
+    :data:`HELD_REGION_FRAMES`. Zero held frames gives 1 (no growth). Pass the
+    result as ``grow`` to :func:`pad_face` or :func:`pad_person`.
     """
     n = _count(held_frames, "held_frames")
     return min(1 + n * HELD_GROWTH_PER_FRAME, HELD_GROWTH_CAP)
@@ -225,9 +234,7 @@ def pad_face(
     x, y, bw, bh = _box(box)
     frame_h, frame_w = _count(h, "h"), _count(w, "w")
     p = _decimal(padding, "padding")
-    g = grow if isinstance(grow, Fraction) else _decimal(grow, "grow")
-    if g < 1:
-        raise ValueError(f"grow must be at least 1, got {grow!r}")
+    g = _growth(grow)
     if bw == 0 or bh == 0:
         return None
     # Every edge is an integer count of 1/den pixels, den = 2 * denominator(p):
@@ -241,42 +248,57 @@ def pad_face(
     bottom = max(floor_units, n * bh)
     left, right = x * den - side, (x + bw) * den + side
     upper, lower = y * den - top, (y + bh) * den + bottom
-    if g != 1:
-        # Scale around the center: the new edges are (L + R) / 2 -+ (R - L) * g / 2,
-        # which over the denominator 2 * gb * den stays an exact integer.
-        ga, gb = g.numerator, g.denominator
-        sum_x, span_x = (left + right) * gb, (right - left) * ga
-        sum_y, span_y = (upper + lower) * gb, (lower - upper) * ga
-        left, right = sum_x - span_x, sum_x + span_x
-        upper, lower = sum_y - span_y, sum_y + span_y
-        den *= 2 * gb
-    return _outward(left, upper, right, lower, den, frame_h, frame_w)
+    return _outward(*_scaled(left, upper, right, lower, den, g), frame_h, frame_w)
 
 
-def pad_person(box: Box, h: int, w: int) -> Rect | None:
+def _growth(grow: float | Fraction) -> Fraction:
+    """Return ``grow`` as an exact fraction of at least 1, or raise ValueError."""
+    g = grow if isinstance(grow, Fraction) else _decimal(grow, "grow")
+    if g < 1:
+        raise ValueError(f"grow must be at least 1, got {grow!r}")
+    return g
+
+
+def _scaled(
+    left: int, upper: int, right: int, lower: int, den: int, g: Fraction
+) -> tuple[int, int, int, int, int]:
+    """Scale the rect with edges ``left / den`` and so on by ``g`` around its center.
+
+    The new edges are (L + R) / 2 -+ (R - L) * g / 2, which over the denominator
+    2 * gb * den stays an exact integer, so no rounding happens before
+    :func:`_outward`.
+    """
+    if g == 1:
+        return left, upper, right, lower, den
+    ga, gb = g.numerator, g.denominator
+    sum_x, span_x = (left + right) * gb, (right - left) * ga
+    sum_y, span_y = (upper + lower) * gb, (lower - upper) * ga
+    return sum_x - span_x, sum_y - span_y, sum_x + span_x, sum_y + span_y, den * 2 * gb
+
+
+def pad_person(box: Box, h: int, w: int, *, grow: float | Fraction = 1) -> Rect | None:
     """Return a person box padded by :data:`PERSON_PAD` per side, in an ``h`` by ``w`` frame.
 
-    Each side grows by at least :data:`MIN_PAD_PX`. Edges are rounded outward and
-    the result is clipped to the frame. Returns None for a zero-area box, or when
-    nothing of the result lies in the frame. Raises ValueError for a non-integral
-    coordinate or a negative box size.
+    Each side grows by at least :data:`MIN_PAD_PX`. With ``grow`` above 1 (a
+    held person box, see :func:`held_growth`) the padded rect is then scaled by
+    ``grow`` around its own center, before clipping, for the same reason as in
+    :func:`pad_face`. Edges are rounded outward once and the result is clipped
+    to the frame. Returns None for a zero-area box, or when nothing of the result
+    lies in the frame. Raises ValueError for a non-integral coordinate, a
+    negative box size, or a ``grow`` below 1.
     """
     x, y, bw, bh = _box(box)
     frame_h, frame_w = _count(h, "h"), _count(w, "w")
+    g = _growth(grow)
     if bw == 0 or bh == 0:
         return None
     n, den = PERSON_PAD.numerator, PERSON_PAD.denominator
     side = max(MIN_PAD_PX * den, n * bw)
     vert = max(MIN_PAD_PX * den, n * bh)
-    return _outward(
-        x * den - side,
-        y * den - vert,
-        (x + bw) * den + side,
-        (y + bh) * den + vert,
-        den,
-        frame_h,
-        frame_w,
+    edges = _scaled(
+        x * den - side, y * den - vert, (x + bw) * den + side, (y + bh) * den + vert, den, g
     )
+    return _outward(*edges, frame_h, frame_w)
 
 
 def dilate_px(h: int, dilate: float) -> int:
@@ -393,25 +415,26 @@ def _mask_orphan(mask: np.ndarray, box: Box) -> bool:
     )
 
 
-def orphan_persons(
+def orphan_indices(
     persons: Sequence[Box] | None,
     faces: Sequence[Face] | None,
     mask: np.ndarray | None,
     primary: Primary,
     h: int,
     w: int,
-) -> tuple[Rect, ...]:
-    """Return the padded rects of the person boxes the primary styles do not cover.
+) -> tuple[int, ...]:
+    """Return the positions in ``persons`` of the boxes the primary styles do not cover.
 
-    Only runs when ``persons`` is not None; zero-area person boxes are dropped.
-    By ``primary``:
+    Only runs when ``persons`` is not None; zero-area person boxes are never
+    orphans. By ``primary``:
 
     - ``"face"``: each face with a non-zero area clears at most one person box:
       the smallest-area box whose interior holds the face-box center strictly
       inside its top :data:`FACE_ZONE` (ties go to the first box in input order).
       Every box no face cleared is an orphan. So one face cannot clear two
       overlapping or nested persons, and a face found at belt height or lower
-      clears nothing.
+      clears nothing. The caller decides which faces may clear a box: the
+      shadow mode passes only the faces that are not held.
     - ``"mask"``: a person box is an orphan when its own area holds less than
       :data:`ORPHAN_MASK_SHARE` mask pixels, or when its head zone (the top
       :data:`HEAD_ZONE` of its height, whole rows rounded up) holds less than
@@ -429,9 +452,8 @@ def orphan_persons(
     - Face primary: a false face detection inside the top third of a person box
       whose real face was missed still clears that box.
 
-    Each orphan is returned padded by :func:`pad_person`, in the order of
-    ``persons``. ``h`` and ``w`` are the frame size, needed for the padding.
-    Raises ValueError for an unknown ``primary``, a mask whose shape is not
+    Indices are returned in increasing order. ``h`` and ``w`` are the frame
+    size. Raises ValueError for an unknown ``primary``, a mask whose shape is not
     ``(h, w)``, or a malformed box.
     """
     if primary not in PRIMARIES:
@@ -439,7 +461,7 @@ def orphan_persons(
     frame_h, frame_w = _count(h, "h"), _count(w, "w")
     if persons is None or primary == "bodybox":
         return ()
-    boxes = [box for box in persons if _has_area(box)]
+    boxes = [(i, box) for i, box in enumerate(persons) if _has_area(box)]
     if primary == "face":
         cleared: set[int] = set()
         for face in faces or ():
@@ -447,20 +469,48 @@ def orphan_persons(
                 continue
             fx, fy, fw, fh = _box(face.box)
             cx2, cy2 = 2 * fx + fw, 2 * fy + fh
-            best: int | None = None
-            for i, box in enumerate(boxes):
+            best: tuple[int, Box] | None = None
+            for i, box in boxes:
                 if _clears(cx2, cy2, box) and (
-                    best is None or box.w * box.h < boxes[best].w * boxes[best].h
+                    best is None or box.w * box.h < best[1].w * best[1].h
                 ):
-                    best = i
+                    best = (i, box)
             if best is not None:
-                cleared.add(best)
-        orphans = [box for i, box in enumerate(boxes) if i not in cleared]
-    else:
-        if mask is not None and mask.shape != (frame_h, frame_w):
-            raise ValueError(
-                f"mask shape {mask.shape} does not match the frame {(frame_h, frame_w)}"
-            )
-        orphans = [box for box in boxes if mask is None or _mask_orphan(mask, box)]
-    rects = (pad_person(box, frame_h, frame_w) for box in orphans)
+                cleared.add(best[0])
+        return tuple(i for i, _ in boxes if i not in cleared)
+    if mask is not None and mask.shape != (frame_h, frame_w):
+        raise ValueError(
+            f"mask shape {mask.shape} does not match the frame {(frame_h, frame_w)}"
+        )
+    return tuple(i for i, box in boxes if mask is None or _mask_orphan(mask, box))
+
+
+def orphan_persons(
+    persons: Sequence[Box] | None,
+    faces: Sequence[Face] | None,
+    mask: np.ndarray | None,
+    primary: Primary,
+    h: int,
+    w: int,
+    *,
+    held: Sequence[int] | None = None,
+) -> tuple[Rect, ...]:
+    """Return the padded rects of the person boxes the primary styles do not cover.
+
+    The orphans are the boxes :func:`orphan_indices` names, in the order of
+    ``persons``, each padded by :func:`pad_person` with
+    ``grow=held_growth(held[i])``. ``held`` gives one held count per entry of
+    ``persons``; None means 0 for every box. Raises ValueError like
+    :func:`orphan_indices`, and for a ``held`` of the wrong length.
+    """
+    indices = orphan_indices(persons, faces, mask, primary, h, w)
+    if persons is None:
+        return ()
+    counts = tuple(held) if held is not None else (0,) * len(persons)
+    if len(counts) != len(persons):
+        raise ValueError(
+            f"held must give one count per person box: {len(counts)} counts, "
+            f"{len(persons)} boxes"
+        )
+    rects = (pad_person(persons[i], h, w, grow=held_growth(counts[i])) for i in indices)
     return tuple(rect for rect in rects if rect is not None)

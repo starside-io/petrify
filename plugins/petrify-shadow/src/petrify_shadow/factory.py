@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping
 
@@ -30,10 +31,13 @@ from petrify_shadow.options import (
     DEFAULT_DILATE,
     DEFAULT_PADDING,
     FACE_STYLES,
+    MASK_STYLES,
     OPTIONS,
     STYLE_NAMES,
     parse_params,
 )
+
+logger = logging.getLogger(__name__)
 
 BODYBOX_NEEDS_PERSONS = (
     "the bodybox style needs person boxes: use --detector person or both, with "
@@ -73,6 +77,14 @@ WEAK_SEGMENT_MISS = (
     "segmented on the same frame, unless the person detector finds that person; add "
     "bodybox to cover every person box."
 )
+
+WARN_MASK_WITHOUT_PERSONS = (
+    "shadow: the mask styles run without person boxes (--detector motion). A person the "
+    "segmenter misses is shown whenever the segmenter marks anything else on the frame, "
+    "and the orphan rule that would cover that person needs person boxes. Use --detector "
+    "person or both, with --person-detector dnn."
+)
+"""Logged once per newly built mode with a mask style, no bodybox, and --detector motion."""
 
 # The styles that replace every pixel of the padded face box, which makes the
 # blur strength irrelevant and the face cover irreversible.
@@ -145,6 +157,10 @@ class ShadowFactory:
         Raises ``ValueError`` for invalid options, and for bodybox with
         ``--detector motion``: that check comes before the engine's terser
         mandatory error and also rejects a live switch to the motion detector.
+
+        A new mode that replaces a previous :class:`ShadowMode` takes over its
+        held-box memory. Each newly built mode with a mask style, no bodybox and
+        ``--detector motion`` logs :data:`WARN_MASK_WITHOUT_PERSONS` once.
         """
         params = parse_params(ctx.options)
         if "bodybox" in params.styles and ctx.config.detector == "motion":
@@ -153,7 +169,16 @@ class ShadowFactory:
         # noise generator running instead of starting a new one.
         if isinstance(previous, ShadowMode) and previous.params == params:
             return previous
-        return ShadowMode(params)
+        if (
+            params.styles & MASK_STYLES
+            and "bodybox" not in params.styles
+            and ctx.config.detector == "motion"
+        ):
+            logger.warning(WARN_MASK_WITHOUT_PERSONS)
+        # The held-box memory carries over, so a held cover does not shrink on
+        # the frame the options change.
+        held_from = previous if isinstance(previous, ShadowMode) else None
+        return ShadowMode(params, held_from=held_from)
 
 
 _UNREADABLE = object()

@@ -29,6 +29,7 @@ from petrify_shadow.regions import (
     FACE_ZONE,
     HEAD_ZONE,
     HELD_GROWTH_CAP,
+    HELD_REGION_FRAMES,
     MIN_PAD_PX,
     ORPHAN_HEAD_MASK_SHARE,
     ORPHAN_MASK_SHARE,
@@ -37,6 +38,7 @@ from petrify_shadow.regions import (
     Rect,
     dilate_px,
     held_growth,
+    orphan_indices,
     orphan_persons,
     pad_face,
     pad_person,
@@ -324,6 +326,61 @@ def test_pad_person_contains_box_property() -> None:
             assert rect.x1 >= min(box.x + box.w + side, w)
             assert rect.y0 <= max(box.y - vert, 0)
             assert rect.y1 >= min(box.y + box.h + vert, h)
+
+
+def test_pad_person_grow_literal() -> None:
+    box = Box(100, 100, 200, 400)
+    # Unclipped padded rect: x 90 to 310, y 80 to 520, center (200, 300).
+    assert pad_person(box, H, W, grow=1) == Rect(90, 80, 310, 520)
+    # 1.1: half width 121, half height 242.
+    assert pad_person(box, H, W, grow=held_growth(1)) == Rect(79, 58, 321, 542)
+    # 2: half width 220, half height 440, clipped at the top and left only.
+    assert pad_person(box, H, W, grow=held_growth(10)) == Rect(0, 0, 420, 740)
+    assert pad_person(box, H, W, grow=held_growth(50)) == Rect(0, 0, 420, 740)
+    assert pad_person(box, H, W, grow=2.0) == Rect(0, 0, 420, 740)
+
+
+def test_pad_person_grow_rounds_outward() -> None:
+    # Padded x 7.5 to 62.5 (rounded out to 7 and 63), center 35, half width 27.5;
+    # 1.1 gives half width 30.25, so x 4.75 to 65.25, rounded out to 4 and 66.
+    assert pad_person(Box(10, 10, 50, 30), H, W, grow=held_growth(1)).x0 == 4  # type: ignore[union-attr]
+    assert pad_person(Box(10, 10, 50, 30), H, W, grow=held_growth(1)).x1 == 66  # type: ignore[union-attr]
+
+
+def test_pad_person_grows_before_clipping() -> None:
+    box = Box(0, 0, 100, 100)
+    grown = pad_person(box, 400, 400, grow=2)
+    # Unclipped -5 to 105 doubled around 50: -60 to 160.
+    assert grown == Rect(0, 0, 160, 160)
+    # Growing the clipped Rect(0, 0, 105, 105) around its own center reaches only 157.5.
+    assert grown.x1 > 158
+
+
+def test_pad_person_grow_rejects_shrinking_and_zero_area() -> None:
+    with pytest.raises(ValueError, match="grow"):
+        pad_person(Box(10, 10, 10, 10), H, W, grow=0.9)
+    assert pad_person(Box(10, 10, 0, 10), H, W, grow=2) is None
+
+
+def test_pad_person_grow_contains_ungrown_property() -> None:
+    rng = random.Random(11)
+    for _ in range(2000):
+        h, w = rng.randint(1, 80), rng.randint(1, 80)
+        box = Box(rng.randint(-20, 80), rng.randint(-20, 80), rng.randint(1, 40), rng.randint(1, 40))
+        previous = pad_person(box, h, w)
+        for held in range(0, 13):
+            grown = pad_person(box, h, w, grow=held_growth(held))
+            if previous is not None:
+                assert grown is not None
+                assert _in_frame(grown, h, w)
+                assert _contains(grown, previous.x0, previous.y0, previous.x1, previous.y1)
+            previous = grown
+
+
+def test_held_region_frames_is_where_the_growth_reaches_the_cap() -> None:
+    assert HELD_REGION_FRAMES == 10
+    assert held_growth(HELD_REGION_FRAMES) == HELD_GROWTH_CAP
+    assert held_growth(HELD_REGION_FRAMES - 1) < HELD_GROWTH_CAP
 
 
 # --- dilate_px --------------------------------------------------------------
@@ -826,3 +883,25 @@ def test_orphans_reject_bad_input() -> None:
         orphan_persons((Box(0, 0, 5, 5),), (), np.zeros((5, 5), bool), "mask", 10, 10)
     with pytest.raises(ValueError):
         orphan_persons((Box(0, 0, -5, 5),), (), None, "face", 10, 10)
+
+
+def test_orphan_indices_name_positions_in_the_input() -> None:
+    # A zero-area box keeps its position, so indices line up with ``persons``.
+    persons = (Box(0, 0, 0, 0), Box(100, 100, 200, 400), Box(500, 100, 200, 400))
+    faces = (_face(150, 120, 40, 50),)
+    assert orphan_indices(persons, faces, None, "face", H, W) == (2,)
+    assert orphan_indices(persons, (), None, "face", H, W) == (1, 2)
+    assert orphan_indices(persons, (), None, "mask", H, W) == (1, 2)
+    assert orphan_indices(persons, (), None, "bodybox", H, W) == ()
+    assert orphan_indices(None, (), None, "face", H, W) == ()
+
+
+def test_orphans_grow_with_their_held_count() -> None:
+    persons = (Box(100, 100, 200, 400), Box(500, 100, 200, 400))
+    grown = orphan_persons(persons, (), None, "face", H, W, held=(0, 10))
+    assert grown == (pad_person(persons[0], H, W), pad_person(persons[1], H, W, grow=2))
+    assert orphan_persons(persons, (), None, "face", H, W, held=None) == tuple(
+        pad_person(p, H, W) for p in persons
+    )
+    with pytest.raises(ValueError, match="one count per person box"):
+        orphan_persons(persons, (), None, "face", H, W, held=(0,))

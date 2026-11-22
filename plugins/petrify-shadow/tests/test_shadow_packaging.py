@@ -28,6 +28,7 @@ from conftest import ShadowEntryPoint, read_pyproject
 from petrify_shadow import SHADOW, __version__
 from petrify_shadow.mode import ShadowMode
 from petrify_shadow.options import OPTIONS, parse_params
+from petrify_shadow.regions import HELD_REGION_FRAMES, held_growth, pad_person
 
 import petrify.pipeline as pipeline
 from petrify.core import Frame, PetrifyConfig
@@ -38,6 +39,8 @@ from petrify.core.plugin import ModeContext, resolve_options
 from petrify.core.registry import ENTRY_POINT_GROUP, build_mode, list_modes, load_mode
 from petrify.pipeline import OutputConfig, run_stream
 from tests.test_run_stream import FakeSource, ListSink, Scene, _live_config
+from tests.test_run_stream import H as SCENE_H
+from tests.test_run_stream import W as SCENE_W
 from tests.test_run_stream_plugins import FakePersons
 
 EXPECTED_TARGET = "petrify_shadow:SHADOW"
@@ -115,20 +118,20 @@ def test_factory_declares_a_region_mode_without_background_or_roi() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stub render rule
+# Render rule
 # ---------------------------------------------------------------------------
 
 
-def test_stub_returns_the_input_itself_without_a_subject() -> None:
+def test_render_returns_the_input_itself_without_a_subject() -> None:
     frame = _frame()
     assert ShadowMode(parse_params({})).render(frame, Detections(), False) is frame.image
 
 
-def test_stub_returns_a_new_black_frame_with_a_subject() -> None:
+def test_render_returns_a_new_black_frame_when_no_face_is_found() -> None:
     frame = _frame()
     frame.image.flags.writeable = False  # Any write to the input raises.
     before = frame.image.copy()
-    out = ShadowMode(parse_params({})).render(frame, Detections(), True)
+    out = ShadowMode(parse_params({})).render(frame, Detections(faces=()), True)
     assert type(out) is np.ndarray
     assert out.shape == frame.image.shape
     assert out.dtype == frame.image.dtype
@@ -145,7 +148,7 @@ SCENE = Scene(total=60, enter=20, stand=25, leave=35, gone=40)
 PERSON = Box(x=100, y=90, w=60, h=80)
 
 
-def test_run_stream_with_the_stub(
+def test_run_stream_covers_the_person_box(
     shadow_entry_point: ShadowEntryPoint, caplog: pytest.LogCaptureFixture
 ) -> None:
     persons = FakePersons({i: PERSON for i in range(SCENE.enter, SCENE.gone)})
@@ -169,9 +172,24 @@ def test_run_stream_with_the_stub(
     assert report.stats.failed_closed == 0
     assert len(sink.images) == SCENE.total
     for i, (out, given) in enumerate(zip(sink.images, src.yielded, strict=True)):
-        if SCENE.enter <= i < SCENE.gone:
-            assert not out.any(), f"frame {i} has a subject and must be black"
+        # The fake box is the same on every frame, so the mode sees it as held:
+        # it grows each frame, and from the growth cap on it is no region and
+        # the frame is black.
+        held = i - SCENE.enter
+        if SCENE.enter <= i < SCENE.gone and held >= HELD_REGION_FRAMES:
+            assert not out.any(), f"frame {i}"
+        elif SCENE.enter <= i < SCENE.gone:
+            # The padded person box is filled black and the rest is shown. The
+            # fake box does not follow the scene's subject: this checks the
+            # mechanics end to end, not the detector.
+            rect = pad_person(PERSON, SCENE_H, SCENE_W, grow=held_growth(held))
+            assert rect is not None
+            box = np.zeros((SCENE_H, SCENE_W), bool)
+            box[rect.y0 : rect.y1, rect.x0 : rect.x1] = True
+            assert not out[box].any(), f"frame {i}"
+            assert np.array_equal(out[~box], given[~box]), f"frame {i}"
         else:
+            # No person box: black while the subject is held, else unchanged.
             assert not out.any() or np.array_equal(out, given), f"frame {i}"
     # Frames well after the subject left (past the lookahead) pass through unchanged.
     assert np.array_equal(sink.images[-1], src.yielded[-1])
