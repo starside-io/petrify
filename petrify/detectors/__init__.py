@@ -19,8 +19,19 @@
 from __future__ import annotations
 
 from petrify.detectors.bgdiff import BackgroundDiffer
+from petrify.detectors.face_yunet import FaceYuNetDetector
 from petrify.detectors.motion import MotionDetector
+from petrify.detectors.person_dnn import PersonDnnDetector
 from petrify.detectors.person_hog import PersonDetector
+from petrify.detectors.segment import PersonSegmenter
 from petrify.detectors.tracker import TrackerRefiner
 
-__all__ = ["BackgroundDiffer", "MotionDetector", "PersonDetector", "TrackerRefiner"]
+__all__ = [
+    "BackgroundDiffer",
+    "FaceYuNetDetector",
+    "MotionDetector",
+    "PersonDetector",
+    "PersonDnnDetector",
+    "PersonSegmenter",
+    "TrackerRefiner",
+]

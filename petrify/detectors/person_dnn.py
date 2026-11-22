@@ -48,19 +48,9 @@ import numpy as np
 from petrify.core.config import PersonDnnConfig
 from petrify.core.detections import Box, DetectionKind, Detections
 from petrify.core.frame import Frame
-from petrify.models import ModelSpec, load_model_bytes
+from petrify.models import PERSON_DNN_MODEL, load_model_bytes
 
-MODEL = ModelSpec(
-    key="object_detection_nanodet_2022nov",
-    filename="object_detection_nanodet_2022nov.onnx",
-    sha256="4b82da9944b88577175ee23a459dce2e26e6e4be573def65b1055dc2d9720186",
-    size=3800954,
-    source_url=(
-        "https://github.com/opencv/opencv_zoo/raw/main/models/object_detection_nanodet/"
-        "object_detection_nanodet_2022nov.onnx"
-    ),
-    license="Apache-2.0",
-)
+MODEL = PERSON_DNN_MODEL
 
 INPUT_SIZE = 416
 STRIDES = (8, 16, 32)
@@ -436,7 +426,7 @@ class PersonDnnDetector:
 
         ``config.model_path`` is tried alone when set; otherwise ``model_dirs``
         (see :func:`petrify.models.model_dirs`) is searched in order. The box
-        padding keeps its defaults, since the config has no fields for it yet.
+        padding comes from ``config.pad_x`` and ``config.pad_y``.
 
         Raises
         ------
@@ -449,6 +439,8 @@ class PersonDnnDetector:
             data,
             score_threshold=config.score_threshold,
             nms_threshold=config.nms_threshold,
+            pad_x=config.pad_x,
+            pad_y=config.pad_y,
         )
 
     def detect(self, frame: Frame) -> Detections:

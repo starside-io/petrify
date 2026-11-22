@@ -245,7 +245,7 @@ def test_mode_options_dict_round_trips() -> None:
 
 
 @pytest.mark.parametrize(
-    "checkers", [("hog",), ("yunet",), ("hog", "yunet", "dnn", "segment"), ("segment", "hog")]
+    "checkers", [("hog",), ("yunet",), ("hog", "yunet", "dnn"), ("dnn", "hog")]
 )
 def test_sample_checkers_accepts_known_unique_names(checkers: tuple[str, ...]) -> None:
     assert BackgroundConfig(sample_checkers=checkers).sample_checkers == checkers
@@ -259,6 +259,12 @@ def test_sample_checkers_rejects_empty() -> None:
 def test_sample_checkers_rejects_unknown_name() -> None:
     with pytest.raises(ValueError, match="one of"):
         BackgroundConfig(sample_checkers=("hog", "mog2"))
+
+
+def test_sample_checkers_rejects_the_segmenter() -> None:
+    # It marks empty floor, so as a check it would reject nearly every sample.
+    with pytest.raises(ValueError, match="one of hog, yunet, dnn, got 'segment'"):
+        BackgroundConfig(sample_checkers=("hog", "segment"))
 
 
 def test_sample_checkers_rejects_duplicates() -> None:
@@ -285,7 +291,7 @@ def _full_config() -> PetrifyConfig:
         segment=SegmentConfig(dilate_px=4),
         tracker=TrackerConfig(),
         models=ModelConfig(dir="/models"),
-        background=BackgroundConfig(sample_checkers=("hog", "segment")),
+        background=BackgroundConfig(sample_checkers=("hog", "dnn")),
     )
 
 
@@ -304,7 +310,7 @@ def test_asdict_keeps_mode_options_as_pairs() -> None:
     assert data["faces"]["model_path"] == "face.onnx"
     assert data["tracker"] == {"iou_threshold": 0.3, "hold_frames": 15, "max_tracks": 256}
     assert data["models"] == {"dir": "/models"}
-    assert data["background"]["sample_checkers"] == ("hog", "segment")
+    assert data["background"]["sample_checkers"] == ("hog", "dnn")
 
 
 def test_config_to_dict_renders_mode_options_as_object() -> None:
@@ -317,13 +323,16 @@ def test_config_to_dict_renders_mode_options_as_object() -> None:
     assert data["faces"] == {
         "score_threshold": 0.6, "nms_threshold": 0.3, "top_k": 5000, "model_path": "face.onnx",
     }
-    assert data["person_dnn"] == {"score_threshold": 0.4, "nms_threshold": 0.5, "model_path": None}
+    assert data["person_dnn"] == {
+        "score_threshold": 0.4, "nms_threshold": 0.5, "pad_x": 0.10, "pad_y": 0.07,
+        "model_path": None,
+    }
     assert data["segment"] == {
         "threshold": 0.5, "dilate_px": 4, "min_area_share": 0.0, "model_path": None,
     }
     assert data["tracker"] == {"iou_threshold": 0.3, "hold_frames": 15, "max_tracks": 256}
     assert data["models"] == {"dir": "/models"}
-    assert data["background"]["sample_checkers"] == ["hog", "segment"]
+    assert data["background"]["sample_checkers"] == ["hog", "dnn"]
 
 
 def test_config_to_dict_defaults() -> None:

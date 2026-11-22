@@ -102,7 +102,7 @@
           <label for="ctl-detector">Detector</label>
           <select id="ctl-detector" data-field="detector" aria-describedby="err-ctl-detector">
             <option value="motion">Motion (MOG2)</option>
-            <option value="person">Person (HOG)</option>
+            <option id="opt-detector-person" value="person">Person (HOG)</option>
             <option value="both">Both</option>
           </select>
           <span class="applied" id="applied-ctl-detector"></span>
@@ -133,7 +133,11 @@
       </fieldset>
 
       <fieldset>
-        <legend>Person detector</legend>
+        <legend id="person-legend">Person detector (HOG)</legend>
+        <p id="person-dnn-note" hidden>
+          This run uses the DNN person detector. These HOG settings do not apply to it and
+          cannot be changed.
+        </p>
         <div class="field">
           <label for="ctl-person-min-confidence">Minimum confidence (0 to 2)</label>
           <input id="ctl-person-min-confidence" data-field="person.min_confidence" data-type="float" type="number" min="0" max="2" step="any" inputmode="decimal" aria-describedby="err-ctl-person-min-confidence">

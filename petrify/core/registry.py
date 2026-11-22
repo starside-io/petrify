@@ -66,6 +66,14 @@ BUILTIN_MODES: Mapping[str, str] = MappingProxyType({"erase": "petrify.modes.era
 """Built-in mode names and their ``module:attr`` targets (read-only)."""
 
 _DETECT_POLICIES: tuple[str, ...] = ("first_hit", "all")
+# Kinds that come from a detector of their own, grouped by that detector. Under the
+# "first_hit" policy the engine skips the later detectors on a frame where an
+# earlier one fired, so a mode that needs one of these kinds together with a kind
+# from another detector would get None in that field on most frames.
+_OWN_DETECTOR_KINDS: tuple[frozenset[DetectionKind], ...] = (
+    frozenset({DetectionKind.FACES, DetectionKind.LANDMARKS}),
+    frozenset({DetectionKind.MASK}),
+)
 # Longest name or value copied into a problem string, which a web page may show.
 _PROBLEM_TEXT_LIMIT = 80
 # Most registrations named in one ambiguity message.
@@ -621,12 +629,26 @@ def _check_mode(
             raise ModeLoadError(
                 f"{label}: detect_policy must be 'first_hit' or 'all', got {_safe_text(policy)}"
             )
+        if policy == "first_hit":
+            _check_first_hit(label, requires)
     elif not builtin:
         raise ModeLoadError(
             f"{label}: the mode must declare detect_policy ('first_hit' or 'all'); "
             "without it the engine stops at the first detector that fires and the mode "
             "would receive incomplete regions"
         )
+
+
+def _check_first_hit(label: str, requires: frozenset[DetectionKind]) -> None:
+    """Refuse a "first_hit" mode that needs faces, landmarks or a mask with another kind."""
+    for group in _OWN_DETECTOR_KINDS:
+        if requires & group and not requires <= group:
+            raise ModeLoadError(
+                f"{label}: requires {_names(requires)} with the 'first_hit' detection "
+                f"policy, which skips the detector of {_names(requires & group)} on frames "
+                "where another detector fired; the mode must declare "
+                "detect_policy = \"all\""
+            )
 
 
 def _names(kinds: frozenset[DetectionKind]) -> str:

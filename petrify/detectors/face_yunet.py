@@ -29,16 +29,9 @@ import numpy as np
 from petrify.core.config import FaceYuNetConfig
 from petrify.core.detections import Box, DetectionKind, Detections, Face
 from petrify.core.frame import Frame
-from petrify.models import ModelSpec, load_model_bytes
+from petrify.models import FACE_YUNET_MODEL, load_model_bytes
 
-MODEL = ModelSpec(
-    key="face_yunet_2023mar",
-    filename="face_detection_yunet_2023mar.onnx",
-    sha256="8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
-    size=232589,
-    source_url="https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet",
-    license="MIT",
-)
+MODEL = FACE_YUNET_MODEL
 """Pinned identity of the YuNet 2023mar face detection model."""
 
 # One YuNet row: box (x, y, w, h), five landmark points (right eye, left eye,

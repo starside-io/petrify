@@ -14,7 +14,8 @@
  * The stub records every element id set by the script, every attribute name
  * passed to setAttribute, every href and dataset key written, and every
  * window.open call or location assignment, so a test can check that none of
- * them is built from data.
+ * them is built from data. For every static element (one with an id in
+ * index.html) it reports whether it is hidden or disabled, and its text.
  */
 "use strict";
 
@@ -183,13 +184,16 @@ function describe(el) {
   }
   const hidden = {};
   const text = {};
+  const disabled = {};
   for (const id of Object.keys(staticById)) {
     hidden[id] = staticById[id].hidden;
     text[id] = staticById[id].textContent;
+    disabled[id] = staticById[id].disabled;
   }
   const report = {
     hidden: hidden,
     text: text,
+    disabled: disabled,
     weakened: staticById["weakened-list"].children.map((li) => li.textContent),
     modeList: staticById["mode-list"].children.map(describe),
     inputs: inputs().map((el) => ({

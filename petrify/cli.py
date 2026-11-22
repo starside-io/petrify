@@ -470,6 +470,12 @@ _DEFAULT_MODE = "erase"
 # config here would slow down every invocation).
 _TRACK_HOLD_DEFAULT = 15
 
+# Defaults of PersonDnnConfig.score_threshold, FaceYuNetConfig.score_threshold and
+# SegmentConfig.threshold, for the help texts, for the same reason.
+_DNN_SCORE_DEFAULT = 0.4
+_FACE_SCORE_DEFAULT = 0.6
+_SEGMENT_THRESHOLD_DEFAULT = 0.5
+
 # Default --lookahead: the file form's --gap-fill default for a file or image folder
 # and for a stream URL (CCTV, where a subject may enter slowly), a short delay for a
 # webcam. Frames are buffered uncompressed, so the value is capped.
@@ -827,8 +833,80 @@ def _build_run_parser(modes: _ModeCatalog | None = None) -> argparse.ArgumentPar
         metavar="DIR",
         dest="model_dir",
         help=(
-            "Directory searched first for detector model files. The detectors "
-            "available so far need no model files."
+            "Directory searched first for detector model files, before "
+            "$PETRIFY_MODEL_DIR and the per-user model directory. Only the detectors "
+            "below and their background checks use model files; petrify never "
+            "downloads them."
+        ),
+    )
+
+    # -- Detectors with model files ------------------------------------------
+    model_group = parser.add_argument_group("Detectors With Model Files")
+    model_group.add_argument(
+        "--person-detector",
+        choices=("hog", "dnn"),
+        default="hog",
+        dest="person_detector",
+        help=(
+            "Person box detector used by --detector person and both. 'hog': OpenCV HOG "
+            "(default). 'dnn': the NanoDet-Plus model, which needs its model file. The "
+            "DNN misses people smaller than roughly 110 px tall on a 1080p frame (the "
+            "frame is scaled down to 416 px for it); the background differ covers that "
+            "gap only while it is enabled (not with --no-bg-diff). The locked background "
+            "pre-scan always uses HOG. Default: hog."
+        ),
+    )
+    model_group.add_argument(
+        "--dnn-score-threshold",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        dest="dnn_score_threshold",
+        help=(
+            "Minimum score in (0, 1) to accept a DNN person box (with --person-detector "
+            "dnn). It also applies when dnn checks the background samples "
+            f"(--background-check). Default: {_DNN_SCORE_DEFAULT}."
+        ),
+    )
+    model_group.add_argument(
+        "--faces",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable the YuNet face detector (needs its model file) for modes that use "
+            "faces or face landmarks. The erase mode does not use it."
+        ),
+    )
+    model_group.add_argument(
+        "--face-score-threshold",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        dest="face_score_threshold",
+        help=(
+            "Minimum score in (0, 1) to accept a face (with --faces). It also applies "
+            "when yunet checks the background samples (--background-check). Default: "
+            f"{_FACE_SCORE_DEFAULT}."
+        ),
+    )
+    model_group.add_argument(
+        "--segment",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable the PP-HumanSeg person segmenter (needs its model file) for modes "
+            "that use a person mask. The erase mode does not use it."
+        ),
+    )
+    model_group.add_argument(
+        "--segment-threshold",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        dest="segment_threshold",
+        help=(
+            "Person probability in (0, 1) from which a pixel belongs to the mask (with "
+            f"--segment). Default: {_SEGMENT_THRESHOLD_DEFAULT}."
         ),
     )
 
@@ -863,10 +941,23 @@ def _build_run_parser(modes: _ModeCatalog | None = None) -> argparse.ArgumentPar
         help=(
             "UNSAFE. Turn off the person check on the frames the running or calibrate "
             "background is learned from. By default a frame in which the HOG person "
-            "detector finds a person is not used. Without the check a person in view "
-            "while the background is built is absorbed into it and shown after they "
-            "leave. The check reduces but does not eliminate this: start with the scene "
-            "empty either way."
+            "detector finds a person is not used (--background-check chooses the "
+            "detectors). Without the check a person in view while the background is "
+            "built is absorbed into it and shown after they leave. The check reduces "
+            "but does not eliminate this: start with the scene empty either way."
+        ),
+    )
+    bg_group.add_argument(
+        "--background-check",
+        default=None,
+        metavar="NAMES",
+        dest="background_checkers",
+        help=(
+            "Comma-separated detectors that check the frames the running or calibrate "
+            "background is learned from: hog, yunet (faces), dnn (person boxes). A "
+            "frame is not used when any of them finds a person. The list replaces the "
+            "default, so include hog to keep it (for example hog,dnn). yunet and dnn "
+            "need their model files. Default: hog."
         ),
     )
     bg_group.add_argument(
@@ -903,7 +994,15 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
     Every problem is reported with ``parser.error`` (exit code 2). No message holds
     the source spec, which may be a URL with credentials.
     """
-    from petrify.core.config import ModelConfig, PetrifyConfig, TrackerConfig  # noqa: PLC0415
+    from petrify.core.config import (  # noqa: PLC0415
+        BackgroundConfig,
+        FaceYuNetConfig,
+        ModelConfig,
+        PersonDnnConfig,
+        PetrifyConfig,
+        SegmentConfig,
+        TrackerConfig,
+    )
     from petrify.pipeline import OutputConfig, _same_file  # noqa: PLC0415
     from petrify.sources import source_kind  # noqa: PLC0415
 
@@ -998,11 +1097,55 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
     except ValueError as exc:
         parser.error(f"--model-dir: {exc}")
 
+    for flag, value, needs, enabled in (
+        ("--dnn-score-threshold", args.dnn_score_threshold, "--person-detector dnn",
+         args.person_detector == "dnn"),
+        ("--face-score-threshold", args.face_score_threshold, "--faces", args.faces),
+        ("--segment-threshold", args.segment_threshold, "--segment", args.segment),
+    ):
+        if value is not None and not enabled:
+            parser.error(f"{flag} requires {needs}")
+    person_dnn: PersonDnnConfig | None = None
+    faces: FaceYuNetConfig | None = None
+    segment: SegmentConfig | None = None
+    try:
+        if args.person_detector == "dnn":
+            person_dnn = PersonDnnConfig(
+                **_given(score_threshold=args.dnn_score_threshold)  # type: ignore[arg-type]
+            )
+        if args.faces:
+            faces = FaceYuNetConfig(
+                **_given(score_threshold=args.face_score_threshold)  # type: ignore[arg-type]
+            )
+        if args.segment:
+            segment = SegmentConfig(
+                **_given(threshold=args.segment_threshold)  # type: ignore[arg-type]
+            )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    sample_checkers: tuple[str, ...] | None = None
+    if args.background_checkers is not None:
+        if not args.background_check:
+            parser.error("--background-check cannot be combined with --no-background-check")
+        if background == "locked":
+            parser.error(
+                "--background-check applies to --background running or calibrate; the "
+                "locked background pre-scan uses HOG"
+            )
+        sample_checkers = tuple(name.strip() for name in args.background_checkers.split(","))
+        try:
+            BackgroundConfig(sample_checkers=sample_checkers)
+        except ValueError as exc:
+            parser.error(f"--background-check: {exc}")
+
     base = PetrifyConfig.from_namespace(args)
     bg_changes: dict[str, object] = {
         "strategy": background,
         "sample_check": args.background_check,
     }
+    if sample_checkers is not None:
+        bg_changes["sample_checkers"] = sample_checkers
     if args.calibrate_seconds is not None:
         bg_changes["calibrate_seconds"] = args.calibrate_seconds
     roi_changes: dict[str, object] = {}
@@ -1027,6 +1170,9 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
         mode=args.mode or _DEFAULT_MODE,
         tracker=tracker,
         models=models,
+        person_dnn=person_dnn,
+        faces=faces,
+        segment=segment,
     )
     outputs = OutputConfig(
         file=None if args.output is None else Path(args.output),
@@ -1035,6 +1181,11 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
         preview=args.preview,
     )
     return _RunSettings(kind=kind, config=config, outputs=outputs)
+
+
+def _given(**values: object) -> dict[str, object]:
+    """The keyword arguments whose value is not None (flags left at their default)."""
+    return {name: value for name, value in values.items() if value is not None}
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -1185,6 +1336,7 @@ def _run_main(argv: list[str]) -> int:
     settings = _resolve_run(parser, args)
 
     from petrify.core.registry import ModeLoadError  # noqa: PLC0415
+    from petrify.models import ModelError  # noqa: PLC0415
     from petrify.pipeline import output_overwrites_input, run_stream  # noqa: PLC0415
     from petrify.sources import display_spec, open_source  # noqa: PLC0415
 
@@ -1232,6 +1384,11 @@ def _run_main(argv: list[str]) -> int:
             run_stream(source, settings.config, settings.outputs, realtime=True)
         else:
             run_stream(source, settings.config, settings.outputs)
+    except ModelError as exc:
+        # Before FileNotFoundError: a missing model is a ModelNotFoundError, which is
+        # also a FileNotFoundError, but it is a fatal error (exit 1), not a missing input.
+        log.error("Fatal error: %s", _one_line(exc), exc_info=args.verbose)
+        return 1
     except FileNotFoundError as exc:
         log.error("%s", exc)
         return 2

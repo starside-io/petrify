@@ -726,7 +726,7 @@ def test_l1_without_sample_check_the_known_leak_reproduces(strategy: str) -> Non
 def test_l1_online_models_get_the_prescan_person_check(strategy: str) -> None:
     config = _live_config(strategy, person=PersonHogConfig(min_confidence=0.9))
     detector = object()
-    sample_filter = object()
+    sample_filter = mock.Mock(return_value=True)
     with (
         mock.patch.object(pipeline.PersonDetector, "from_config", return_value=detector) as build,
         mock.patch.object(pipeline, "person_free", return_value=sample_filter) as check,
@@ -737,7 +737,14 @@ def test_l1_online_models_get_the_prescan_person_check(strategy: str) -> None:
     build.assert_called_once_with(config.background_scan_person_config())
     check.assert_called_once_with(detector)
     model = running if strategy == "running" else calibrated
-    assert model.call_args.kwargs["sample_filter"] is sample_filter
+    # The model gets person_free's filter behind the stuck-check watch, which
+    # passes every answer on unchanged.
+    given = model.call_args.kwargs["sample_filter"]
+    image = np.zeros((4, 4, 3), np.uint8)
+    assert given(image) is True
+    sample_filter.assert_called_once_with(image)
+    sample_filter.return_value = False
+    assert given(image) is False
 
 
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:

@@ -58,8 +58,16 @@ def _same_size_other(payload: bytes = PAYLOAD) -> bytes:
 # ----------------------------------------------------------------------
 
 
-def test_known_models_is_empty_and_read_only() -> None:
-    assert len(KNOWN_MODELS) == 0
+def test_known_models_lists_the_three_detector_models_and_is_read_only() -> None:
+    from petrify.detectors import face_yunet, person_dnn, segment
+
+    assert dict(KNOWN_MODELS) == {
+        spec.key: spec for spec in (face_yunet.MODEL, person_dnn.MODEL, segment.MODEL)
+    }
+    # One definition each: the detector modules hold the registered objects themselves.
+    assert KNOWN_MODELS[face_yunet.MODEL.key] is face_yunet.MODEL
+    assert KNOWN_MODELS[person_dnn.MODEL.key] is person_dnn.MODEL
+    assert KNOWN_MODELS[segment.MODEL.key] is segment.MODEL
     with pytest.raises(TypeError):
         KNOWN_MODELS["x"] = _spec()  # type: ignore[index]
 

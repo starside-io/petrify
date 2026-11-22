@@ -49,6 +49,10 @@ from typing import Protocol
 
 import numpy as np
 
+from petrify.core.detections import check_detections
+from petrify.core.frame import Frame, SourceInfo
+from petrify.core.plugin import Detector
+
 
 class PersonCheck(Protocol):
     """Anything with ``is_person(image) -> bool``, such as ``PersonDetector``."""
@@ -86,6 +90,38 @@ class _AnyPerson:
     def __repr__(self) -> str:
         inner = ", ".join(repr(check) for check in self._checks)
         return f"any_person([{inner}])"
+
+
+class _DetectorCheck:
+    """A :class:`PersonCheck` that fires when a frame detector finds any subject."""
+
+    def __init__(self, detector: Detector) -> None:
+        self._detector = detector
+
+    def is_person(self, frame: np.ndarray) -> bool:
+        height, width = frame.shape[:2]
+        # The detector API takes a Frame; the sample has no position in the stream.
+        info = SourceInfo(
+            fps=1.0, width=width, height=height, frame_count=None, seekable=False, live=False
+        )
+        result = self._detector.detect(Frame(image=frame, index=0, timestamp=0.0, source=info))
+        # The same checks the engine applies: a malformed result raises, so the
+        # sample is rejected instead of being read as "no person".
+        checked = check_detections(result, self._detector.provides, (height, width))
+        return checked.subject_present
+
+    def __repr__(self) -> str:
+        return f"detector_check({self._detector!r})"
+
+
+def detector_check(detector: Detector) -> PersonCheck:
+    """Return a check that finds a person when ``detector`` reports any subject.
+
+    This turns a frame detector without ``is_person`` (the face detector, the DNN
+    person detector, the segmenter) into a sample check: a face, a person box or a
+    mask pixel counts as a person. Exceptions from the detector propagate.
+    """
+    return _DetectorCheck(detector)
 
 
 def any_person(checks: Sequence[PersonCheck]) -> PersonCheck:

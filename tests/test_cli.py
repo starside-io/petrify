@@ -1382,3 +1382,166 @@ def test_t13_web_run_control_knows_a_plugin_mode_and_imports_no_other(
     assert control.submit({"mode_options": {"flag": True}}).mode_options_dict()["flag"] is True
     for name in (T12_OTHER, T12_BROKEN, T12_SLOW):
         assert not _imported(t12_plugins, name)
+
+
+# ---------------------------------------------------------------------------
+# T8: detectors with model files
+# ---------------------------------------------------------------------------
+
+
+def test_t8_no_new_flag_leaves_the_new_sections_off() -> None:
+    for spec in (IN, "camera:0"):
+        config, _ = _resolved(["--source", spec, "--output", OUT])
+        assert (config.person_dnn, config.faces, config.segment) == (None, None, None)
+        assert config.background.sample_checkers == ("hog",)
+
+
+def test_t8_detector_flags_reach_the_config() -> None:
+    from petrify.core.config import FaceYuNetConfig, PersonDnnConfig, SegmentConfig
+
+    config, _ = _resolved(["--source", IN, "--output", OUT, "--person-detector", "dnn",
+                           "--faces", "--segment"])
+    assert config.person_dnn == PersonDnnConfig()
+    assert config.faces == FaceYuNetConfig()
+    assert config.segment == SegmentConfig()
+    assert _resolved(["--source", IN, "--output", OUT, "--person-detector", "hog"])[
+        0].person_dnn is None
+    config, _ = _resolved(["--source", IN, "--output", OUT, "--person-detector", "dnn",
+                           "--dnn-score-threshold", "0.55", "--faces",
+                           "--face-score-threshold", "0.7", "--segment",
+                           "--segment-threshold", "0.4"])
+    assert config.person_dnn == PersonDnnConfig(score_threshold=0.55)
+    assert config.faces == FaceYuNetConfig(score_threshold=0.7)
+    assert config.segment == SegmentConfig(threshold=0.4)
+
+
+def test_t8_help_defaults_match_the_config() -> None:
+    from petrify.core.config import FaceYuNetConfig, PersonDnnConfig, SegmentConfig
+
+    text = " ".join(_build_run_parser().format_help().split())
+    assert ("dnn). It also applies when dnn checks the background samples "
+            f"(--background-check). Default: {PersonDnnConfig().score_threshold}.") in text
+    assert ("(with --faces). It also applies when yunet checks the background samples "
+            f"(--background-check). Default: {FaceYuNetConfig().score_threshold}.") in text
+    assert "The list replaces the default, so include hog to keep it" in text
+    assert "misses people smaller than roughly 110 px tall on a 1080p frame" in text
+    assert f"--segment). Default: {SegmentConfig().threshold}." in text
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        ("hog", ("hog",)),
+        ("dnn", ("dnn",)),
+        ("hog,yunet,dnn", ("hog", "yunet", "dnn")),
+        (" dnn , hog ", ("dnn", "hog")),
+    ],
+)
+def test_t8_background_check_names_reach_the_config(names: str, expected: tuple[str, ...]) -> None:
+    config, _ = _resolved(["--source", "camera:0", "--preview", "--background-check", names])
+    assert config.background.sample_checkers == expected
+    config, _ = _resolved(["--source", IN, "--output", OUT, "--background", "calibrate",
+                           "--background-check", names])
+    assert config.background.sample_checkers == expected
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--dnn-score-threshold", "0.5"], "--dnn-score-threshold requires --person-detector dnn"),
+        (["--face-score-threshold", "0.5"], "--face-score-threshold requires --faces"),
+        (["--segment-threshold", "0.5"], "--segment-threshold requires --segment"),
+        (["--person-detector", "dnn", "--dnn-score-threshold", "1"],
+         "PersonDnnConfig.score_threshold must be a number in (0, 1)"),
+        (["--faces", "--face-score-threshold", "0"],
+         "FaceYuNetConfig.score_threshold must be a number in (0, 1)"),
+        (["--segment", "--segment-threshold", "nan"],
+         "SegmentConfig.threshold must be a number in (0, 1)"),
+        (["--person-detector", "cnn"], "invalid choice: 'cnn'"),
+        (["--background", "running", "--background-check", "hog,mog2"],
+         "--background-check: BackgroundConfig.sample_checkers entries must be one of"),
+        (["--background", "running", "--background-check", "hog,segment"],
+         "--background-check: BackgroundConfig.sample_checkers entries must be one of hog, "
+         "yunet, dnn, got 'segment'"),
+        (["--background", "running", "--background-check", "hog,hog"],
+         "--background-check: BackgroundConfig.sample_checkers must not repeat"),
+        (["--background", "running", "--background-check", ""],
+         "--background-check: BackgroundConfig.sample_checkers entries must be one of"),
+        (["--background", "running", "--background-check", "dnn", "--no-background-check"],
+         "--background-check cannot be combined with --no-background-check"),
+        (["--background-check", "dnn"], "--background-check applies to --background running"),
+    ],
+)
+def test_t8_detector_usage_errors(
+    run_stream: mock.MagicMock,
+    capsys: pytest.CaptureFixture[str],
+    extra: list[str],
+    message: str,
+) -> None:
+    err = _usage_error(_run_args(*extra), capsys)
+    assert message in " ".join(err.split())
+    run_stream.assert_not_called()
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_t8_model_error_is_one_line_and_exit_1(
+    run_stream: mock.MagicMock,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    verbose: bool,
+) -> None:
+    from petrify.models import ModelNotFoundError
+
+    # A ModelNotFoundError is also a FileNotFoundError; it must not become exit code 2.
+    run_stream.side_effect = ModelNotFoundError("Model 'm' was not found.\nLocations:\n  1. /x")
+    argv = _run_args("--person-detector", "dnn", *(["--verbose"] if verbose else []))
+    assert main(argv) == 1
+    (record,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert record.getMessage() == "Fatal error: Model 'm' was not found. Locations: 1. /x"
+    assert bool(record.exc_info) is verbose
+    if not verbose:
+        assert "Traceback" not in capsys.readouterr().err + caplog.text
+
+
+def test_t8_model_dir_and_flags_reach_run_stream(run_stream: mock.MagicMock) -> None:
+    from petrify.core.config import ModelConfig, PersonDnnConfig
+
+    assert main(_run_args("--person-detector", "dnn", "--model-dir", "/opt/models")) == 0
+    config = run_stream.call_args.args[1]
+    assert config.person_dnn == PersonDnnConfig()
+    assert config.models == ModelConfig(dir="/opt/models")
+
+
+def test_t8_missing_model_fails_fast_with_one_line_and_exit_1(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cv2
+    import numpy as np
+
+    from tests.test_run_stream import ListSink
+
+    monkeypatch.delenv("PETRIFY_MODEL_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))  # No per-user model directory.
+    for i in range(3):
+        cv2.imwrite(str(tmp_path / f"f{i:03d}.png"), np.full((256, 320, 3), 90, np.uint8))
+    with (
+        mock.patch.object(petrify.pipeline, "_build_sinks", return_value=[ListSink()]),
+        mock.patch.object(petrify.pipeline, "locked_background",
+                          side_effect=AssertionError("pre-scan ran")) as prescan,
+    ):
+        code = main(["run", "--source", str(tmp_path), "--preview", "--detector", "both",
+                     "--person-detector", "dnn", "--model-dir", str(tmp_path / "none")])
+    assert code == 1
+    prescan.assert_not_called()
+    (record,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    message = record.getMessage()
+    assert message.startswith(
+        "Fatal error: Model 'object_detection_nanodet_2022nov' "
+        "(file 'object_detection_nanodet_2022nov.onnx') was not found."
+    )
+    assert str(tmp_path / "none") in message
+    assert "\n" not in message
+    assert "Traceback" not in capsys.readouterr().err

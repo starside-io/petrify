@@ -30,7 +30,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType, TracebackType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import cv2
 import numpy as np
@@ -39,8 +39,15 @@ from tqdm import tqdm
 from petrify.background.calibrate import CalibratedBackground, frames_for
 from petrify.background.locked import locked_background
 from petrify.background.running import RunningBackground
-from petrify.background.vetting import person_free
-from petrify.core.config import OptionValue, PetrifyConfig, mode_options_from
+from petrify.background.vetting import PersonCheck, any_person, detector_check, person_free
+from petrify.core.config import (
+    BackgroundConfig,
+    FaceYuNetConfig,
+    OptionValue,
+    PersonDnnConfig,
+    PetrifyConfig,
+    mode_options_from,
+)
 from petrify.core.detections import DetectionKind
 from petrify.core.engine import Engine, EngineStats, FrameTrace
 from petrify.core.frame import Frame, SourceInfo
@@ -59,10 +66,22 @@ from petrify.core.plugin import (
 )
 from petrify.core.registry import ModeLoadError, build_mode, load_mode
 from petrify.detectors.bgdiff import BackgroundDiffer
+from petrify.detectors.face_yunet import FaceYuNetDetector
 from petrify.detectors.motion import MotionDetector
+from petrify.detectors.person_dnn import PersonDnnDetector
 from petrify.detectors.person_hog import PersonDetector
+from petrify.detectors.segment import PersonSegmenter
 from petrify.detectors.tracker import TrackerRefiner
 from petrify.encoder import ffmpeg_encode
+from petrify.models import (
+    FACE_YUNET_MODEL,
+    PERSON_DNN_MODEL,
+    SEGMENT_MODEL,
+    ModelError,
+    ModelSpec,
+    model_dirs,
+    pop_loaded_path,
+)
 from petrify.modes.erase import EraseMode
 from petrify.roi_detect import WarmupRoiDetector, auto_detect_roi
 from petrify.sinks import file as file_sinks
@@ -78,6 +97,8 @@ if TYPE_CHECKING:
     from petrify.sinks.mjpeg import MjpegSink
 
 logger = logging.getLogger(__name__)
+
+_ModelDetectorT = TypeVar("_ModelDetectorT")
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +654,35 @@ NO_BG_DIFF_LIVE_WARNING = (
     "moving is no longer detected and can be shown. The differ is the only protection "
     "against that."
 )
+DNN_WITHOUT_DIFFER_WARNING = (
+    "The DNN person detector runs without the background differ (--no-bg-diff, or a "
+    "mode that does not use it): the DNN misses people smaller than about 110 px tall "
+    "on a 1080p frame, and nothing else covers that gap. Small or distant people can "
+    "be shown."
+)
+DNN_NOT_USED_WARNING = (
+    "--person-detector dnn has no effect: --detector motion runs no person detector. "
+    "It takes effect when the detector is switched to person or both."
+)
+FACES_NOT_USED_WARNING = (
+    "--faces has no effect: the mode {mode!r} does not use faces or face landmarks, so "
+    "the face detector does not run on the frames."
+)
+SEGMENT_NOT_USED_WARNING = (
+    "--segment has no effect: the mode {mode!r} does not use a person mask, so the "
+    "segmenter does not run on the frames."
+)
+BACKGROUND_CHECK_NOT_USED_WARNING = (
+    "--background-check has no effect: the mode {mode!r} uses no background, so no "
+    "background sample is checked."
+)
+SAMPLE_REJECTION_STREAK = 50
+"""Consecutive rejected samples, with no background yet, after which the run warns."""
+SAMPLE_CHECK_STUCK_WARNING = (
+    "The background sample check ({checkers}) rejected {count} samples in a row and "
+    "the background is still not ready: it cannot be built while these checkers see a "
+    "person in every sample, and until then every frame is written black."
+)
 
 
 class NoFramesError(RuntimeError):
@@ -711,13 +761,18 @@ def _build_sinks(source: Source, config: PetrifyConfig, outputs: OutputConfig) -
 
 
 def _background_for(
-    source: Source, config: PetrifyConfig
+    source: Source,
+    config: PetrifyConfig,
+    sample_check: PersonCheck | None = None,
 ) -> tuple[np.ndarray | BackgroundModel, int | None]:
     """Return the locked image and its index, or an online model and None.
 
-    The online models get a person check on their samples (the HOG settings of the
-    locked pre-scan) unless ``config.background.sample_check`` is False. Every run
-    with an online model logs :data:`ONLINE_BACKGROUND_WARNING`.
+    The online models get a person check on their samples unless
+    ``config.background.sample_check`` is False: ``sample_check`` when given (built
+    by :func:`_sample_check` at startup), else the one :func:`_sample_check` builds
+    here. With the default checkers that is the HOG detector with the settings of
+    the locked pre-scan. Every run with an online model logs
+    :data:`ONLINE_BACKGROUND_WARNING`.
     """
     bg_cfg = config.background
     info = source.info
@@ -734,10 +789,12 @@ def _background_for(
         )
     logger.warning(ONLINE_BACKGROUND_WARNING)
     sample_filter: Callable[[np.ndarray], bool] | None = None
+    watch: _RejectionWatch | None = None
     if bg_cfg.sample_check:
-        sample_filter = person_free(
-            PersonDetector.from_config(config.background_scan_person_config())
-        )
+        if sample_check is None:
+            sample_check = _sample_check(config, _ModelDetectors(config))
+        watch = _RejectionWatch(person_free(sample_check), bg_cfg.sample_checkers)
+        sample_filter = watch
     else:
         logger.warning(NO_BACKGROUND_CHECK_WARNING)
     if bg_cfg.strategy == "running":
@@ -748,6 +805,8 @@ def _background_for(
             recompute_in_background=info.live,
             sample_filter=sample_filter,
         )
+        if watch is not None:
+            watch.model = model
         logger.info(
             "Background: running median (window=%d interval=%d min_samples=%d)",
             bg_cfg.running_window,
@@ -761,7 +820,54 @@ def _background_for(
         frames,
         bg_cfg.calibrate_seconds,
     )
-    return CalibratedBackground(frames, sample_filter=sample_filter), None
+    calibrated = CalibratedBackground(frames, sample_filter=sample_filter)
+    if watch is not None:
+        watch.model = calibrated
+    return calibrated, None
+
+
+class _RejectionWatch:
+    """A sample filter that passes on ``sample_filter``'s answer and watches for a stuck check.
+
+    When :data:`SAMPLE_REJECTION_STREAK` samples in a row are rejected (a filter
+    error counts as a rejection) and ``model`` still has no background, it logs
+    :data:`SAMPLE_CHECK_STUCK_WARNING` once per run. It changes no answer:
+    rejected samples stay rejected and errors propagate.
+    """
+
+    def __init__(
+        self, sample_filter: Callable[[np.ndarray], bool], checkers: Sequence[str]
+    ) -> None:
+        self._filter = sample_filter
+        self._checkers = tuple(checkers)
+        self._streak = 0
+        self._warned = False
+        self.model: BackgroundModel | None = None
+
+    def __call__(self, image: np.ndarray) -> bool:
+        try:
+            accepted = bool(self._filter(image))
+        except Exception:
+            self._rejected()
+            raise
+        if accepted:
+            self._streak = 0
+        else:
+            self._rejected()
+        return accepted
+
+    def _rejected(self) -> None:
+        self._streak += 1
+        if self._warned or self._streak < SAMPLE_REJECTION_STREAK:
+            return
+        if self.model is not None and self.model.current() is not None:
+            return
+        self._warned = True
+        logger.warning(
+            SAMPLE_CHECK_STUCK_WARNING.format(
+                checkers=", ".join(self._checkers), count=self._streak
+            )
+        )
 
 
 def _warn_large_manual_roi(box: tuple[int, int, int, int], cap: float, source: Source) -> None:
@@ -960,11 +1066,16 @@ class _Components:
     the mode does not use a background. ``roi_stage`` is None when the mode does
     not allow the ROI overlay. ``factory`` is the loaded mode factory, ``options``
     its resolved options and ``requires`` what the mode requires for them.
+    ``person`` is the HOG or the DNN person detector, as the config selects.
+    ``models`` holds the detectors built from model files, so that a later change
+    reuses them instead of reading their files again.
     """
 
     config: PetrifyConfig
     motion: MotionDetector | None
-    person: PersonDetector | None
+    person: PersonDetector | PersonDnnDetector | None
+    faces: FaceYuNetDetector | None
+    segment: PersonSegmenter | None
     differ: BackgroundDiffer | None
     background: np.ndarray | BackgroundModel | None
     mode: Mode
@@ -974,11 +1085,13 @@ class _Components:
     requires: frozenset[DetectionKind]
     refiners: tuple[Refiner, ...]
     source: SourceInfo
+    models: _ModelDetectors
 
     @property
     def detectors(self) -> list[Detector]:
-        """The detector list in the engine's order: motion, person, background differ."""
-        return [d for d in (self.motion, self.person, self.differ) if d is not None]
+        """The detector list in the engine's order: motion, person, faces, mask, differ."""
+        found = (self.motion, self.person, self.faces, self.segment, self.differ)
+        return [d for d in found if d is not None]
 
     @property
     def stages(self) -> list[Stage]:
@@ -1005,14 +1118,38 @@ def _mode_options(factory: ModeFactory, config: PetrifyConfig) -> dict[str, Opti
     return options
 
 
+# Kinds that only a detector the user turns on provides: the config section that
+# turns it on, and how the error names that detector and its flag.
+_OPT_IN_PROVIDERS: tuple[tuple[DetectionKind, str, str], ...] = (
+    (DetectionKind.FACES, "faces", "the YuNet face detector with --faces"),
+    (DetectionKind.LANDMARKS, "faces", "the YuNet face detector with --faces"),
+    (DetectionKind.MASK, "segment", "the person segmenter with --segment"),
+)
+
+MISSING_PROVIDER_ERROR = (
+    "The mode {mode!r} requires {kind} but no enabled detector provides it; enable {provider}"
+)
+
+
 def _mode_requires(
-    factory: ModeFactory, options: Mapping[str, OptionValue]
+    factory: ModeFactory, options: Mapping[str, OptionValue], config: PetrifyConfig
 ) -> frozenset[DetectionKind]:
-    """Return ``factory.requires(options)``.
+    """Return ``factory.requires(options)``, checked against the detectors ``config`` enables.
 
     A ``ValueError`` from the factory propagates (the settings are not acceptable);
     any other error, or a result that is not a frozenset of DetectionKind, raises
     :class:`ModeLoadError` (the plugin is faulty), as in :func:`build_mode`.
+
+    Raises ``ValueError`` (:data:`MISSING_PROVIDER_ERROR`) when the mode requires
+    faces, landmarks or a mask and the detector that provides it is not enabled:
+    without it the mode would receive None in that field on every frame. Motion
+    and person boxes keep the engine's rule (at least one required kind provided),
+    which is what lets erase run with ``--detector motion``.
+
+    An enabled provider is not enough on its own: under the ``first_hit``
+    policy the engine skips it on frames where an earlier detector fired. A mode
+    that needs these kinds together with another kind must therefore use
+    ``detect_policy = "all"``, which :func:`build_mode` enforces.
     """
     try:
         kinds = factory.requires(options)
@@ -1026,6 +1163,11 @@ def _mode_requires(
         raise ModeLoadError(
             f"mode {factory.name!r}: requires must return a frozenset of DetectionKind"
         )
+    for kind, section, provider in _OPT_IN_PROVIDERS:
+        if kind in kinds and getattr(config, section) is None:
+            raise ValueError(
+                MISSING_PROVIDER_ERROR.format(mode=factory.name, kind=kind.value, provider=provider)
+            )
     return kinds
 
 
@@ -1058,17 +1200,140 @@ DIFFER_WITHOUT_BACKGROUND_ERROR = (
 )
 
 
+class _ModelDetectors:
+    """The detectors of one run that are built from model files, one per class and settings.
+
+    A model file is read and verified only when a detector with settings not seen
+    before in the run is built, so a reconfiguration that keeps a detector, or
+    brings back one used earlier, reads nothing. The background sample check and
+    frame detection share an instance: both run on the engine's thread (the sample
+    filter runs inside the mode's background update), and these detectors keep no
+    state between frames.
+    """
+
+    def __init__(self, config: PetrifyConfig) -> None:
+        self.models = config.models
+        self.dirs = model_dirs(config.models.dir)
+        self._built: dict[tuple[type, object], Any] = {}
+
+    def get(self, cls: type[_ModelDetectorT], settings: object) -> _ModelDetectorT:
+        """Return the run's ``cls`` detector for ``settings``, building it on first use.
+
+        Raises :class:`~petrify.models.ModelError` when the model file is missing,
+        unreadable, or fails its size or SHA-256 check.
+        """
+        key = (cls, settings)
+        found = self._built.get(key)
+        if found is None:
+            spec = _MODEL_OF[cls]
+            pop_loaded_path(spec)  # Drop a path left by an earlier load.
+            found = cls.from_config(settings, self.dirs)  # type: ignore[attr-defined]
+            self._built[key] = found
+            path = pop_loaded_path(spec)
+            logger.info(
+                "Detector %s ready: model %s loaded and verified",
+                cls.__name__,
+                path if path is not None else spec.filename,
+            )
+        return found  # type: ignore[no-any-return]
+
+
+# The model file each detector class loads, to report where it was found.
+_MODEL_OF: dict[type, ModelSpec] = {
+    FaceYuNetDetector: FACE_YUNET_MODEL,
+    PersonDnnDetector: PERSON_DNN_MODEL,
+    PersonSegmenter: SEGMENT_MODEL,
+}
+
+
+def _person_detector(
+    config: PetrifyConfig, models: _ModelDetectors
+) -> PersonDetector | PersonDnnDetector:
+    """Build the person box detector the config selects: DNN with a ``person_dnn`` section."""
+    if config.person_dnn is not None:
+        return models.get(PersonDnnDetector, config.person_dnn)
+    return PersonDetector.from_config(config.person)
+
+
+def _faces_detector(
+    config: PetrifyConfig, requires: frozenset[DetectionKind], models: _ModelDetectors
+) -> FaceYuNetDetector | None:
+    """The face detector when the config enables it and the mode requires faces or landmarks."""
+    if config.faces is None or not _wants(FaceYuNetDetector, requires):
+        return None
+    return models.get(FaceYuNetDetector, config.faces)
+
+
+def _segmenter(
+    config: PetrifyConfig, requires: frozenset[DetectionKind], models: _ModelDetectors
+) -> PersonSegmenter | None:
+    """The person segmenter when the config enables it and the mode requires a mask."""
+    if config.segment is None or not _wants(PersonSegmenter, requires):
+        return None
+    return models.get(PersonSegmenter, config.segment)
+
+
 def _frame_detectors(
-    config: PetrifyConfig, requires: frozenset[DetectionKind]
-) -> tuple[MotionDetector | None, PersonDetector | None]:
-    """Build the motion and person detectors ``config.detector`` selects and the mode requires."""
+    config: PetrifyConfig, requires: frozenset[DetectionKind], models: _ModelDetectors
+) -> tuple[
+    MotionDetector | None,
+    PersonDetector | PersonDnnDetector | None,
+    FaceYuNetDetector | None,
+    PersonSegmenter | None,
+]:
+    """Build the frame detectors the config enables and the mode requires.
+
+    Motion and person boxes follow ``config.detector``; the person boxes come from
+    the DNN detector instead of HOG when ``config.person_dnn`` is set. Faces and
+    the mask follow their own sections. Raises
+    :class:`~petrify.models.ModelError` when a model file cannot be used.
+    """
     motion = None
     person = None
     if config.detector in ("motion", "both") and _wants(MotionDetector, requires):
         motion = MotionDetector.from_config(config.motion)
     if config.detector in ("person", "both") and _wants(PersonDetector, requires):
-        person = PersonDetector.from_config(config.person)
-    return motion, person
+        person = _person_detector(config, models)
+    return motion, person, _faces_detector(config, requires, models), _segmenter(
+        config, requires, models
+    )
+
+
+def _sample_checker(name: str, config: PetrifyConfig, models: _ModelDetectors) -> PersonCheck:
+    """Build the background sample check named ``name`` (one of ``SAMPLE_CHECKERS``).
+
+    A model-based checker uses the settings of its detector section when the
+    config enables that detector, and the section's defaults otherwise.
+    """
+    if name == "hog":
+        return PersonDetector.from_config(config.background_scan_person_config())
+    if name == "yunet":
+        return detector_check(models.get(FaceYuNetDetector, config.faces or FaceYuNetConfig()))
+    if name == "dnn":
+        return detector_check(
+            models.get(PersonDnnDetector, config.person_dnn or PersonDnnConfig())
+        )
+    # BackgroundConfig accepts only the names above; this guards a name added there
+    # without a checker here, which must not silently vet nothing.
+    raise ValueError(f"The background sample checker {name!r} is not available")
+
+
+def _sample_check(config: PetrifyConfig, models: _ModelDetectors) -> PersonCheck:
+    """Build the background sample check from ``config.background.sample_checkers``.
+
+    A single checker is used as is, so the default (HOG alone) is the same check
+    as before the other checkers existed. Several are combined with
+    :func:`~petrify.background.vetting.any_person`: a sample is rejected as soon as
+    any of them sees a person.
+    """
+    checks = [_sample_checker(name, config, models) for name in config.background.sample_checkers]
+    return checks[0] if len(checks) == 1 else any_person(checks)
+
+
+def _uses_sample_check(factory: ModeFactory, config: PetrifyConfig) -> bool:
+    """True when the run builds an online background whose samples are checked."""
+    bg_cfg = config.background
+    return factory.needs_background and bg_cfg.strategy != "locked" and bg_cfg.sample_check
 
 
 def _refiners(config: PetrifyConfig, requires: frozenset[DetectionKind]) -> tuple[Refiner, ...]:
@@ -1128,6 +1393,21 @@ def _requires_differ(
     return differ is not None and not isinstance(background, np.ndarray)
 
 
+def _warn_unused(
+    config: PetrifyConfig, factory: ModeFactory, requires: frozenset[DetectionKind]
+) -> None:
+    """Log a warning for each detector setting that has no effect in this run."""
+    if config.person_dnn is not None and config.detector == "motion":
+        logger.warning(DNN_NOT_USED_WARNING)
+    if config.faces is not None and not _wants(FaceYuNetDetector, requires):
+        logger.warning(FACES_NOT_USED_WARNING.format(mode=config.mode))
+    if config.segment is not None and not _wants(PersonSegmenter, requires):
+        logger.warning(SEGMENT_NOT_USED_WARNING.format(mode=config.mode))
+    default_checkers = BackgroundConfig().sample_checkers
+    if config.background.sample_checkers != default_checkers and not factory.needs_background:
+        logger.warning(BACKGROUND_CHECK_NOT_USED_WARNING.format(mode=config.mode))
+
+
 def _build_components(source: Source, config: PetrifyConfig) -> tuple[_Components, int | None]:
     """Build the mode factory, detectors, ROI stage, background, mode and refiners at startup.
 
@@ -1140,15 +1420,25 @@ def _build_components(source: Source, config: PetrifyConfig) -> tuple[_Component
     when the factory allows the overlay. Raises ``ValueError`` when the settings
     cannot work with the mode. Returns the components and the locked
     background's index.
+
+    Every model file the run needs (frame detectors and background sample
+    checkers) is loaded and verified before the ROI scan and the background are
+    built, which are the first steps that read frames, so a missing or corrupt
+    model fails the run with :class:`~petrify.models.ModelError` within seconds.
     """
     factory = load_mode(config.mode)
     options = _mode_options(factory, config)
-    requires = _mode_requires(factory, options)
+    requires = _mode_requires(factory, options, config)
     wants_differ = DetectionKind.BACKGROUND_DIFF in requires
     if wants_differ and not factory.needs_background and config.background_diff is not None:
         raise ValueError(DIFFER_WITHOUT_BACKGROUND_ERROR.format(mode=config.mode))
-    motion, person = _frame_detectors(config, requires)
+    models = _ModelDetectors(config)
+    motion, person, faces, segment = _frame_detectors(config, requires, models)
+    sample_check = _sample_check(config, models) if _uses_sample_check(factory, config) else None
     logger.info("Detector mode: %s", config.detector)
+    if person is not None and config.person_dnn is not None:
+        logger.info("Person detector: DNN (NanoDet-Plus) in place of HOG")
+    _warn_unused(config, factory, requires)
     roi_stage: Stage | None = None
     if factory.roi_overlay:
         roi_stage = _roi_stage(source, config)
@@ -1158,15 +1448,19 @@ def _build_components(source: Source, config: PetrifyConfig) -> tuple[_Component
     bg_idx: int | None = None
     differ: BackgroundDiffer | None = None
     if factory.needs_background:
-        background, bg_idx = _background_for(source, config)
+        background, bg_idx = _background_for(source, config, sample_check)
         if wants_differ:
             differ = _background_differ(background, config, source.info.live)
+    if person is not None and config.person_dnn is not None and differ is None:
+        logger.warning(DNN_WITHOUT_DIFFER_WARNING)
     ctx = _mode_context(source.info, config, factory, options, background)
     mode = build_mode(factory, ctx)
     components = _Components(
         config=config,
         motion=motion,
         person=person,
+        faces=faces,
+        segment=segment,
         differ=differ,
         background=background,
         mode=mode,
@@ -1176,6 +1470,7 @@ def _build_components(source: Source, config: PetrifyConfig) -> tuple[_Component
         requires=requires,
         refiners=_refiners(config, requires),
         source=source.info,
+        models=models,
     )
     return components, bg_idx
 
@@ -1194,11 +1489,13 @@ def _rebuild(old: _Components, new: PetrifyConfig) -> tuple[_Components, dict[st
     stays absent for a mode without the overlay. The mode itself cannot change.
 
     Raises ``ValueError`` for an invalid combination, including a faulty plugin
-    (its :class:`ModeLoadError` becomes a ``ValueError``); nothing is installed then.
+    (its :class:`ModeLoadError` becomes a ``ValueError``) and a detector whose
+    model file cannot be used (its :class:`~petrify.models.ModelError`); nothing
+    is installed then.
     """
     try:
         return _rebuild_components(old, new)
-    except ModeLoadError as exc:
+    except (ModeLoadError, ModelError) as exc:
         raise ValueError(str(exc)) from exc
 
 
@@ -1213,17 +1510,23 @@ def _rebuild_components(
         )
     factory = old.factory
     options = _mode_options(factory, new)
-    requires = _mode_requires(factory, options)
+    requires = _mode_requires(factory, options, new)
+    models = old.models if new.models == old.models.models else _ModelDetectors(new)
     motion: MotionDetector | None = None
     if new.detector in ("motion", "both") and _wants(MotionDetector, requires):
         motion = old.motion
         if motion is None or new.motion != cfg.motion:
             motion = MotionDetector.from_config(new.motion)
-    person: PersonDetector | None = None
+    person: PersonDetector | PersonDnnDetector | None = None
     if new.detector in ("person", "both") and _wants(PersonDetector, requires):
-        person = old.person
-        if person is None or new.person != cfg.person:
-            person = PersonDetector.from_config(new.person)
+        if new.person_dnn is not None:
+            person = models.get(PersonDnnDetector, new.person_dnn)
+        else:
+            person = old.person
+            if person is None or isinstance(person, PersonDnnDetector) or new.person != cfg.person:
+                person = PersonDetector.from_config(new.person)
+    faces = _faces_detector(new, requires, models)
+    segment = _segmenter(new, requires, models)
     differ: BackgroundDiffer | None = None
     if new.background_diff is not None and DetectionKind.BACKGROUND_DIFF in requires:
         differ = old.differ
@@ -1247,6 +1550,8 @@ def _rebuild_components(
         config=new,
         motion=motion,
         person=person,
+        faces=faces,
+        segment=segment,
         differ=differ,
         background=old.background,
         mode=mode,
@@ -1256,6 +1561,7 @@ def _rebuild_components(
         requires=requires,
         refiners=refiners,
         source=old.source,
+        models=models,
     )
     kwargs: dict[str, Any] = {}
     detectors_changed = [id(d) for d in built.detectors] != [id(d) for d in old.detectors]

@@ -870,7 +870,7 @@ def test_factory_must_be_the_runs_mode() -> None:
 def test_defaults_keep_the_old_snapshot() -> None:
     data = _control().snapshot().to_dict()
     assert set(data) == {"config", "stats", "timings", "source", "background", "roi",
-                         "running", "ended", "last_error", "weakened"}
+                         "running", "ended", "last_error", "weakened", "person_detector"}
     assert _control().snapshot().mode is None and _control().snapshot().modes is None
 
 
@@ -1441,3 +1441,65 @@ def test_an_erase_run_keeps_the_background_state_shape() -> None:
                sinks=[ListSink()], control=control)
     assert set(seen["background"]) == {"strategy", "ready", "rejected"}
     assert BackgroundState().to_dict() == {"strategy": "", "ready": False, "rejected": 0}
+
+
+# ---------------------------------------------------------------------------
+# T8b: the HOG settings while the DNN finds the person boxes
+# ---------------------------------------------------------------------------
+
+DNN_PERSON_ERROR = (
+    "The HOG person settings cannot be changed: this run uses the DNN person detector, "
+    "which they do not affect"
+)
+
+
+def _dnn_config() -> PetrifyConfig:
+    from petrify.core.config import PersonDnnConfig
+
+    return PetrifyConfig(detector="both", person_dnn=PersonDnnConfig())
+
+
+@pytest.mark.parametrize("field", ["min_confidence", "min_box_area", "scale"])
+def test_t8b_hog_settings_are_rejected_while_the_dnn_runs(field: str) -> None:
+    control = _control(_dnn_config())
+    value = {"min_confidence": 0.5, "min_box_area": 900, "scale": 1.1}[field]
+    with pytest.raises(ValueError) as excinfo:
+        control.submit({"person": {field: value}})
+    assert str(excinfo.value) == DNN_PERSON_ERROR
+    assert control.snapshot().last_error == DNN_PERSON_ERROR
+    assert control.take_pending() is None
+    # Nothing else in the same patch is applied either.
+    with pytest.raises(ValueError, match="HOG person settings cannot be changed"):
+        control.submit({"detector": "person", "person": {field: value}})
+    assert control.take_pending() is None
+
+
+def test_t8b_other_settings_still_change_while_the_dnn_runs() -> None:
+    control = _control(_dnn_config())
+    assert control.submit({"detector": "person"}).detector == "person"
+    assert control.submit({"motion": {"threshold": 300}}).motion.threshold == 300
+
+
+def test_t8b_hog_settings_still_change_with_hog() -> None:
+    control = _control(PetrifyConfig(detector="both"))
+    assert control.submit({"person": {"min_confidence": 0.5}}).person.min_confidence == 0.5
+
+
+def test_t8b_no_hog_weakened_sentence_while_the_dnn_runs() -> None:
+    dnn = _dnn_config()
+    tripled = dataclasses.replace(
+        dnn, person=dataclasses.replace(dnn.person, min_confidence=0.9, min_box_area=5000)
+    )
+    found = control_module.weakened_protections(tripled, dnn, SIZE)
+    assert [key for key, _ in found if key.startswith("threshold:person.")] == []
+    hog = PetrifyConfig(detector="both")
+    hog_tripled = dataclasses.replace(tripled, person_dnn=None)
+    found = control_module.weakened_protections(hog_tripled, hog, SIZE)
+    assert [key for key, _ in found if key.startswith("threshold:person.")] == [
+        "threshold:person.min_confidence", "threshold:person.min_box_area",
+    ]
+
+
+def test_t8b_the_snapshot_names_the_active_person_detector() -> None:
+    assert _control().snapshot().to_dict()["person_detector"] == "hog"
+    assert _control(_dnn_config()).snapshot().to_dict()["person_detector"] == "dnn"

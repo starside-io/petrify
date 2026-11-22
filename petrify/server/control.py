@@ -280,6 +280,11 @@ def apply_patch(
         changes["motion"] = dataclasses.replace(config.motion, **motion)
 
     if "person" in patch:
+        if config.person_dnn is not None:
+            _fail(
+                "The HOG person settings cannot be changed: this run uses the DNN person "
+                "detector, which they do not affect"
+            )
         section = _section(
             "person", patch["person"], ("min_confidence", "min_box_area", "scale"),
             _FIXED_FIELDS["person"],
@@ -485,6 +490,8 @@ def weakened_protections(
                 "detects a subject the person detector misses.",
             ))
     for section, key in _THRESHOLDS:
+        if section == "person" and config.person_dnn is not None:
+            continue  # The HOG settings are not used while the DNN finds the person boxes.
         current = getattr(config, section)
         start = getattr(startup, section)
         if section == "background_diff":
@@ -782,6 +789,7 @@ class RunSnapshot:
             "ended": self.ended,
             "last_error": self.last_error,
             "weakened": list(self.weakened),
+            "person_detector": "dnn" if self.config.get("person_dnn") is not None else "hog",
         }
         if self.mode is not None:
             data["mode"] = _plain(self.mode)

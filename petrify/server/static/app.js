@@ -131,6 +131,19 @@
     ["ctl-background-diff-pixel-threshold", "ctl-background-diff-area-threshold"].forEach(function (id) {
       $(id).disabled = differOff || ended;
     });
+    showPersonDetector(state.person_detector === "dnn");
+  }
+
+  var PERSON_CONTROLS = ["ctl-person-min-confidence", "ctl-person-min-box-area", "ctl-person-scale"];
+
+  function showPersonDetector(dnn) {
+    var name = dnn ? "DNN" : "HOG";
+    text("opt-detector-person", "Person (" + name + ")");
+    text("person-legend", "Person detector (" + name + ")");
+    $("person-dnn-note").hidden = !dnn;
+    PERSON_CONTROLS.forEach(function (id) {
+      $(id).disabled = dnn || ended;
+    });
   }
 
   var shownWeakened = null;

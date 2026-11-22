@@ -36,7 +36,9 @@ OptionValue = bool | int | float | str | tuple[str, ...]
 _NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,31}")
 
 # Detectors that may vet a background sample, in BackgroundConfig.sample_checkers.
-SAMPLE_CHECKERS: tuple[str, ...] = ("hog", "yunet", "dnn", "segment")
+# The segmenter is not one of them: it marks patches of empty floor, so as a check
+# it rejects nearly every sample and the background is never built.
+SAMPLE_CHECKERS: tuple[str, ...] = ("hog", "yunet", "dnn")
 
 # Upper bounds for the integer settings of the detector sections. Each is far above
 # any useful value and stops a typo from exhausting memory once the value is used.
@@ -325,11 +327,17 @@ class PersonDnnConfig:
 
     score_threshold: float = 0.4
     nms_threshold: float = 0.5
+    # Share of the box width (pad_x) and height (pad_y) added on each side of every
+    # box, to cover the undershoot of the model's boxes on compact poses.
+    pad_x: float = 0.10
+    pad_y: float = 0.07
     model_path: str | None = None  # Explicit model file; None searches the model directories.
 
     def __post_init__(self) -> None:
         _check_unit("PersonDnnConfig.score_threshold", self.score_threshold, high_closed=False)
         _check_unit("PersonDnnConfig.nms_threshold", self.nms_threshold, high_closed=True)
+        _check_share("PersonDnnConfig.pad_x", self.pad_x)
+        _check_share("PersonDnnConfig.pad_y", self.pad_y)
         _check_model_path("PersonDnnConfig.model_path", self.model_path)
 
 
@@ -385,7 +393,9 @@ class PetrifyConfig:
     them from a mapping with :func:`mode_options_from` and read them back with
     :meth:`mode_options_dict`. Whether a mode of that name exists is checked by
     the mode registry, not here. ``faces``, ``person_dnn``, ``segment`` and
-    ``tracker`` are off when None.
+    ``tracker`` are off when None. A ``person_dnn`` section selects the DNN person
+    detector in place of the HOG one wherever ``detector`` asks for person boxes;
+    ``person`` (HOG) stays in use for the locked background pre-scan.
     """
 
     detector: Literal["motion", "person", "both"] = "motion"

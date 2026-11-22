@@ -353,7 +353,8 @@ def test_state_shape(control: RunControl) -> None:
     with _client(app) as c:
         data = c.get("/api/state", headers=AUTH).json()
     assert set(data) == {"config", "stats", "timings", "source", "background", "roi",
-                         "running", "ended", "last_error", "weakened", "raw_preview"}
+                         "running", "ended", "last_error", "weakened", "raw_preview",
+                         "person_detector"}
     assert set(data["stats"]) == {"frames", "frozen", "passed_through", "failed_closed",
                                   "over_budget", "sink_failures", "reconfigurations"}
     assert set(data["timings"]) == {"detect_mean_ms", "detect_last_ms", "render_mean_ms",
@@ -1492,3 +1493,67 @@ def test_t13b_node_is_present_for_the_page_behavior_tests() -> None:
         pytest.skip("node is not on PATH")
     version = subprocess.run([NODE, "--version"], capture_output=True, text=True, check=True)
     assert version.stdout.startswith("v")
+
+
+# ---------------------------------------------------------------------------
+# T8b: the page names the active person detector
+# ---------------------------------------------------------------------------
+
+_HOG_CONTROLS = ("ctl-person-min-confidence", "ctl-person-min-box-area", "ctl-person-scale")
+
+
+def _person_state(person_detector: str) -> dict:
+    from petrify.core.config import PersonDnnConfig
+
+    dnn = PersonDnnConfig() if person_detector == "dnn" else None
+    config = PetrifyConfig(detector="both", person_dnn=dnn)
+    data = RunSnapshot(config=config_to_dict(config), running=True).to_dict()
+    data["raw_preview"] = False
+    return data
+
+
+@needs_node
+def test_t8b_page_shows_the_dnn_and_disables_the_hog_controls(tmp_path: Path) -> None:
+    state = _person_state("dnn")
+    assert state["person_detector"] == "dnn"
+    report = _run_page(tmp_path, state)
+    text, hidden, disabled = report["text"], report["hidden"], report["disabled"]
+    assert text["opt-detector-person"] == "Person (DNN)"
+    assert text["person-legend"] == "Person detector (DNN)"
+    assert "HOG" not in text["opt-detector-person"] + text["person-legend"]
+    assert hidden["person-dnn-note"] is False
+    # The harness keeps no static text; the note's wording is in index.html.
+    page = " ".join((STATIC_DIR / "index.html").read_text(encoding="utf-8").split())
+    assert ('<p id="person-dnn-note" hidden> This run uses the DNN person detector. These '
+            "HOG settings do not apply to it and cannot be changed. </p>") in page
+    assert all(disabled[name] for name in _HOG_CONTROLS)
+
+
+@needs_node
+def test_t8b_page_shows_hog_and_keeps_its_controls(tmp_path: Path) -> None:
+    report = _run_page(tmp_path, _person_state("hog"))
+    text, hidden, disabled = report["text"], report["hidden"], report["disabled"]
+    assert text["opt-detector-person"] == "Person (HOG)"
+    assert text["person-legend"] == "Person detector (HOG)"
+    assert hidden["person-dnn-note"] is True
+    assert not any(disabled[name] for name in _HOG_CONTROLS)
+
+
+def test_t8b_page_text_has_no_dashes() -> None:
+    for name in ("index.html", "app.js"):
+        content = (STATIC_DIR / name).read_text(encoding="utf-8")
+        assert "\u2014" not in content and "\u2013" not in content, name
+
+
+def test_t8b_patch_of_a_hog_setting_under_the_dnn_is_rejected() -> None:
+    from petrify.core.config import PersonDnnConfig
+
+    control = RunControl(PetrifyConfig(detector="both", person_dnn=PersonDnnConfig()), (320, 256))
+    app = create_app(control, ScriptedFeed([]), token=TOKEN, port=PORT)  # type: ignore[arg-type]
+    with _client(app) as c:
+        response = c.patch("/api/config", headers=AUTH, json={"person": {"min_confidence": 0.5}})
+        state = c.get("/api/state", headers=AUTH).json()
+    assert response.status_code == 422
+    assert "DNN person detector" in json.dumps(response.json())
+    assert state["person_detector"] == "dnn"
+    assert control.take_pending() is None

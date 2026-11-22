@@ -119,8 +119,55 @@ def _validate_filename(filename: object) -> None:
             )
 
 
-# Entries are added once each file has been verified by hand. Read-only.
-KNOWN_MODELS: Mapping[str, ModelSpec] = MappingProxyType({})
+# The pinned model files. They are defined here, not in the detector modules, so
+# that listing them needs no OpenCV import; each detector module's MODEL is one of
+# these objects. Entries are added once each file has been verified by hand.
+FACE_YUNET_MODEL = ModelSpec(
+    key="face_yunet_2023mar",
+    filename="face_detection_yunet_2023mar.onnx",
+    sha256="8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+    size=232589,
+    source_url="https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet",
+    license="MIT",
+)
+PERSON_DNN_MODEL = ModelSpec(
+    key="object_detection_nanodet_2022nov",
+    filename="object_detection_nanodet_2022nov.onnx",
+    sha256="4b82da9944b88577175ee23a459dce2e26e6e4be573def65b1055dc2d9720186",
+    size=3800954,
+    source_url=(
+        "https://github.com/opencv/opencv_zoo/raw/main/models/object_detection_nanodet/"
+        "object_detection_nanodet_2022nov.onnx"
+    ),
+    license="Apache-2.0",
+)
+SEGMENT_MODEL = ModelSpec(
+    key="human_segmentation_pphumanseg_2023mar",
+    filename="human_segmentation_pphumanseg_2023mar.onnx",
+    sha256="552d8a984054e59b5d773d24b9b12022b22046ceb2bbc4c9aaeaceb36a9ddf24",
+    size=6163938,
+    source_url="https://github.com/opencv/opencv_zoo/tree/main/models/human_segmentation_pphumanseg",
+    license="Apache-2.0",
+)
+
+# Every pinned model, by key. Read-only.
+KNOWN_MODELS: Mapping[str, ModelSpec] = MappingProxyType(
+    {spec.key: spec for spec in (FACE_YUNET_MODEL, PERSON_DNN_MODEL, SEGMENT_MODEL)}
+)
+
+
+# Where each model was last loaded from, by key, until the caller takes it with
+# pop_loaded_path. Detectors receive only the bytes, so this is how the caller that
+# built a detector can report which file it used without reading it again.
+_LOADED_PATHS: dict[str, Path] = {}
+
+
+def pop_loaded_path(spec: ModelSpec) -> Path | None:
+    """Return and forget the file *spec* was last loaded from, or None.
+
+    Only a successful :func:`load_model_bytes` records a path.
+    """
+    return _LOADED_PATHS.pop(spec.key, None)
 
 
 def _home(env: Mapping[str, str]) -> Path:
@@ -318,5 +365,6 @@ def load_model_bytes(
     for candidate in candidates:
         data = _read_checked(spec, candidate)
         if data is not None:
+            _LOADED_PATHS[spec.key] = candidate
             return data
     raise _not_found(spec, candidates)

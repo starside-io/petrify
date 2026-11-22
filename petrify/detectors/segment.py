@@ -29,16 +29,9 @@ import numpy as np
 from petrify.core.config import MAX_DILATE_PX, SegmentConfig
 from petrify.core.detections import DetectionKind, Detections
 from petrify.core.frame import Frame
-from petrify.models import ModelSpec, load_model_bytes
+from petrify.models import SEGMENT_MODEL, load_model_bytes
 
-MODEL = ModelSpec(
-    key="human_segmentation_pphumanseg_2023mar",
-    filename="human_segmentation_pphumanseg_2023mar.onnx",
-    sha256="552d8a984054e59b5d773d24b9b12022b22046ceb2bbc4c9aaeaceb36a9ddf24",
-    size=6163938,
-    source_url="https://github.com/opencv/opencv_zoo/tree/main/models/human_segmentation_pphumanseg",
-    license="Apache-2.0",
-)
+MODEL = SEGMENT_MODEL
 """Pinned identity of the PP-HumanSeg model file."""
 
 INPUT_SIZE = 192
