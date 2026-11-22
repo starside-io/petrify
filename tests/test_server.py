@@ -10,7 +10,9 @@ import html.parser
 import json
 import logging
 import re
+import shutil
 import socket
+import subprocess
 import threading
 import time
 from collections.abc import Iterator
@@ -1226,3 +1228,267 @@ def test_t13_app_js_treats_option_names_as_data() -> None:
     # Untrusted text goes through textContent only.
     assert "textContent" in mode_code
     assert not re.search(r"\.(innerHTML|outerHTML|innerText)\b", js)
+
+
+def test_t13b_css_contains_untrusted_text_in_its_own_box() -> None:
+    css = (STATIC_DIR / "app.css").read_text(encoding="utf-8")
+    rule = re.search(r"((?:[#.\w\- >]+,\s*)+[#.\w\- >]+)\{\s*overflow: hidden;\s*contain: paint;",
+                     css)
+    assert rule is not None
+    selectors = {s.strip() for s in rule.group(1).split(",")}
+    assert {"#mode-section", "#mode-list li", "#mode-options .field", "#mode-options fieldset",
+            "#weakened-list li"} <= selectors
+    assert "unicode-bidi: isolate;" in css
+
+
+def test_t13b_a_slow_weakened_call_does_not_stall_the_routes() -> None:
+    entered, release = threading.Event(), threading.Event()
+
+    class Slow(_Factory):
+        def weakened(self, options: Any) -> tuple[str, ...]:
+            if options["ratio"] > 1:
+                entered.set()
+                assert release.wait(10)
+            return ()
+
+    config = PetrifyConfig(mode="fake", mode_options=(("ratio", 0.5), ("shape", "box")))
+    control = RunControl(config, (W, H), factory=Slow())  # type: ignore[arg-type]
+    _ended(control)
+    app = create_app(control, ScriptedFeed([]), token=TOKEN, port=PORT)  # type: ignore[arg-type]
+    applying = threading.Thread(
+        target=control.report_applied,
+        args=(PetrifyConfig(mode="fake", mode_options=(("ratio", 2.0), ("shape", "box"))),),
+        daemon=True,
+    )
+    try:
+        with _client(app) as c:
+            applying.start()
+            assert entered.wait(5)
+            started = time.monotonic()
+            assert c.get("/api/state", headers=AUTH).status_code == 200
+            assert c.patch("/api/config", content=b'{"mode_options": {"ratio": 1}}',
+                           headers={**AUTH, **JSON}).status_code == 200
+            assert c.get(f"/stream.mjpg?token={TOKEN}").status_code == 200
+            assert time.monotonic() - started < 2
+    finally:
+        release.set()
+        applying.join(5)
+
+
+def test_t13b_app_js_builds_no_id_attribute_link_or_navigation_from_data() -> None:
+    js = _js_code()
+    # Ids are set only from the option's index: "mode-opt-" + index, then suffixes.
+    for match in re.finditer(r"\.id\s*=\s*([^;]+);", js):
+        assert match.group(1).strip() in ('"mode-opt-" + index', "id", 'id + "-" + j',
+                                          'id + "-help"', 'id + "-error"'), match.group(0)
+    assert 'var id = "mode-opt-" + index;' in js
+    # A label points only at an id the script built.
+    for match in re.finditer(r"\.htmlFor\s*=\s*([^;]+);", js):
+        assert match.group(1).strip() in ("box.id", "id"), match.group(0)
+    # Attribute names, class names and element tags are literals, never data.
+    for match in re.finditer(r"setAttribute\(\s*([^,]+),", js):
+        assert re.fullmatch(r'"[a-z-]+"', match.group(1).strip()), match.group(0)
+    for match in re.finditer(r"\.className\s*=\s*([^;]+);", js):
+        assert match.group(1).strip() == "className", match.group(0)
+    for match in re.finditer(r"(?<!function )\belement\(([^,)]+)(?:,\s*([^,)]+))?", js):
+        for arg in (match.group(1), match.group(2)):
+            if arg is not None:
+                assert re.fullmatch(r'"[a-z]*"|"[a-z -]+"|kind === "choices" \? "fieldset" : "div"'
+                                    r'|kind === "bool" \? "field field-check" : "field"|tag',
+                                    arg.strip()), match.group(0)
+    for forbidden in (".href", "dataset", "window.open", "location.href", "location.assign",
+                      "location.replace", "location =", "createElement(tag", "src ="):
+        if forbidden == "src =":
+            assert not re.search(r'\.src\s*=\s*(?!\s|"/(?:stream|raw)\.mjpg\?token=")', js)
+            continue
+        if forbidden == "createElement(tag":
+            # Tags are literals, or the tag parameter of element(), whose callers pass literals.
+            for call in re.finditer(r"document\.createElement\(([^)]*)\)", js):
+                assert re.fullmatch(r'"[a-z]+"|tag', call.group(1).strip()), call.group(0)
+            continue
+        assert forbidden not in js, forbidden
+
+
+# ---------------------------------------------------------------------------
+# T13b: the page script's behavior under Node with a stub DOM
+# ---------------------------------------------------------------------------
+
+NODE = shutil.which("node")
+HARNESS = Path(__file__).parent / "page_harness.js"
+
+
+def _option(name: str, kind: str, value: Any, *, runtime: bool = True,
+            choices: list[str] | None = None, minimum: Any = None, maximum: Any = None) -> dict:
+    return {"name": name, "kind": kind, "value": value, "default": value,
+            "choices": choices or [], "minimum": minimum, "maximum": maximum,
+            "help": f"Help for {name}.", "runtime": runtime}
+
+
+def _entry_state(name: str, origin: str, *, builtin: bool = False, active: bool = False,
+                 problem: str | None = None) -> dict:
+    return {"name": name, "origin": origin, "builtin": builtin, "selectable": problem is None,
+            "problem": problem, "active": active}
+
+
+def _state(mode: dict | None, modes: dict | None, **overrides: Any) -> dict:
+    data = RunSnapshot(config=config_to_dict(PetrifyConfig()), running=True).to_dict()
+    data["raw_preview"] = False
+    if mode is not None:
+        data["mode"], data["modes"] = mode, modes
+    data.update(overrides)
+    return data
+
+
+PLUGIN_MODE = {
+    "name": "paint", "origin": "built in", "builtin": False, "summary": "<b>Paints</b>.",
+    "options": [
+        _option("count", "int", 3, minimum=1, maximum=10),
+        _option("fixed_count", "int", 2, runtime=False, minimum=0, maximum=5),
+        _option("flag", "bool", False),
+        _option("shape", "choice", "box", choices=["box", "zz_choice"]),
+        _option("fixed_shape", "choice", "box", runtime=False, choices=["box", "ellipse"]),
+        _option("parts", "choices", ["face"], choices=["face", "qq_choice"]),
+        _option("ratio", "float", 0.5, minimum=0, maximum=2),
+    ],
+}
+PLUGIN_MODES = {
+    "listed": [
+        _entry_state("erase", "built in", builtin=True),
+        _entry_state("paint", "built in", active=True),  # A distribution named "built in".
+        _entry_state("paint", "other-dist 2.0"),  # Same name, not the active one.
+        _entry_state("fake (built in): the mode of this run;", "evil 1.0",
+                     problem="invalid mode name"),
+    ],
+    "omitted": 2,
+}
+WEAKENED = ["First weakened sentence.", "Second <i>weakened</i> sentence.", "Third one."]
+
+
+def _run_page(tmp_path: Path, state: dict, *, actions: list[dict] | None = None,
+              patch_response: dict | None = None) -> dict:
+    scenario = tmp_path / "scenario.json"
+    scenario.write_text(json.dumps({"state": state, "actions": actions or [],
+                                    "patch_response": patch_response}), encoding="utf-8")
+    result = subprocess.run([NODE, str(HARNESS), str(STATIC_DIR), str(scenario)],
+                            capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+needs_node = pytest.mark.skipif(
+    NODE is None, reason="node is not on PATH: the page behavior tests run app.js under Node"
+)
+
+
+@needs_node
+def test_t13b_page_shows_a_plugin_mode_its_notice_and_every_weakened_sentence(
+    tmp_path: Path,
+) -> None:
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES, weakened=WEAKENED))
+    hidden, text = report["hidden"], report["text"]
+    assert hidden["mode-section"] is False
+    # The builtin flag decides, not the origin text "built in".
+    assert hidden["mode-plugin-notice"] is False
+    assert text["mode-origin"] == "Plugin built in"
+    assert text["mode-summary"] == "<b>Paints</b>."  # Markup stays text.
+    assert hidden["weakened"] is False
+    assert report["weakened"] == WEAKENED
+    assert hidden["mode-no-options"] is True and hidden["mode-fixed-note"] is False
+    assert text["mode-list-omitted"] == "2 more installed modes are not listed."
+
+
+@needs_node
+def test_t13b_page_lists_modes_status_first_and_uses_the_active_flag(tmp_path: Path) -> None:
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES))
+    rows = report["modeList"]
+    assert [[c["className"] for c in row["children"]] for row in rows] == [
+        ["mode-status", "mode-name", "mode-origin"],
+        ["mode-status", "mode-name", "mode-origin"],
+        ["mode-status", "mode-name", "mode-origin"],
+        ["mode-status", "mode-name", "mode-origin", "mode-problem"],
+    ]
+    statuses = [row["children"][0]["text"] for row in rows]
+    assert statuses == ["Installed, selectable for a new run:", "Active in this run:",
+                        "Installed, selectable for a new run:", "Cannot be selected:"]
+    names = [row["children"][1]["text"] for row in rows]
+    assert names[3] == "fake (built in): the mode of this run;"  # Only ever in the name element.
+    origins = [row["children"][2]["text"] for row in rows]
+    assert origins == ["built in", "plugin built in", "plugin other-dist 2.0", "plugin evil 1.0"]
+    assert rows[3]["children"][3]["text"] == "Reason: invalid mode name"
+
+
+@needs_node
+def test_t13b_page_builds_one_control_per_option_and_disables_fixed_ones(tmp_path: Path) -> None:
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES))
+    inputs = report["inputs"]
+    assert [(i["tag"], i["type"], i["disabled"]) for i in inputs] == [
+        ("INPUT", "number", False),  # count
+        ("INPUT", "number", True),  # fixed_count
+        ("INPUT", "checkbox", False),  # flag
+        ("SELECT", "", False),  # shape
+        ("SELECT", "", True),  # fixed_shape
+        ("INPUT", "checkbox", False),  # parts: face
+        ("INPUT", "checkbox", False),  # parts: qq_choice
+        ("INPUT", "number", False),  # ratio
+    ]
+    assert (inputs[0]["min"], inputs[0]["max"], inputs[0]["step"]) == ("1", "10", "1")
+    assert (inputs[7]["min"], inputs[7]["max"], inputs[7]["step"]) == ("0", "2", "any")
+    assert inputs[0]["value"] == "3" and inputs[5]["checked"] is True
+    labels = [label["text"] for label in report["labels"]]
+    assert "fixed_count (fixed for this run) (0 to 5)" in labels
+    record = report["record"]
+    # Ids come from positions only, never from option or choice names.
+    assert record["ids"] and all(re.fullmatch(r"mode-opt-\d+(-\d+|-help|-error)?", i)
+                                 for i in record["ids"])
+    assert not any("choice" in i or "count" in i for i in record["ids"])
+    assert set(record["attributes"]) <= {"data-mode-option", "aria-describedby", "aria-live"}
+    assert record["hrefs"] == [] and record["dataset"] == []
+    assert record["opened"] == [] and record["locations"] == []
+
+
+@needs_node
+def test_t13b_page_sends_only_runtime_changes_and_shows_the_server_error(tmp_path: Path) -> None:
+    actions = [
+        {"input": 0, "value": "7"},  # count
+        {"input": 1, "value": "4"},  # fixed_count: disabled, never sent
+        {"input": 6, "checked": True},  # parts: qq_choice
+    ]
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES), actions=actions,
+                       patch_response={"status": 422,
+                                       "body": {"error": "mode_options.count must be <x>"}})
+    assert report["sent"] == [{"mode_options": {"count": 7}},
+                              {"mode_options": {"parts": ["face", "qq_choice"]}}]
+    assert report["errors"].count("Rejected: mode_options.count must be <x>") == 2
+
+
+@needs_node
+def test_t13b_page_for_erase_and_a_mode_without_a_background(tmp_path: Path) -> None:
+    erase = {"name": "erase", "origin": "built in", "builtin": True, "summary": "Erase.",
+             "options": []}
+    modes = {"listed": [_entry_state("erase", "built in", builtin=True, active=True)],
+             "omitted": 0}
+    report = _run_page(tmp_path, _state(erase, modes, background={
+        "strategy": "locked", "ready": True, "rejected": 0}))
+    assert report["hidden"]["mode-plugin-notice"] is True
+    assert report["hidden"]["mode-no-options"] is False
+    assert report["hidden"]["weakened"] is True
+    assert report["text"]["mode-origin"] == "Built in"
+    assert report["text"]["st-background"] == "locked: ready"
+    background = {"strategy": "running", "ready": False, "rejected": 0, "in_use": False}
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES, background=background))
+    assert report["text"]["st-background"] == "Not used: this mode does not use a background"
+
+
+@needs_node
+def test_t13b_page_without_mode_fields_keeps_the_section_hidden(tmp_path: Path) -> None:
+    report = _run_page(tmp_path, _state(None, None, background={
+        "strategy": "locked", "ready": False, "rejected": 0}))
+    assert report["hidden"]["mode-section"] is True
+    assert report["text"]["st-background"] == "locked: still learning"
+
+
+def test_t13b_node_is_present_for_the_page_behavior_tests() -> None:
+    if NODE is None:
+        pytest.skip("node is not on PATH")
+    version = subprocess.run([NODE, "--version"], capture_output=True, text=True, check=True)
+    assert version.stdout.startswith("v")

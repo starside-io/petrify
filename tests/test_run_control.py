@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -27,14 +28,16 @@ from petrify.pipeline import OutputConfig, run_stream
 from petrify.server import control as control_module
 from petrify.server.control import (
     RUNTIME_FIELDS,
+    BackgroundState,
     RunControl,
     RunSnapshot,
     RunStats,
     SourceFacts,
     config_to_dict,
+    metadata_text,
     untrusted_text,
 )
-from tests.test_run_stream import QUIET, HookSource, ListSink
+from tests.test_run_stream import QUIET, HookSource, ListSink, _live_config
 from tests.test_run_stream import H as STREAM_H
 from tests.test_run_stream import W as STREAM_W
 from tests.test_run_stream_plugins import (  # noqa: F401 (fixtures used by name)
@@ -959,8 +962,8 @@ def _is_plain(text: str, limit: int) -> bool:
 
 
 def test_untrusted_strings_are_plain_text_and_capped() -> None:
-    nasty = "<script>alert(1)</script>\n\r\t\x00\x1b[31m‮evil⁦ " * 200
-    spec = OptionSpec("count", "int", 3, nasty, runtime=True)
+    nasty = "<script>alert(1)</script>\n\r\t\x00\x1b[31m\u202eevil\u2066 " * 200
+    spec = OptionSpec("count", "int", 3, nasty, minimum=0, maximum=10, runtime=True)
     factory = FakeFactory(name="fake", summary=nasty, options=(spec,),
                           weakened=(nasty, nasty + "x"))
     modes = (
@@ -991,7 +994,7 @@ def test_untrusted_text_never_raises() -> None:
             raise RuntimeError("no")
 
     assert untrusted_text(Hostile(), 40) == "<Hostile object>"
-    assert untrusted_text("a\nb​c", 40) == "a b c"
+    assert untrusted_text("a\nb\u200bc", 40) == "a b c"
     assert untrusted_text("x" * 50, 10) == "xxxxxxx..."
 
 
@@ -1047,9 +1050,38 @@ def test_mode_weakened_sentences_follow_the_built_in_ones() -> None:
     assert control.snapshot().weakened == (DIFFER_OFF, "The mode shows faces.")
 
 
-def test_mode_weakened_is_capped_in_number() -> None:
+def test_mode_weakened_is_capped_in_number_and_says_how_many_are_not_listed() -> None:
     factory = FakeFactory(tuple(f"Sentence {i}." for i in range(30)))
-    assert len(_fake_control(factory).snapshot().weakened) == control_module.MAX_MODE_WEAKENED
+    weakened = _fake_control(factory).snapshot().weakened
+    cap = control_module.MAX_MODE_WEAKENED
+    assert len(weakened) == cap + 1
+    assert weakened[:cap] == tuple(f"Sentence {i}." for i in range(cap))
+    assert weakened[cap] == control_module.MODE_WEAKENED_MORE.format(name="fake", count=30 - cap)
+    assert weakened[cap] == (
+        "The mode fake reported 20 more weakened protections that are not listed here."
+    )
+
+
+def test_mode_weakened_at_the_cap_adds_no_count_sentence() -> None:
+    cap = control_module.MAX_MODE_WEAKENED
+    factory = FakeFactory(tuple(f"Sentence {i}." for i in range(cap)))
+    assert len(_fake_control(factory).snapshot().weakened) == cap
+
+
+@pytest.mark.parametrize(
+    "sentences",
+    [("",), ("   ",), ("\u200b\u200d",), ("\u3164\u2800",), ("\u0301\u0302",),
+     ("Real sentence.", "\u200b"), ("\ufe0f", "Real sentence.", "\n\t")],
+    ids=["empty", "spaces", "zero-width", "blank-letters", "marks", "real-then-blank",
+         "blank-real-blank"],
+)
+def test_a_weakened_sentence_that_cleans_to_empty_shows_the_fixed_sentence_once(
+    sentences: tuple[str, ...],
+) -> None:
+    weakened = _fake_control(FakeFactory(sentences)).snapshot().weakened
+    unknown = control_module.MODE_WEAKENED_UNKNOWN.format(name="fake")
+    real = tuple(s for s in sentences if s == "Real sentence.")
+    assert weakened == (*real, unknown)
 
 
 def _raises(options: Any) -> Any:
@@ -1107,3 +1139,305 @@ def test_runtime_option_change_reaches_the_mode_while_the_run_continues() -> Non
     assert options["fail"]["runtime"] is False
     assert seen["mode"]["origin"] == "petrify-t11-plugins 0.1"
     assert control.snapshot().last_error is None
+
+
+# ---------------------------------------------------------------------------
+# T13b: plugin code outside the lock, ordering of weakened results
+# ---------------------------------------------------------------------------
+
+
+class _Gate:
+    """A weakened callable that blocks for configs with ``count == block_at`` until released."""
+
+    def __init__(self, block_at: int) -> None:
+        self.block_at = block_at
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, options: Any) -> tuple[str, ...]:
+        if options["count"] == self.block_at:
+            self.entered.set()
+            assert self.release.wait(10)
+        return (f"count {options['count']} is weakened.",)
+
+
+def _in_thread(target: Any, *args: Any) -> threading.Thread:
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_a_slow_weakened_call_does_not_hold_the_lock() -> None:
+    gate = _Gate(block_at=8)
+    control = _fake_control(FakeFactory(gate))
+    slow = _in_thread(control.report_applied, _fake_config(count=8))
+    try:
+        assert gate.entered.wait(5)
+        # While the plugin runs, every server-side call returns at once.
+        done = threading.Event()
+
+        def server_calls() -> None:
+            control.snapshot().to_dict()
+            control.submit({"mode_options": {"ratio": 1.5}})
+            assert control.applied.mode_options_dict()["count"] == 8
+            done.set()
+
+        _in_thread(server_calls)
+        assert done.wait(2), "a server call waited for the plugin's weakened call"
+        # Until the result lands, the previous mode sentences stay listed.
+        assert control.snapshot().weakened == ("count 3 is weakened.",)
+    finally:
+        gate.release.set()
+        slow.join(5)
+    assert control.snapshot().weakened == ("count 8 is weakened.",)
+
+
+def test_a_newer_applied_config_wins_over_a_slower_older_result(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gate = _Gate(block_at=8)
+    control = _fake_control(FakeFactory(gate))
+    with caplog.at_level(logging.WARNING, logger="petrify.server.control"):
+        older = _in_thread(control.report_applied, _fake_config(count=8))
+        try:
+            assert gate.entered.wait(5)
+            control.report_applied(_fake_config(count=9))  # Completes while the older one waits.
+            assert control.snapshot().weakened == ("count 9 is weakened.",)
+        finally:
+            gate.release.set()
+            older.join(5)
+    # The older, slower result was discarded: the list belongs to the applied config.
+    assert control.applied.mode_options_dict()["count"] == 9
+    assert control.snapshot().weakened == ("count 9 is weakened.",)
+    options = {o["name"]: o["value"] for o in control.snapshot().to_dict()["mode"]["options"]}
+    assert options["count"] == 9
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert messages == ["Weakened protection: count 9 is weakened."]
+
+
+def test_built_in_weakened_protections_are_logged_when_the_mode_part_is_superseded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gate = _Gate(block_at=8)
+    control = _fake_control(FakeFactory(gate))
+    off = dataclasses.replace(_fake_config(count=8), background_diff=None)
+    with caplog.at_level(logging.WARNING, logger="petrify.server.control"):
+        older = _in_thread(control.report_applied, off)
+        try:
+            assert gate.entered.wait(5)
+            control.report_applied(dataclasses.replace(off, mode_options=_fake_config(
+                count=9).mode_options))
+        finally:
+            gate.release.set()
+            older.join(5)
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert messages == [f"Weakened protection: {DIFFER_OFF}",
+                        "Weakened protection: count 9 is weakened."]
+
+
+def test_option_spec_subclasses_are_used_as_plain_specs() -> None:
+    armed = threading.Event()
+
+    class Slow(OptionSpec):
+        def validate(self, value: object) -> Any:
+            if armed.is_set():
+                raise RuntimeError("plugin validate must not run under the lock")
+            return super().validate(value)
+
+    spec = Slow("count", "int", 3, "count", minimum=1, maximum=10, runtime=True)
+    armed.set()
+    control = RunControl(PetrifyConfig(mode="fake", mode_options=(("count", 3),)), SIZE,
+                         factory=FakeFactory(options=(spec,)))
+    assert control.submit({"mode_options": {"count": 4}}).mode_options == (("count", 4),)
+    with pytest.raises(ValueError, match="from 1 to 10"):
+        control.submit({"mode_options": {"count": 11}})
+
+
+# ---------------------------------------------------------------------------
+# T13b: rejection messages, and the change accepted after a rejected one
+# ---------------------------------------------------------------------------
+
+HOSTILE_ERROR = "x" * 20_000 + "\nsecond line \u202eevil\u0301"
+
+
+def _is_clean(text: str | None, limit: int) -> bool:
+    return (text is not None and len(text) <= limit and all(ch.isprintable() for ch in text)
+            and "\u202e" not in text and "\u0301" not in text)
+
+
+def test_rejection_messages_are_cleaned_and_capped() -> None:
+    control = _fake_control()
+    control.submit({"mode_options": {"count": 4}})
+    control.take_pending()
+    control.report_rejected(HOSTILE_ERROR)
+    error = control.snapshot().last_error
+    assert _is_clean(error, control_module.PROBLEM_TEXT_LIMIT)
+    assert error is not None and error.endswith("...") and "\n" not in error
+
+
+def test_the_pipeline_logs_and_reports_a_cleaned_rejection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import petrify.pipeline as pipeline_module
+
+    control = _fake_control()
+    control.submit({"mode_options": {"count": 4}})
+
+    class OpenEngine:
+        is_open = True
+
+    old = mock.Mock(config=control.applied)
+    with (
+        mock.patch.object(pipeline_module, "_rebuild", side_effect=ValueError(HOSTILE_ERROR)),
+        caplog.at_level(logging.WARNING, logger="petrify.pipeline"),
+    ):
+        assert pipeline_module._apply_pending(OpenEngine(), old, control, False) is old  # type: ignore[arg-type]
+    records = [r for r in caplog.records if r.name == "petrify.pipeline"]
+    assert len(records) == 1
+    logged = records[0].getMessage()
+    prefix = "The new settings were not applied, the previous ones stay: "
+    assert logged.startswith(prefix)
+    assert _is_clean(logged[len(prefix):], control_module.PROBLEM_TEXT_LIMIT)
+    assert logged[len(prefix):] == control.snapshot().last_error
+
+
+def test_a_change_accepted_after_a_rejected_one_stands_on_its_own() -> None:
+    control = _fake_control()
+    control.submit({"mode_options": {"count": 4}})  # A
+    assert control.take_pending() is not None  # The loop starts applying A.
+    b = control.submit({"mode_options": {"ratio": 1.5}})  # B, built on A: returns 200.
+    assert b.mode_options_dict()["count"] == 4
+    control.report_rejected("A is not acceptable")
+    assert control.snapshot().last_error == "A is not acceptable"
+    rebuilt = control.take_pending()
+    assert rebuilt is not None
+    options = rebuilt.mode_options_dict()
+    assert (options["count"], options["ratio"]) == (3, 1.5)  # B without A's value.
+    control.report_applied(rebuilt)
+    assert control.applied.mode_options_dict()["ratio"] == 1.5
+
+
+def test_the_next_change_builds_on_the_rebuilt_one_not_on_the_applied_config() -> None:
+    control = _fake_control()
+    control.submit({"mode_options": {"count": 4}})  # A
+    control.take_pending()
+    control.submit({"mode_options": {"ratio": 1.5}})  # B
+    control.report_rejected("A is not acceptable")
+    c = control.submit({"mode_options": {"flag": True}})  # C
+    options = c.mode_options_dict()
+    assert (options["count"], options["ratio"], options["flag"]) == (3, 1.5, True)
+    assert control.take_pending() is c
+
+
+def test_a_later_change_that_needs_the_rejected_one_is_dropped_with_a_clear_error() -> None:
+    control = RunControl(dataclasses.replace(_fake_config(), background_diff=None), SIZE,
+                         modes=FAKE_MODES, factory=FakeFactory())
+    control.submit({"background_diff": {"enabled": True}})  # A
+    control.take_pending()
+    control.submit({"background_diff": {"pixel_threshold": 30}})  # B, valid only after A.
+    control.report_rejected("A is not acceptable")
+    assert control.take_pending() is None
+    error = control.snapshot().last_error
+    assert error is not None
+    assert error.startswith("A is not acceptable A later change was dropped too")
+    assert "The background differ is off" in error
+    # The next change builds on the applied config.
+    assert control.submit({"detector": "both"}).background_diff is None
+
+
+# ---------------------------------------------------------------------------
+# T13b: spoofing text from package metadata and from the plugin
+# ---------------------------------------------------------------------------
+
+ZALGO = "x" + "\u0336\u0337\u0338\u0489" * 100
+SPOOFS = {
+    "zalgo": ZALGO,
+    "hangul-filler": "era\u3164se",
+    "halfwidth-filler": "era\uffa0se",
+    "jungseong-filler": "era\u1160se",
+    "braille-blank": "era\u2800se",
+    "cyrillic-e": "\u0435rase",
+    "rtl-letters": "\u05d0\u05d1\u05d2 erase",
+    "variation-selector": "erase\ufe0f\U000e0100",
+    "fake-status": "fake (built in): the mode of this run;",
+}
+
+
+def _ascii_printable(text: str) -> bool:
+    return all(" " <= ch <= "~" for ch in text)
+
+
+@pytest.mark.parametrize("spoof", list(SPOOFS.values()), ids=list(SPOOFS))
+def test_metadata_strings_are_reduced_to_printable_ascii(spoof: str) -> None:
+    modes = (
+        ModeEntry("fake", "m:F", "petrify-fake", "1.0", False, None),
+        ModeEntry(spoof, "m:F", spoof, spoof, False, f"invalid mode name {spoof!r}"),
+    )
+    data = RunControl(_fake_config(), SIZE, modes=modes,
+                      factory=FakeFactory()).snapshot().to_dict()
+    listed = data["modes"]["listed"][1]
+    for key in ("name", "origin", "problem"):
+        assert _ascii_printable(listed[key]), (key, listed[key])
+        assert listed[key]
+    if not _ascii_printable(spoof):
+        assert "?" in listed["name"] and listed["name"] != "erase"
+
+
+def test_metadata_text_replaces_each_foreign_character_with_a_placeholder() -> None:
+    assert metadata_text("\u0435rase", 64) == "?rase"
+    assert metadata_text("era\u3164se", 64) == "era?se"
+    assert metadata_text("erase\ufe0f", 64) == "erase?"
+    assert metadata_text("a\nb\tc", 64) == "a b c"
+    assert metadata_text(ZALGO, 64) == "x" + "?" * 60 + "..."
+    assert metadata_text("fake (built in): the mode of this run;", 64) == (
+        "fake (built in): the mode of this run;")
+
+
+def test_plugin_strings_keep_other_scripts_but_lose_marks_and_blank_characters() -> None:
+    assert untrusted_text("\u041f\u0440\u0438\u0432\u0435\u0442 \u05e9\u05dc\u05d5\u05dd", 64) == (
+        "\u041f\u0440\u0438\u0432\u0435\u0442 \u05e9\u05dc\u05d5\u05dd")
+    assert untrusted_text(ZALGO, 64) == "x"
+    assert untrusted_text("a\u3164b\uffa0c\u1160d\u2800e", 64) == "a b c d e"
+    assert untrusted_text("ok\ufe0f\U000e0100", 64) == "ok"
+    spec = OptionSpec("count", "int", 3, "Help " + ZALGO + " \u3164", minimum=0, maximum=5,
+                      runtime=True)
+    factory = FakeFactory(summary="Summary " + ZALGO, options=(spec,))
+    data = RunControl(PetrifyConfig(mode="fake", mode_options=(("count", 3),)), SIZE,
+                      factory=factory).snapshot().to_dict()
+    assert data["mode"]["summary"] == "Summary x"
+    assert data["mode"]["options"][0]["help"] == "Help x"
+
+
+# ---------------------------------------------------------------------------
+# T13b: the background state of a mode that uses none
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("plugin", "fake_persons")
+def test_a_mode_without_a_background_reports_that_none_is_in_use() -> None:
+    config = _plugin_config()
+    control = RunControl(config, (STREAM_W, STREAM_H), modes=list_modes(),
+                         factory=load_mode("paint"))
+    seen: dict[str, Any] = {}
+
+    def check() -> None:
+        seen["background"] = control.snapshot().to_dict()["background"]
+
+    run_stream(HookSource(QUIET, hooks={20: check}), config, OutputConfig(),
+               sinks=[ListSink()], control=control)
+    assert seen["background"] == {"strategy": "running", "ready": False, "rejected": 0,
+                                  "in_use": False}
+
+
+def test_an_erase_run_keeps_the_background_state_shape() -> None:
+    config = _live_config("running")
+    control = RunControl(config, (STREAM_W, STREAM_H), modes=list_modes([]), factory=ERASE)
+    seen: dict[str, Any] = {}
+
+    def check() -> None:
+        seen["background"] = control.snapshot().to_dict()["background"]
+
+    run_stream(HookSource(QUIET, hooks={20: check}), config, OutputConfig(),
+               sinks=[ListSink()], control=control)
+    assert set(seen["background"]) == {"strategy", "ready", "rejected"}
+    assert BackgroundState().to_dict() == {"strategy": "", "ready": False, "rejected": 0}

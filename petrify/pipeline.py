@@ -1292,8 +1292,12 @@ def _apply_pending(
     except ValueError as exc:
         if not engine.is_open:
             raise  # Writing the tail failed and aborted the engine: not a bad setting.
-        logger.warning("The new settings were not applied, the previous ones stay: %s", exc)
-        control.report_rejected(str(exc))
+        from petrify.server.control import PROBLEM_TEXT_LIMIT, untrusted_text  # noqa: PLC0415
+
+        # The message may come from plugin code: plain text, capped, before it is logged.
+        message = untrusted_text(exc, PROBLEM_TEXT_LIMIT)
+        logger.warning("The new settings were not applied, the previous ones stay: %s", message)
+        control.report_rejected(message)
         return components
     if live and new.background_diff is None and components.config.background_diff is not None:
         logger.warning(NO_BG_DIFF_LIVE_WARNING)
@@ -1399,6 +1403,9 @@ class _Publisher:
                     ready=ready,
                     rejected=rejected,
                 )
+            else:
+                # The mode uses no background: neither ready nor still learning.
+                background = BackgroundState(strategy=config.background.strategy, in_use=False)
             roi = getattr(components.roi_stage, "roi", None)
         info = self._source.info
         self._control.publish(

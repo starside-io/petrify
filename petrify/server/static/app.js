@@ -425,17 +425,26 @@
     shownModeList = key;
     var ul = $("mode-list");
     clear(ul);
+    /* Status first, then the name and its origin in their own elements, so a
+       name cannot pass for a status or for another entry. */
     listed.forEach(function (item) {
-      var origin = item.builtin === true ? "built in" : "plugin " + String(item.origin);
       var status;
       if (item.active === true) {
-        status = "the mode of this run";
+        status = "Active in this run:";
       } else if (item.selectable === true) {
-        status = "installed, can be selected when a new run starts";
+        status = "Installed, selectable for a new run:";
       } else {
-        status = "cannot be selected: " + String(item.problem);
+        status = "Cannot be selected:";
       }
-      ul.appendChild(element("li", "", String(item.name) + " (" + origin + "): " + status));
+      var li = element("li", "mode-entry");
+      li.appendChild(element("span", "mode-status", status));
+      li.appendChild(element("code", "mode-name", String(item.name)));
+      li.appendChild(element("span", "mode-origin",
+        item.builtin === true ? "built in" : "plugin " + String(item.origin)));
+      if (item.active !== true && item.selectable !== true) {
+        li.appendChild(element("span", "mode-problem", "Reason: " + String(item.problem)));
+      }
+      ul.appendChild(li);
     });
     var omitted = modes && isNumber(modes.omitted) ? modes.omitted : 0;
     var more = $("mode-list-omitted");
@@ -467,8 +476,12 @@
     text("st-running", runText);
     text("st-source", (source.uri || "unknown") + ", " + source.width + "x" + source.height +
       " at " + source.fps.toFixed(2) + " fps" + (source.live ? ", live" : ", file or folder"));
-    text("st-background", bg.strategy + ": " + (bg.ready ? "ready" : "still learning") +
-      (bg.rejected ? " (" + bg.rejected + " samples rejected)" : ""));
+    if (bg.in_use === false) {
+      text("st-background", "Not used: this mode does not use a background");
+    } else {
+      text("st-background", bg.strategy + ": " + (bg.ready ? "ready" : "still learning") +
+        (bg.rejected ? " (" + bg.rejected + " samples rejected)" : ""));
+    }
     text("st-frames", String(stats.frames));
     text("st-frozen", String(stats.frozen));
     text("st-passed", String(stats.passed_through));

@@ -263,7 +263,9 @@ class OptionSpec:
     ``choices`` names must match the option name pattern, so a list of them can be
     written as comma-separated text. ``minimum`` and ``maximum`` (inclusive) apply
     only to ``"int"`` and ``"float"``. ``runtime`` marks an option that may be
-    changed while a run is live.
+    changed while a run is live; a runtime ``"int"`` or ``"float"`` option must
+    declare both ``minimum`` and ``maximum``, so a value sent from the web page
+    is always bounded.
 
     The spec checks itself on construction and raises ``ValueError``; a default
     given in another accepted form (for example ``1`` for a float option or a list
@@ -332,6 +334,15 @@ class OptionSpec:
         ):
             raise ValueError(
                 f"{label}: minimum {self.minimum} is greater than maximum {self.maximum}"
+            )
+        if (
+            self.runtime
+            and self.kind in ("int", "float")
+            and (self.minimum is None or self.maximum is None)
+        ):
+            raise ValueError(
+                f"{label}: a runtime {self.kind!r} option must declare both a minimum "
+                "and a maximum"
             )
         try:
             default = self.validate(self.default)

@@ -95,6 +95,23 @@ def test_option_spec_rejects_invalid_construction(kwargs: dict[str, Any]) -> Non
         OptionSpec(**kwargs)
 
 
+@pytest.mark.parametrize(
+    "bounds",
+    [{}, {"minimum": 0}, {"maximum": 10}],
+    ids=["no-bounds", "minimum-only", "maximum-only"],
+)
+@pytest.mark.parametrize("kind", ["int", "float"])
+def test_runtime_number_option_needs_both_bounds(kind: str, bounds: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="must declare both a minimum and a maximum"):
+        OptionSpec("n", kind, 1, "n", runtime=True, **bounds)  # type: ignore[arg-type]
+    # Without runtime, or with both bounds, the same spec is fine.
+    OptionSpec("n", kind, 1, "n", **bounds)  # type: ignore[arg-type]
+    spec = OptionSpec("n", kind, 1, "n", runtime=True, minimum=0, maximum=10)  # type: ignore[arg-type]
+    assert spec.runtime is True
+    with pytest.raises(ValueError):
+        spec.validate(int("9" * 4000))
+
+
 def test_option_spec_stores_default_in_declared_type() -> None:
     spec = OptionSpec("scale", "float", 1, "scale")
     assert spec.default == 1.0 and type(spec.default) is float

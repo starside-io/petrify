@@ -239,8 +239,53 @@ h3 {
   grid-column: 1 / -1;
 }
 
-#mode-list li {
+/* Text from plugins and package metadata stays inside its own box: it cannot
+   paint over the controls, the plugin notice, or the weakened list. */
+#mode-section,
+#mode-list li,
+#mode-options .field,
+#mode-options fieldset,
+#weakened-list li,
+.status dd {
+  overflow: hidden;
+  contain: paint;
+}
+
+#mode-section dd,
+#mode-list li > *,
+#mode-options label,
+#mode-options legend,
+#mode-options .help,
+#weakened-list li {
+  unicode-bidi: isolate;
   overflow-wrap: anywhere;
+}
+
+/* Room for the focus outline, which the containment above would clip. */
+#mode-options .field {
+  padding: 6px;
+}
+
+#mode-list li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 8px;
+  margin: 2px 0;
+}
+
+.mode-status {
+  font-weight: 600;
+}
+
+.mode-name {
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+
+.mode-origin,
+.mode-problem {
+  color: var(--muted);
 }
 
 .roi-box {
