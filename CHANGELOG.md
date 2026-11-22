@@ -80,6 +80,14 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Warnings when `--person-detector dnn` is given with `--detector motion`, when `--faces`, `--segment`, or `--background-check` has no effect for the mode, and when the DNN person detector runs without the background differ. `--faces` and `--person-detector dnn` are not reported as having no effect when their settings are used by the `yunet` or `dnn` background sample check
 - The web page shows which person detector the run uses
 
+#### Shadow mode plugin
+- `petrify-shadow` (`plugins/petrify-shadow`), a separate package that registers the mode `shadow` through the `petrify.modes` entry point. It keeps the live frame and covers the people in it while a subject is present. Install it from the repository root with `python -m pip install --no-deps -e plugins/petrify-shadow`. See `plugins/petrify-shadow/README.md` for its coverage rules and measured limits
+- Nine styles, stackable and always drawn in a fixed order: face covers `gaussian`, `pixelate`, `noise`, `facebox`, and `eyebar` (need `--faces`), mask styles `silhouette`, `silhouette_color`, and `outline` (need `--segment`), and `bodybox` (needs `--detector person` or `both`). `outline` on its own, an empty style list, and `bodybox` with `--detector motion` are refused
+- Five options, all changeable while a run is in progress: `styles` (default `facebox`), `padding` (0.3, 0 to 1), `strength` (`high`, `medium`, `low`), `color` (`black`, `white`, `gray`, `red`, `green`, `blue`), and `dilate` (0.01, 0 to 0.1)
+- A frame with a subject but no region to draw on is written black, and a person box that the selected styles do not cover (no face in its top third, or too little mask) is filled black. With `--track`, a box held unchanged grows its cover per held frame and stops counting as a region after 10 frames
+- Weakened protections reported by the mode: no body style, the reversible `gaussian` and `pixelate` covers and a lower `strength`, `eyebar` as the only face style, `padding` or `dilate` below the default, and a silhouette without `bodybox`. A warning is logged for a mask style without `bodybox` and with `--detector motion`
+- `plugins/petrify-shadow/tools/padding_sheet.py` writes contact sheets of padded face crops, to judge the face padding by eye. The plugin's tests are part of the root test run
+
 ### Changed
 - `petrify INPUT OUTPUT` now runs through the streaming engine (`petrify.pipeline.run_file`) instead of the two-pass pipeline. Output for the same input and flags is unchanged, verified frame for frame against recorded fixtures. Background selection and timestamp ROI auto-detection still pre-scan the file before the processing pass
 - The modules `petrify.motion`, `petrify.person`, `petrify.bgdiff`, and `petrify.compositor` moved to `petrify.detectors.motion`, `petrify.detectors.person_hog`, `petrify.detectors.bgdiff`, and `petrify.stages.roi_overlay`; the old module paths no longer exist. `petrify.Compositor`, `petrify.MotionDetector`, and `petrify.run` are still exported. `petrify.run` is still the old two-pass function, kept as the reference implementation for the golden tests; the CLI no longer calls it
@@ -101,6 +109,8 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `petrify run` refuses to start when the mode requires faces, landmarks, or a mask and the detector that provides it is not enabled (`--faces`, `--segment`), and when a `first_hit` mode requires faces, landmarks, or a mask together with another kind (it must declare `detect_policy = "all"`). Before, a mode that required them together with motion or person boxes received `None` in those fields
 - `petrify run` rejects `--dnn-score-threshold`, `--face-score-threshold`, and `--segment-threshold` without their detector flag, and `--background-check` with `--no-background-check` or a `locked` background (usage error, exit code 2)
 - With `--person-detector dnn` the web page rejects changes to the HOG settings, and a raised HOG threshold is not listed as a weakened protection while the DNN is in use
+- `--track` is refused with every mode that uses the `first_hit` detection policy, at startup and on a live change, whatever trackers would be built
+- When `--track` is on and cannot hold a kind the mode requires (for example person boxes with `--detector motion`), a warning says so and the web page lists it as a weakened protection; a mode that requires neither person boxes nor faces gets a warning that the tracker has no effect
 
 ### Removed
 - MOG2 pre-warmup: it never had an effect, because its model was reset before use
@@ -111,6 +121,7 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A negative `--gap-fill` is rejected
 - `petrify run` without `--source` but with an option only the run form has (for example `petrify run --output out.mp4`) is a usage error that says `petrify run` requires `--source` (exit code 2), instead of an "unrecognized arguments" error from the file form
 - A failed run never leaves an encoded output from partial frames
+- A mode that requires person boxes, run with `--detector motion` and `--track`, no longer makes the engine refuse to start: a tracker refiner is now built only for a kind that a detector of the run provides, a live detector switch rebuilds the refiners, and a mode that requires landmarks without faces gets the faces refiner
 
 ### Security
 - Stream URLs are redacted in logs and error messages: at most the scheme, host, and port are shown, credentials become `***`, the path and query are dropped, and an ambiguous URL hides the host. A mistyped stream spec is not echoed with its credentials

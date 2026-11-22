@@ -1,6 +1,6 @@
 # petrify refactor plan: real-time core + plugin modes
 
-Status: phases 0 to 3 are done. Phase 4 is done, pending the user's sign-off: the plugin API, the mode registry, the tracker, the model file lookup, and the YuNet face, DNN person, and segmentation detectors have landed. Phases 5 and 6 are planned and not implemented yet.
+Status: phases 0 to 3 are done. Phase 4 is done, pending the user's sign-off: the plugin API, the mode registry, the tracker, the model file lookup, and the YuNet face, DNN person, and segmentation detectors have landed. Phase 5 is done, pending the user's sign-off: the `petrify-shadow` plugin (mode `shadow`) with its nine styles and five options, and the tracker fixes it needed in core. Phase 6 is planned and not implemented yet.
 
 ## Goals
 
@@ -116,11 +116,23 @@ petrify/
     static/          # index.html, app.js, app.css
   cli.py             # `petrify run --source ... --mode ...`; legacy `petrify in out` kept
 
-plugins/petrify-shadow/      # (not yet) separate package with its own pyproject
-  petrify_shadow/
-    mode.py          # ShadowMode: declares required detections per style
-    styles/          # gaussian, pixelate, noise, eyebar, facebox,
-                     # silhouette, silhouette_color, outline, bodybox
+plugins/petrify-shadow/      # separate package with its own pyproject (mode `shadow`)
+  pyproject.toml     # petrify.modes entry point: shadow = petrify_shadow:SHADOW
+  README.md          # styles, options, coverage rules, measured limits
+  src/
+    petrify_shadow/
+      __init__.py    # exports SHADOW
+      options.py     # the five options, style groups, fixed drawing order, colors
+      factory.py     # ShadowFactory: requires / mandatory per style, refusals, weakened
+      mode.py        # plan (pure decision: pass, black, draw) and ShadowMode (render,
+                     # held-box memory)
+      regions.py     # face and person padding, held growth, mask preparation, orphan rule
+      styles/
+        face.py      # gaussian, pixelate, noise, facebox (fill), eyebar
+        body.py      # silhouette, silhouette_color, outline, bodybox
+  tests/             # unit, contract, end-to-end (models marker), and timing tests
+  tools/
+    padding_sheet.py # contact sheets of padded face crops, to judge the padding
 ```
 
 ### Plugin mechanism
@@ -133,7 +145,7 @@ Implemented in phase 4. [PLUGINS.md](PLUGINS.md) is the guide for plugin authors
 - The mode has `name`, `requires`, `render(frame, detections, subject_present)`, a `detect_policy` (`"first_hit"` or `"all"`, required for a plugin mode), and optionally `mandatory`. When `subject_present` is True the mode must cover the subject, cover the whole frame when it has no regions to draw on, and return an array that does not share memory with the input image; the engine checks the type, shape, dtype, and memory and fails the frame closed otherwise.
 - Option values have one canonical type per kind (`bool`, `int`, `float`, `choice`, `choices`), because the pipeline detects a settings change with `!=`. An option marked `runtime` can be changed from the web page; a runtime number option must declare both bounds.
 - `build_mode` checks what `create` returns. A `ValueError` from the factory means the settings are not acceptable: at startup the run stops with the message, and during a run the change is rejected and the previous settings stay. Any other exception, or a broken contract, raises `ModeLoadError`: the plugin is faulty. At startup that also stops the run; during a run it is reported as a rejected change.
-- Installing `petrify-shadow` (phase 5) will make `--mode shadow` available in the CLI and list it on the web page without changes to core.
+- Installing `petrify-shadow` (phase 5) makes `--mode shadow` available in the CLI and lists it on the web page without changes to the plugin API. Phase 5 changed only the pipeline's tracker wiring (see [Findings from phase 5](#findings-from-phase-5)).
 - Keeping shadow as its own package proves the plugin API is real and keeps heavy dependencies (e.g. `mediapipe`) out of core.
 
 ## Shadow mode styles
@@ -143,14 +155,14 @@ Implemented in phase 4. [PLUGINS.md](PLUGINS.md) is the guide for plugin authors
 | `gaussian` | Face box |
 | `pixelate` | Face box |
 | `noise` | Face box (random noise refilled every frame) |
-| `facebox` | Face box, with head-from-body fallback |
+| `facebox` | Face box, filled with a solid color. No head-from-body fallback yet (phase 6) |
 | `eyebar` | Eye landmarks (YuNet 5 points); bar rotates with the head |
 | `silhouette` | Person mask, filled black |
-| `silhouette_color` | Person mask, filled with a color or blur |
-| `outline` | Person mask edges |
+| `silhouette_color` | Person mask, filled with a solid color (no blur) |
+| `outline` | Person mask edges; refused on its own, since it hides no one |
 | `bodybox` | Person box only; cheap fallback for CCTV angles where segmentation struggles |
 
-Styles are stackable (e.g. `silhouette` + `eyebar`).
+Styles are stackable (e.g. `silhouette` + `eyebar`) and always drawn in a fixed order: body fills, orphan person boxes, outline, face covers, eye bar. The [plugin README](../plugins/petrify-shadow/README.md) describes each style and option as built.
 
 Note: plain Gaussian blur and pixelation have been partially reversed by ML models. `noise`, `facebox`, and `silhouette` are the irreversible options and should be the recommended defaults for compliance use.
 
@@ -160,7 +172,7 @@ Profiles are presets of defaults, not code forks. Every value can be overridden.
 
 | | `--profile webcam` | `--profile cctv` |
 |---|---|---|
-| Person | segmentation mask | motion + bgdiff + DNN boxes |
+| Person | segmentation mask (as the only person signal it lets a person the segmenter misses through: the shadow mode's orphan rule needs person boxes, see the findings from phase 5) | motion + bgdiff + DNN boxes |
 | Face | YuNet (large, frontal faces) | YuNet when faces are large enough, else head-from-body box |
 | Background | calibrate / running | locked / running |
 | Lookahead | 0 to 3 frames | 10+ frames |
@@ -177,7 +189,7 @@ Profiles are presets of defaults, not code forks. Every value can be overridden.
 
 Implemented in phase 3 (`petrify run --web`): the processed MJPEG feed, the opt-in raw preview (`--web-raw-preview`), run stats and per-stage timings, a stop button, and controls for the erase settings only (detector, detector thresholds, background differ, lookahead, frame budget, ROI), with a list of weakened protections. Changes are sent over REST only (the page polls the state); there is no WebSocket. Mode, style, strength, box padding, hold frames, and the debug overlay belong to later phases.
 
-Added in phase 4: a Mode section that shows the active mode, its origin and options, and the installed modes, with controls for the options the mode marks `runtime`, the mode's own weakened protections in the weakened list, and a trust notice for a plugin mode. The mode cannot be switched during a run. Style, strength, box padding, and the debug overlay are planned as options of the shadow mode; hold frames are set with `--track-hold` and are not changeable from the page.
+Added in phase 4: a Mode section that shows the active mode, its origin and options, and the installed modes, with controls for the options the mode marks `runtime`, the mode's own weakened protections in the weakened list, and a trust notice for a plugin mode. The mode cannot be switched during a run. Added in phase 5: style, strength, and box padding are options of the shadow mode (`styles`, `strength`, `padding`, with `color` and `dilate`), changeable from the page. The debug overlay is not implemented. Hold frames are set with `--track-hold` and are not changeable from the page.
 
 ## Findings from phases 2 and 3
 
@@ -206,6 +218,20 @@ Design points that later phases (the detectors, `petrify-shadow`, CCTV hardening
 - The locked background pre-scan still uses HOG only, whatever `--person-detector` and `--background-check` say.
 - The `--background-check` thresholds are tied to the detector flags: the `dnn` and `yunet` checkers use `--dnn-score-threshold` and `--face-score-threshold`, which are accepted only with `--person-detector dnn` and `--faces`. A checker's threshold can only be set by also enabling that detector: for `dnn` that replaces HOG on the frames, and for `yunet` with `erase` the face detector does not run on the frames, and the run does not warn about it, since `--faces` then takes effect through the checker.
 
+## Findings from phase 5
+
+Design points from building `petrify-shadow` that phase 6 and later plugins must respect:
+
+- The tracker needed a fix in the pipeline. A tracker refiner was built for every kind the mode required, so a mode that requires person boxes with `--detector motion` and `--track` made the engine refuse to start (a persons refiner with no detector to feed it). Refiners are now built only for kinds a detector the run builds provides, a live detector switch rebuilds them, and a mode that requires landmarks without faces gets the faces refiner. When the tracker cannot hold a kind the mode requires, a warning says so and the web page lists it as a weakened protection. `--track` with a `first_hit` mode is refused for every mode, at startup and on a live change.
+- A held box cannot be told from a fresh one: `Detections` carries no held marker. The plugin treats a box exactly equal to one on the previous frame as held, grows its cover by 10 percent per held frame up to twice its size, and stops trusting it as a region after 10 frames (the growth cap). A box that truly stays still, or a fresh detection with the same box, is also seen as held, which only covers more. A core marker (held flag or age per box) would replace this heuristic.
+- The orphan rule (a person box the primary styles do not cover is filled black) is what catches a person the face detector or the segmenter misses. With the mask styles a box is an orphan below 30 percent mask coverage of the box or of its head zone. At those thresholds no person box the segmenter missed escaped on the demo clips, at the cost of turning 77 percent (640x480) and 86 percent (1080p) of correctly segmented persons into black boxes.
+- Mask styles need person boxes. Without them the orphan rule cannot run, and the segmenter marks something on almost every frame: `silhouette` with `--detector motion` left a fully visible head on 94 of 655 frames of the 640x480 clip, against 0 with `--detector both --person-detector dnn`. The plugin logs a warning for that setup.
+- The blur and pixelation styles leak: with two different real faces, about 25 percent (gaussian high) to 83 percent (pixelate low) of the difference between them survives the cover, nearly independent of face size, and averaging pixelated frames of a moving face recovers detail. They are reported as weakened protections; `noise`, `facebox`, `silhouette`, `silhouette_color`, and `bodybox` replace the pixels.
+- `ModeFactory.requires(options)` and `mandatory(options)` see only the options, not the config. A rule that depends on the detector settings (`bodybox` with `--detector motion`) can only be enforced in `create`, which receives the config through `ModeContext`.
+- `needs_background` is a fixed attribute and cannot follow the mode's options. The shadow mode sets it to False, so the background differ never runs for it and cannot serve as a presence signal; with the DNN person detector the run warns that small, distant people can be shown.
+- A `choices` option arrives in typed order from the command line and in option order from the web page. A mode that compares options to decide whether to rebuild must not depend on that order; the plugin stores its styles as a set and draws in a fixed order.
+- The plugin was tested on the two demo clips (CCTV-style footage) only, not on a real webcam or any live hardware.
+
 ## Phases
 
 | # | Phase | Done when |
@@ -215,7 +241,7 @@ Design points that later phases (the detectors, `petrify-shadow`, CCTV hardening
 | 2 | Live sources + sinks (done) | Webcam, RTSP, image folder, and push API inputs; preview, ffmpeg pipe, and virtual cam outputs. Erase mode runs live. |
 | 3 | Webapp (done) | Live feed visible in the browser; erase config tweakable live. |
 | 4 | Plugin API + new detectors (done, pending sign-off) | Entry-point loading, the mode contract and registry, `--mode`, `--mode-option`, `--list-modes`, detection policies and refiners in the engine, the tracker (`--track`), model file lookup with pinned SHA-256 (`--model-dir`), the Mode section of the web page, and the YuNet face (`--faces`), DNN person (`--person-detector dnn`), and segmentation (`--segment`) detectors with their three pinned model files, a startup check of every model file a run needs, and `--background-check`. |
-| 5 | `petrify-shadow` plugin | All styles implemented and stackable. |
+| 5 | `petrify-shadow` plugin (done, pending sign-off) | All styles implemented and stackable: the nine styles and five options of the mode `shadow`, the orphan rule, held-box growth with the tracker, weakened protections, and the tracker fixes in the pipeline. |
 | 6 | CCTV hardening | Head-from-body fallback, multi-camera, performance budgets, fail-closed tests. |
 
 ## Open decisions

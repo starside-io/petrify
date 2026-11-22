@@ -2,6 +2,8 @@
 
 A mode decides what petrify writes for each frame. The built-in mode, `erase`, shows the clean background while a subject is present and the live frame otherwise. A plugin is an installed Python package that adds another mode, selected with `petrify run --mode NAME`.
 
+The repository holds one complete plugin, [`petrify-shadow`](../plugins/petrify-shadow/README.md) in `plugins/petrify-shadow` (mode `shadow`). It is the reference for a region mode: it uses faces, landmarks, person boxes, and the mask, declares its kinds per option, reports weakened protections, and ships its own tests. The examples below are smaller sketches.
+
 This guide describes the contract as it is implemented today. Read [Which detector provides what](#which-detector-provides-what) before you plan a mode: faces, landmarks, and the person mask come from model-based detectors that the user must enable with a flag and supply model files for, and each has measured limits.
 
 ## Trust model
@@ -283,7 +285,7 @@ Before a mode sees them, detector results go through these steps:
 - **Boxes are clipped to the frame.** A box that starts before 0 or extends past the edge is clipped; a box wholly outside becomes a zero-area box on the nearest edge. Landmark points are not clipped.
 - **The mask is a read-only copy.**
 - **Results are merged as a union.** Flags are OR-ed, boxes and faces are concatenated, masks are OR-ed pixel by pixel. A field left `None` by every detector stays `None` ("not computed").
-- **Refiners run after the detectors.** With `--track` (or `--track-hold N`), petrify adds a box tracker for `persons` and for `faces` when the mode requires them. It holds the last box of a lost subject for N frames (default 15) without moving it. Refiners need `detect_policy = "all"`, which is why `erase` refuses `--track`. Refiners do not run on a frame whose detection failed; that frame is written black.
+- **Refiners run after the detectors.** With `--track` (or `--track-hold N`), petrify adds a box tracker for each kind the mode requires that it can hold and that a detector the run builds provides: `persons` only with `--detector person` or `both`, `faces` only with `--faces` (a mode that requires `landmarks` without `faces` also gets the faces tracker). It holds the last box of a lost subject for N frames (default 15) without moving it. When the tracker is on and cannot hold a kind the mode requires, for example `persons` with `--detector motion`, the run logs a warning and the web page lists it as a weakened protection; a mode that requires neither kind gets a warning that the tracker has no effect. A live detector switch rebuilds the trackers. Refiners need `detect_policy = "all"`: `--track` with a `"first_hit"` mode is refused, at startup and on a live change, whatever trackers would be built. That is why `erase` refuses `--track`. Refiners do not run on a frame whose detection failed; that frame is written black.
 - **A subject is present** when motion, a person box, a background difference, a face, or a mask pixel is found.
 
 ## Which detector provides what
@@ -323,6 +325,8 @@ Each field below is `None` when it was not computed (its detector is not active,
 - **`detections.persons`** from the DNN: boxes padded by 10 percent of their width and 7 percent of their height on each side, overlapping candidates merged into their union rather than dropped. An outstretched arm can still stick out of a box.
 
 With `--track`, the box tracker also holds face boxes for `--track-hold` frames after a miss.
+
+A held box reaches the mode exactly like a fresh one: `Detections` carries no marker for it, and a held face keeps its last landmarks and score. A mode cannot tell that a box is held, nor for how long. `petrify-shadow` works around this by treating a box exactly equal to one of the previous frame as held, growing its cover per held frame and no longer trusting it after 10 frames; a box that truly stays still is then seen as held too. A core marker for held boxes is not implemented yet.
 
 ## A mode that uses faces
 
@@ -420,5 +424,9 @@ YuNet found a face on 805 frames, and those frames have the face box painted. Th
 
 ## What is not available yet
 
-- **No built-in mode uses faces or a mask.** `erase` uses motion, person boxes, and the background differ only, so `--faces` and `--segment` matter only to a plugin mode today.
-- **No `petrify-shadow` plugin.** The face blur, eye bar, and silhouette modes are planned for Phase 5 of the [refactor plan](REFACTOR.md).
+- **No built-in mode uses faces or a mask.** `erase` uses motion, person boxes, and the background differ only, so `--faces` and `--segment` matter only to a plugin mode, such as `shadow` from [`petrify-shadow`](../plugins/petrify-shadow/README.md).
+- **No held marker.** A box the tracker holds reaches the mode like a fresh detection (see [What the mode receives](#what-the-mode-receives)).
+- **`requires(options)` and `mandatory(options)` do not see the config.** A rule that depends on the detector settings must be checked in `create`, which receives the config in `ModeContext`; raise `ValueError` there.
+- **`needs_background` cannot follow the options.** It is one value for the mode, so a mode cannot use the background differ for some options only.
+- **`choices` values arrive in different orders.** The command line passes them in typed order and the web page in option order. Do not let the order change what the mode draws, or whether `create` returns `previous`.
+- **No head-from-body estimation, webcam or CCTV profiles, or multi-camera support.** They are planned for Phase 6 of the [refactor plan](REFACTOR.md).

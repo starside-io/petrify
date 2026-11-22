@@ -221,7 +221,19 @@ A plugin is a Python package that registers a mode under the `petrify.modes` ent
 
 > **A mode plugin is ordinary Python code.** It runs in the petrify process with petrify's permissions and receives the unprocessed frames, people included. Install only plugins you trust. petrify's checks on a plugin catch mistakes, not a hostile plugin. When the selected mode is a plugin, the run logs a warning naming its package and version.
 
-petrify ships no mode plugin yet. [docs/PLUGINS.md](docs/PLUGINS.md) describes how to write one.
+[docs/PLUGINS.md](docs/PLUGINS.md) describes how to write one.
+
+#### Shadow mode (plugin)
+
+The repository holds one mode plugin, `petrify-shadow`, in `plugins/petrify-shadow`. It registers the mode `shadow`, which keeps the live frame and covers the people in it: faces with a blur, pixelation, noise, a solid box, or an eye bar, and bodies with a filled silhouette or a filled person box. It is not installed with petrify; install it from the repository root with `python -m pip install --no-deps -e plugins/petrify-shadow`.
+
+```bash
+petrify run --source input.mp4 --output out.mp4 --mode shadow \
+    --mode-option styles=bodybox,facebox \
+    --detector both --person-detector dnn --faces --track
+```
+
+Its styles depend on the model-based detectors below, each of which misses people, and the blur and pixelation styles can be partly reversed. Read the [plugin README](plugins/petrify-shadow/README.md), in particular its limits, before you rely on it.
 
 ### Tracking and model files
 
@@ -251,7 +263,7 @@ Three detectors run an ONNX model from the [OpenCV model zoo](https://github.com
 | `--segment-threshold FLOAT` | Person probability in (0, 1) from which a pixel belongs to the mask. Default: 0.5. Needs `--segment` |
 | `--background-check NAMES` | Detectors that check the frames a `running` or `calibrate` background is learned from, comma-separated: `hog`, `yunet`, `dnn`. Default: `hog`. See [Background strategies](#background-strategies) |
 
-No built-in mode uses faces or a mask yet: the region modes that would (face blur, silhouette) are planned for phase 5 of the [refactor plan](docs/REFACTOR.md). Today `--faces` and `--segment` only matter to a [plugin mode](docs/PLUGINS.md) that requires faces, landmarks, or a mask. With `erase` they have no effect, and a warning says so.
+No built-in mode uses faces or a mask: `--faces` and `--segment` only matter to a [plugin mode](docs/PLUGINS.md) that requires faces, landmarks, or a mask, such as [`shadow`](#shadow-mode-plugin). With `erase` they have no effect, and a warning says so.
 
 #### Limits, before you choose one
 
@@ -399,7 +411,7 @@ Known limitations, in particular for live use:
 
 1. **Live paths are unverified on real hardware.** Webcams (`camera:N`), stream URLs, `--virtualcam`, and `--preview` were developed and tested against test doubles. They have not been verified with real cameras, streams, virtual camera drivers, or windows.
 2. **An online background can absorb a person.** With `--background running` or `calibrate`, a person in view while the background is learned can be absorbed into it and then shown on frozen frames after they leave. The person check on background samples reduces this, but by default it uses the HOG pedestrian detector, which often misses a seated person framed from the chest up (the usual webcam view). `--background-check` can add the face and DNN person checks. Start with the scene empty. Do not rely on erase mode on a webcam for privacy yet.
-3. **The model-based detectors have measured limits.** The DNN person detector misses people smaller than about 110 px tall on a 1080p frame and replaces HOG rather than adding to it. The segmenter misses small, distant people and marks parts of empty scenes. No built-in mode uses faces or a mask yet. See [Limits, before you choose one](#limits-before-you-choose-one).
+3. **The model-based detectors have measured limits.** The DNN person detector misses people smaller than about 110 px tall on a 1080p frame and replaces HOG rather than adding to it. The segmenter misses small, distant people and marks parts of empty scenes. No built-in mode uses faces or a mask; the `shadow` plugin does, and its [README](plugins/petrify-shadow/README.md) lists its own measured limits. See [Limits, before you choose one](#limits-before-you-choose-one).
 4. **A plugin mode is trusted code.** It runs in the petrify process and receives the unprocessed frames. petrify does not sandbox or vet it.
 5. **The timestamp ROI is shown live.** Anything inside the ROI region is not anonymized, by design.
 6. **A slow entry at the frame edge can show through.** A subject entering slowly at the edge of the frame can be partly visible for a few frames before it is detected, more so with a small `--lookahead` (the `camera:N` default is 3).
