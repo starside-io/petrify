@@ -288,6 +288,17 @@ def test_erase_factory_replaces_previous_when_background_changes() -> None:
     assert isinstance(third, EraseMode) and third.model is model
 
 
+def test_erase_factory_replaces_previous_when_model_changes() -> None:
+    # Same require_background_diff (True) on both sides: only the model differs.
+    old = RunningBackground(window=3, interval=1, min_samples=1)
+    new = RunningBackground(window=3, interval=1, min_samples=1)
+    first = build_mode(ERASE, _ctx(old))
+    second = build_mode(ERASE, _ctx(new), first)
+    assert second is not first
+    assert isinstance(second, EraseMode) and second.model is new
+    assert second.require_background_diff is True
+
+
 def test_erase_factory_replaces_previous_when_differ_requirement_changes() -> None:
     model = RunningBackground(window=3, interval=1, min_samples=1)
     with_differ = build_mode(ERASE, _ctx(model, differ=True))

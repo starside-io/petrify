@@ -203,6 +203,39 @@ _OPTION_KINDS: tuple[str, ...] = ("bool", "int", "float", "choice", "choices")
 _TRUE_TEXT = frozenset({"true", "yes", "on", "1"})
 _FALSE_TEXT = frozenset({"false", "no", "off", "0"})
 _INT_TEXT = re.compile(r"[+-]?[0-9]+")
+# Sign, ASCII digits, an optional fraction and an optional exponent. No inf, nan,
+# underscores or non-ASCII digits, which float() would otherwise accept.
+_FLOAT_TEXT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+_TEXT_LIMIT = 300
+
+
+def _safe_text(value: object, *, use_repr: bool = True, limit: int = _TEXT_LIMIT) -> str:
+    """Return ``repr(value)`` (or ``str``) for a message, never raising, at most ``limit`` long.
+
+    Falls back to the type name when the object's own ``__repr__`` or ``__str__``
+    raises or returns something other than a string. Used for every message that
+    includes an object a plugin or a user controls.
+    """
+    try:
+        text = repr(value) if use_repr else str(value)
+        if type(text) is not str:
+            raise TypeError("not a string")
+    except Exception:
+        try:
+            text = f"<{type(value).__name__} object>"
+        except Exception:
+            text = "<object>"
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    return text
+
+
+def _describe_error(exc: BaseException) -> str:
+    """Return ``"TypeName: message"`` for ``exc``, never raising, length capped."""
+    return _safe_text(
+        f"{_safe_text(type(exc).__name__, use_repr=False)}: {_safe_text(exc, use_repr=False)}",
+        use_repr=False,
+    )
 
 
 def _is_real_number(value: object) -> bool:
@@ -249,17 +282,20 @@ class OptionSpec:
     def __post_init__(self) -> None:
         if type(self.name) is not str or not _NAME_PATTERN.fullmatch(self.name):
             raise ValueError(
-                f"option name must match [a-z][a-z0-9_]{{0,31}}, got {self.name!r}"
+                f"option name must match [a-z][a-z0-9_]{{0,31}}, got {_safe_text(self.name)}"
             )
         label = f"option {self.name!r}"
         if type(self.kind) is not str or self.kind not in _OPTION_KINDS:
             raise ValueError(
-                f"{label}: kind must be one of {', '.join(_OPTION_KINDS)}, got {self.kind!r}"
+                f"{label}: kind must be one of {', '.join(_OPTION_KINDS)}, "
+                f"got {_safe_text(self.kind)}"
             )
         if not isinstance(self.help, str):
             raise ValueError(f"{label}: help must be a string, got {type(self.help).__name__}")
         if type(self.runtime) is not bool:
-            raise ValueError(f"{label}: runtime must be True or False, got {self.runtime!r}")
+            raise ValueError(
+                f"{label}: runtime must be True or False, got {_safe_text(self.runtime)}"
+            )
         if not isinstance(self.choices, tuple):
             raise ValueError(
                 f"{label}: choices must be a tuple, got {type(self.choices).__name__}"
@@ -271,10 +307,12 @@ class OptionSpec:
                 if type(choice) is not str or not _NAME_PATTERN.fullmatch(choice):
                     raise ValueError(
                         f"{label}: choice names must match [a-z][a-z0-9_]{{0,31}}, "
-                        f"got {choice!r}"
+                        f"got {_safe_text(choice)}"
                     )
             if len(set(self.choices)) != len(self.choices):
-                raise ValueError(f"{label}: choices must be distinct, got {self.choices!r}")
+                raise ValueError(
+                    f"{label}: choices must be distinct, got {_safe_text(self.choices)}"
+                )
         elif self.choices:
             raise ValueError(f"{label}: only 'choice' and 'choices' options take choices")
         for bound_name in ("minimum", "maximum"):
@@ -284,7 +322,9 @@ class OptionSpec:
             if self.kind not in ("int", "float"):
                 raise ValueError(f"{label}: only 'int' and 'float' options take a {bound_name}")
             if not _is_real_number(bound):
-                raise ValueError(f"{label}: {bound_name} must be a finite number, got {bound!r}")
+                raise ValueError(
+                    f"{label}: {bound_name} must be a finite number, got {_safe_text(bound)}"
+                )
         if (
             self.minimum is not None
             and self.maximum is not None
@@ -312,21 +352,21 @@ class OptionSpec:
         kind = self.kind
         if kind == "bool":
             if type(value) is not bool:
-                raise ValueError(f"{label} must be true or false, got {value!r}")
+                raise ValueError(f"{label} must be true or false, got {_safe_text(value)}")
             return value
         if kind in ("int", "float"):
             if not _is_real_number(value):
-                raise ValueError(f"{label} must be a finite number, got {value!r}")
+                raise ValueError(f"{label} must be a finite number, got {_safe_text(value)}")
             number: int | float
             if kind == "int":
                 if isinstance(value, float) and not value.is_integer():
-                    raise ValueError(f"{label} must be a whole number, got {value!r}")
+                    raise ValueError(f"{label} must be a whole number, got {_safe_text(value)}")
                 number = int(value)  # type: ignore[call-overload]
             else:
                 try:
                     number = float(value)  # type: ignore[arg-type]
                 except OverflowError:
-                    raise ValueError(f"{label} is too large, got {value!r}") from None
+                    raise ValueError(f"{label} is too large, got {_safe_text(value)}") from None
             if self.minimum is not None and number < self.minimum:
                 raise ValueError(f"{label} must be at least {self.minimum}, got {number!r}")
             if self.maximum is not None and number > self.maximum:
@@ -335,10 +375,10 @@ class OptionSpec:
         if kind == "choice":
             return self._choice(label, value)
         if not isinstance(value, (list, tuple)):
-            raise ValueError(f"{label} must be a list of choices, got {value!r}")
+            raise ValueError(f"{label} must be a list of choices, got {_safe_text(value)}")
         picked = tuple(self._choice(label, item) for item in value)
         if len(set(picked)) != len(picked):
-            raise ValueError(f"{label} must not repeat a choice, got {list(picked)!r}")
+            raise ValueError(f"{label} must not repeat a choice, got {_safe_text(list(picked))}")
         return picked
 
     def parse(self, text: str) -> OptionValue:
@@ -361,17 +401,21 @@ class OptionSpec:
                 return True
             if lowered in _FALSE_TEXT:
                 return False
-            raise ValueError(f"{label} must be true or false, got {text!r}")
+            raise ValueError(f"{label} must be true or false, got {_safe_text(text)}")
         if kind == "int":
             if not _INT_TEXT.fullmatch(stripped):
-                raise ValueError(f"{label} must be a whole number, got {text!r}")
-            return self.validate(int(stripped))
-        if kind == "float":
+                raise ValueError(f"{label} must be a whole number, got {_safe_text(text)}")
             try:
-                number = float(stripped)
-            except ValueError:
-                raise ValueError(f"{label} must be a number, got {text!r}") from None
-            return self.validate(number)
+                whole = int(stripped)
+            except ValueError:  # More digits than int() converts.
+                raise ValueError(
+                    f"{label} has too many digits, got {_safe_text(text)}"
+                ) from None
+            return self.validate(whole)
+        if kind == "float":
+            if not _FLOAT_TEXT.fullmatch(stripped):
+                raise ValueError(f"{label} must be a number, got {_safe_text(text)}")
+            return self.validate(float(stripped))
         if kind == "choice":
             return self.validate(stripped)
         if not stripped:
@@ -383,7 +427,9 @@ class OptionSpec:
             for choice in self.choices:
                 if value == choice:
                     return choice  # The spec's own plain str, never a subclass.
-        raise ValueError(f"{label} must be one of {', '.join(self.choices)}, got {value!r}")
+        raise ValueError(
+            f"{label} must be one of {', '.join(self.choices)}, got {_safe_text(value)}"
+        )
 
 
 def check_option_specs(specs: object) -> tuple[OptionSpec, ...]:
@@ -416,7 +462,7 @@ def resolve_options(
     if not isinstance(given, Mapping):
         raise ValueError(f"mode options must be a mapping, got {type(given).__name__}")
     by_name = {spec.name: spec for spec in specs}
-    unknown = sorted(repr(name) for name in given if name not in by_name)
+    unknown = sorted(_safe_text(name) for name in given if name not in by_name)
     if unknown:
         known = ", ".join(by_name) if by_name else "none"
         raise ValueError(f"unknown mode option {', '.join(unknown)}; known options: {known}")
@@ -439,15 +485,17 @@ def resolve_option_text(
     given: dict[str, object] = {}
     for assignment in assignments:
         if not isinstance(assignment, str) or "=" not in assignment:
-            raise ValueError(f"mode options must be written KEY=VALUE, got {assignment!r}")
+            raise ValueError(
+                f"mode options must be written KEY=VALUE, got {_safe_text(assignment)}"
+            )
         key, _, text = assignment.partition("=")
         key = key.strip()
         if key in given:
-            raise ValueError(f"mode option {key!r} is given more than once")
+            raise ValueError(f"mode option {_safe_text(key)} is given more than once")
         spec = by_name.get(key)
         if spec is None:
             known = ", ".join(by_name) if by_name else "none"
-            raise ValueError(f"unknown mode option {key!r}; known options: {known}")
+            raise ValueError(f"unknown mode option {_safe_text(key)}; known options: {known}")
         given[key] = spec.parse(text)
     return resolve_options(specs, given)
 
@@ -480,6 +528,11 @@ class ModeContext:
             raise TypeError(
                 f"ModeContext.options must be a mapping, got {type(self.options).__name__}"
             )
+        for key in self.options:
+            if type(key) is not str:
+                raise TypeError(
+                    f"ModeContext.options keys must be strings, got {_safe_text(key)}"
+                )
         background = self.background
         if background is not None and not isinstance(background, (np.ndarray, BackgroundModel)):
             raise TypeError(

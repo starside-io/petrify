@@ -41,6 +41,7 @@ from petrify.core import (
     list_modes,
     load_mode,
     mode_options_from,
+    registry,
     resolve_option_text,
     resolve_options,
 )
@@ -468,6 +469,10 @@ MARKER = {marker!r}
 open(MARKER + "/imported_" + __name__, "w").close()
 
 
+class _LyingStr(str):
+    pass
+
+
 class FakeMode:
     name = "{mode}"
     requires = frozenset({{DetectionKind.PERSONS}})
@@ -510,14 +515,21 @@ class _Installer:
         self.modules: set[str] = set()
         monkeypatch.syspath_prepend(str(root))
 
-    def dist(self, dist: str, version: str, entries: dict[str, str]) -> None:
-        info = self.root / f"{dist}-{version}.dist-info"
-        info.mkdir()
+    def dist(
+        self, dist: str, version: str, entries: dict[str, str], root: Path | None = None
+    ) -> None:
+        lines = "".join(f"{name} = {target}\n" for name, target in entries.items())
+        self.raw_dist(dist, version, f"[{ENTRY_POINT_GROUP}]\n{lines}".encode(), root)
+
+    def raw_dist(
+        self, dist: str, version: str, entry_points: bytes, root: Path | None = None
+    ) -> None:
+        info = (root or self.root) / f"{dist}-{version}.dist-info"
+        info.mkdir(parents=True)
         (info / "METADATA").write_text(
             f"Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n"
         )
-        lines = "".join(f"{name} = {target}\n" for name, target in entries.items())
-        (info / "entry_points.txt").write_text(f"[{ENTRY_POINT_GROUP}]\n{lines}")
+        (info / "entry_points.txt").write_bytes(entry_points)
 
     def module(self, name: str, mode: str = "fake", extra: str = "") -> None:
         source = _FAKE_BASE.format(marker=str(self.root), mode=mode)
@@ -536,20 +548,38 @@ class _Installer:
             sys.modules.pop(name, None)
 
 
+def _fake_modules_loaded() -> list[str]:
+    return [name for name in sys.modules if name.endswith("mode_mod")]
+
+
 @pytest.fixture
 def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Installer]:
+    # A fake module left by an earlier test would be reused instead of imported.
+    assert _fake_modules_loaded() == []
     installer = _Installer(tmp_path, monkeypatch)
     yield installer
     installer.cleanup()
+    assert _fake_modules_loaded() == []
+
+
+def test_installer_cleanup_removes_fake_modules(install: _Installer) -> None:
+    install.dist("fakemode", "0.1", {"fake": "fakemode_mod:FACTORY"})
+    install.module("fakemode_mod", extra="FACTORY = Factory()\n")
+    load_mode("fake")
+    assert "fakemode_mod" in sys.modules
+    install.cleanup()
+    assert "fakemode_mod" not in sys.modules
 
 
 def _plugin_entries() -> list[ModeEntry]:
     return [e for e in list_modes() if not e.builtin]
 
 
-def _ctx(factory: ModeFactory, **given: object) -> ModeContext:
+def _ctx(factory: ModeFactory, background: Any = None, **given: object) -> ModeContext:
+    """A context consistent with the factory, as the pipeline will build it."""
     options = resolve_options(factory.options, given)
-    return ModeContext(INFO, PetrifyConfig(mode=factory.name), options)
+    config = PetrifyConfig(mode=factory.name, mode_options=mode_options_from(options))
+    return ModeContext(INFO, config, options, background)
 
 
 def test_fake_plugin_is_listed_with_distribution_and_loads(install: _Installer) -> None:
@@ -856,29 +886,402 @@ def test_build_create_other_exception_becomes_mode_load_error(install: _Installe
 
 def test_build_checks_context_options(install: _Installer) -> None:
     factory = _load_fake(install, "FACTORY = Factory()\n")
-    config = PetrifyConfig(mode="fake")
-    with pytest.raises(ValueError, match="do not match"):
+    config = PetrifyConfig(mode="fake", mode_options=(("strength", 3),))
+    with pytest.raises(ValueError, match="do not match the declared options"):
         build_mode(factory, ModeContext(INFO, config, {}))
     with pytest.raises(ValueError, match="declared type"):
         build_mode(factory, ModeContext(INFO, config, {"strength": 3.0}))
 
 
-def test_build_checks_background_presence(install: _Installer) -> None:
+def test_build_accepts_consistent_context(install: _Installer) -> None:
+    factory = _load_fake(install, "FACTORY = Factory()\n")
+    config = PetrifyConfig(mode="fake", mode_options=(("strength", 3),))
+    assert build_mode(factory, ModeContext(INFO, config, {"strength": 3})).name == "fake"
+
+
+@pytest.mark.parametrize(
+    ("config", "match"),
+    [
+        (PetrifyConfig(mode="other", mode_options=(("strength", 3),)), "selects the mode"),
+        (PetrifyConfig(mode="fake", mode_options=(("strength", 9),)), "mode_options"),
+        (PetrifyConfig(mode="fake", mode_options=(("strength", 3.0),)), "mode_options"),
+        (PetrifyConfig(mode="fake"), "mode_options"),
+    ],
+)
+def test_build_requires_config_to_match_options(
+    install: _Installer, config: PetrifyConfig, match: str
+) -> None:
+    factory = _load_fake(install, "FACTORY = Factory()\n")
+    with pytest.raises(ValueError, match=match):
+        build_mode(factory, ModeContext(INFO, config, {"strength": 3}))
+
+
+def test_build_rejects_background_for_mode_without_one(install: _Installer) -> None:
     import numpy as np
 
     factory = _load_fake(install, "FACTORY = Factory()\n")
-    ctx = ModeContext(
-        INFO,
-        PetrifyConfig(mode="fake"),
-        resolve_options(factory.options, {}),
-        np.zeros((48, 64, 3), dtype=np.uint8),
-    )
     with pytest.raises(ValueError, match="does not use a background"):
-        build_mode(factory, ctx)
-    with pytest.raises(ValueError, match="needs a background"):
-        build_mode(ERASE, ModeContext(INFO, PetrifyConfig(), {}))
+        build_mode(factory, _ctx(factory, np.zeros((48, 64, 3), dtype=np.uint8)))
 
 
-def test_fake_modules_do_not_leak() -> None:
-    # Runs after the fake plugin tests (file order): their modules are gone.
-    assert not [name for name in sys.modules if name.endswith("mode_mod")]
+def test_build_requires_background_when_needed(install: _Installer) -> None:
+    factory = _load_fake(
+        install,
+        """
+        class Needy(Factory):
+            needs_background = True
+
+            def create(self, ctx, previous=None):
+                assert ctx.background is not None  # Never reached without one.
+                return FakeMode()
+        FACTORY = Needy()
+        """,
+    )
+    with pytest.raises(ValueError, match="needs a background, and the context has none"):
+        build_mode(factory, _ctx(factory))
+
+
+def test_build_needs_a_mode_context() -> None:
+    with pytest.raises(ValueError, match="needs a ModeContext"):
+        build_mode(ERASE, object())  # type: ignore[arg-type]
+
+
+def test_build_rejects_create_returning_a_class(install: _Installer) -> None:
+    factory = _load_fake(
+        install,
+        """
+        class ReturnsClass(Factory):
+            def create(self, ctx, previous=None):
+                return FakeMode
+        FACTORY = ReturnsClass()
+        """,
+    )
+    with pytest.raises(ModeLoadError, match="not a mode instance"):
+        build_mode(factory, _ctx(factory))
+
+
+@pytest.mark.parametrize(
+    "policy", ["", "First_hit", "ALL", "all ", "first-hit", None, 1, "_LyingStr('all')"]
+)
+def test_build_rejects_near_miss_detect_policy(install: _Installer, policy: object) -> None:
+    literal = policy if policy == "_LyingStr('all')" else repr(policy)
+    factory = _load_fake(
+        install,
+        f"""
+        class Near(FakeMode):
+            detect_policy = {literal}
+        FACTORY = Factory(mode_cls=Near)
+        """,
+    )
+    with pytest.raises(ModeLoadError, match="detect_policy must be"):
+        build_mode(factory, _ctx(factory))
+
+
+@pytest.mark.parametrize("policy", ["first_hit", "all"])
+def test_build_accepts_valid_detect_policy(install: _Installer, policy: str) -> None:
+    factory = _load_fake(
+        install,
+        f"""
+        class Valid(FakeMode):
+            detect_policy = {policy!r}
+        FACTORY = Factory(mode_cls=Valid)
+        """,
+    )
+    assert build_mode(factory, _ctx(factory)).detect_policy == policy  # type: ignore[attr-defined]
+
+
+def test_build_rejects_factory_kinds_that_are_plain_strings(install: _Installer) -> None:
+    # DetectionKind is a str enum, so {"persons"} == {DetectionKind.PERSONS}.
+    factory = _load_fake(
+        install,
+        """
+        class Stringy(Factory):
+            def requires(self, options):
+                return frozenset({"persons"})
+        FACTORY = Stringy()
+        """,
+    )
+    with pytest.raises(ModeLoadError, match="frozenset of DetectionKind"):
+        build_mode(factory, _ctx(factory))
+
+
+def test_build_rejects_mode_kinds_that_are_plain_strings(install: _Installer) -> None:
+    factory = _load_fake(
+        install,
+        """
+        class Stringy(FakeMode):
+            requires = frozenset({"persons"})
+        FACTORY = Factory(mode_cls=Stringy)
+        """,
+    )
+    with pytest.raises(ModeLoadError, match="frozenset of DetectionKind"):
+        build_mode(factory, _ctx(factory))
+
+
+@pytest.mark.parametrize("attr", ["requires", "mandatory"])
+def test_build_rejects_mutable_set_on_mode(install: _Installer, attr: str) -> None:
+    kinds = "{DetectionKind.PERSONS}" if attr == "requires" else "set()"
+    factory = _load_fake(
+        install,
+        f"""
+        class Mutable(FakeMode):
+            {attr} = {kinds}
+        FACTORY = Factory(mode_cls=Mutable)
+        """,
+    )
+    with pytest.raises(ModeLoadError, match=f"{attr} must be a frozenset"):
+        build_mode(factory, _ctx(factory))
+
+
+def test_build_bad_repr_of_factory_result_is_mode_load_error(install: _Installer) -> None:
+    # A ValueError raised while describing a faulty result must not pass for a
+    # rejected setting.
+    factory = _load_fake(
+        install,
+        """
+        class BadRepr:
+            def __repr__(self):
+                raise ValueError("repr broke")
+
+        class Odd(Factory):
+            def requires(self, options):
+                return BadRepr()
+        FACTORY = Odd()
+        """,
+    )
+    with pytest.raises(ModeLoadError, match="BadRepr object"):
+        build_mode(factory, _ctx(factory))
+
+
+@pytest.mark.parametrize("method", ["requires", "mandatory"])
+def test_build_value_error_from_kind_methods_propagates(install: _Installer, method: str) -> None:
+    factory = _load_fake(
+        install,
+        f"""
+        class Picky(Factory):
+            def {method}(self, options):
+                raise ValueError("not with these options")
+        FACTORY = Picky()
+        """,
+    )
+    with pytest.raises(ValueError, match="not with these options") as info:
+        build_mode(factory, _ctx(factory))
+    assert not isinstance(info.value, ModeLoadError)
+
+
+def test_load_rejects_str_subclass_factory_name(install: _Installer) -> None:
+    install.dist("fakemode", "0.1", {"fake": "fakemode_mod:FACTORY"})
+    install.module("fakemode_mod", extra="FACTORY = Factory(name=_LyingStr('fake'))\n")
+    with pytest.raises(ModeLoadError, match="does not match the registered name"):
+        load_mode("fake")
+
+
+def test_load_strips_spaces_in_stored_target(install: _Installer) -> None:
+    install.module("fakemode_mod", extra="FACTORY = Factory()\n")
+    entry = ModeEntry("fake", " fakemode_mod : FACTORY ", "fakemode", "0.1", False, None)
+    assert load_mode("fake", [entry]).name == "fake"
+
+
+# ----------------------------------------------------------------------
+# Load-time failures always become ModeLoadError
+# ----------------------------------------------------------------------
+
+
+def test_plugin_calling_sys_exit_at_import(install: _Installer) -> None:
+    install.dist("fakemode", "0.1", {"fake": "fakemode_mod:FACTORY"})
+    install.raw_module(
+        "fakemode_mod",
+        """
+        import argparse
+        argparse.ArgumentParser().parse_args(["--no-such-flag"])
+        """,
+    )
+    with pytest.raises(ModeLoadError, match="SystemExit"):
+        load_mode("fake")
+
+
+def test_plugin_exception_with_raising_str(install: _Installer) -> None:
+    install.dist("fakemode", "0.1", {"fake": "fakemode_mod:FACTORY"})
+    install.raw_module(
+        "fakemode_mod",
+        """
+        class Weird(Exception):
+            def __str__(self):
+                raise RuntimeError("str broke")
+        raise Weird()
+        """,
+    )
+    with pytest.raises(ModeLoadError, match="Weird: <Weird object>"):
+        load_mode("fake")
+
+
+def test_plugin_error_message_is_capped(install: _Installer) -> None:
+    install.dist("fakemode", "0.1", {"fake": "fakemode_mod:FACTORY"})
+    install.raw_module("fakemode_mod", "raise RuntimeError('x' * 100_000)\n")
+    with pytest.raises(ModeLoadError) as info:
+        load_mode("fake")
+    assert len(str(info.value)) < 1000
+
+
+def test_build_create_error_message_is_capped(install: _Installer) -> None:
+    factory = _load_fake(
+        install,
+        """
+        class Loud(Factory):
+            def create(self, ctx, previous=None):
+                raise RuntimeError("y" * 100_000)
+        FACTORY = Loud()
+        """,
+    )
+    with pytest.raises(ModeLoadError) as info:
+        build_mode(factory, _ctx(factory))
+    assert len(str(info.value)) < 1000
+
+
+# ----------------------------------------------------------------------
+# Discovery never raises
+# ----------------------------------------------------------------------
+
+
+def _malformed_neighbours(install: _Installer) -> None:
+    install.dist("fakemode", "0.1", {"fake": "fakemode_mod:FACTORY"})
+    install.module("fakemode_mod", extra="FACTORY = Factory()\n")
+    install.raw_dist("unrelated", "1.0", b"[console_scripts]\nnoequals\n")
+    install.raw_dist("badbytes", "1.0", b"[console_scripts]\nx = a:b\xff\n")
+
+
+def test_malformed_distributions_do_not_break_listing(
+    install: _Installer, caplog: pytest.LogCaptureFixture
+) -> None:
+    _malformed_neighbours(install)
+    with caplog.at_level("WARNING", logger="petrify.core.registry"):
+        entries = list_modes()
+    names = [e.name for e in entries]
+    assert names[0] == "erase" and "fake" in names
+    assert load_mode("fake", entries).name == "fake"
+    assert load_mode("erase") is ERASE
+    warned = " ".join(record.getMessage() for record in caplog.records)
+    assert "unrelated" in warned and "badbytes" in warned
+
+
+def test_malformed_distributions_do_not_break_default_loading(install: _Installer) -> None:
+    _malformed_neighbours(install)
+    assert load_mode("fake").name == "fake"
+
+
+def test_builtin_loads_when_discovery_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.metadata
+
+    def boom() -> Any:
+        raise OSError("metadata unreadable")
+
+    monkeypatch.setattr(importlib.metadata, "distributions", boom)
+    assert list_modes() == list_modes([])
+
+    def no_listing(*args: object) -> Any:
+        raise AssertionError("list_modes must not run for a built-in")
+
+    monkeypatch.setattr(registry, "list_modes", no_listing)
+    assert load_mode("erase") is ERASE
+
+
+def test_discovery_keeps_first_distribution_on_path(
+    install: _Installer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = install.root / "first"
+    install.dist("fake_mode", "0.2", {"fake": "fakemode_mod:FACTORY"}, root=first)
+    install.dist("Fake.Mode", "0.1", {"stale": "fakemode_mod:FACTORY"})
+    monkeypatch.syspath_prepend(str(first))
+    plugins = [e for e in _plugin_entries() if e.name in ("fake", "stale")]
+    assert [(e.name, e.version) for e in plugins] == [("fake", "0.2")]
+
+
+# ----------------------------------------------------------------------
+# Listing details
+# ----------------------------------------------------------------------
+
+
+def test_extras_syntax_is_accepted() -> None:
+    entry = list_modes([_ep("blur", "blurmod:FACTORY [gpu]")])[1]
+    assert entry.problem is None
+    assert entry.target == "blurmod:FACTORY"
+
+
+def test_installed_extras_syntax_is_accepted(install: _Installer) -> None:
+    install.dist("fakemode", "0.1", {"fake": "fakemode_mod:FACTORY [gpu]"})
+    install.module("fakemode_mod", extra="FACTORY = Factory()\n")
+    assert load_mode("fake").name == "fake"
+
+
+def test_problem_strings_are_capped() -> None:
+    entries = list_modes([_ep("x" * 200_000), _ep("blur", "y" * 200_000)])
+    assert all(e.problem is not None and len(e.problem) < 300 for e in entries[1:])
+
+
+def test_ambiguity_names_the_targets() -> None:
+    entries = list_modes([_ep("blur", "one:F"), _ep("blur", "two:F")])
+    problem = entries[1].problem
+    assert problem is not None and "'one:F'" in problem and "'two:F'" in problem
+
+
+def test_installed_ambiguity_within_one_distribution(install: _Installer) -> None:
+    install.raw_dist(
+        "fakemode", "0.1", f"[{ENTRY_POINT_GROUP}]\ndup = one:F\ndup = two:F\n".encode()
+    )
+    dup = [e for e in _plugin_entries() if e.name == "dup"]
+    assert len(dup) == 2
+    assert all(
+        e.problem is not None and "fakemode 0.1 as 'one:F'" in e.problem for e in dup
+    )
+
+
+# ----------------------------------------------------------------------
+# Guards in the option helpers and the context
+# ----------------------------------------------------------------------
+
+
+def test_resolve_option_text_strips_key() -> None:
+    assert resolve_option_text(SPECS, [" count =4"])["count"] == 4
+
+
+def test_resolve_option_text_rejects_non_text() -> None:
+    with pytest.raises(ValueError, match="KEY=VALUE"):
+        resolve_option_text(SPECS, [3])  # type: ignore[list-item]
+
+
+def test_resolve_options_requires_mapping() -> None:
+    with pytest.raises(ValueError, match="must be a mapping"):
+        resolve_options(SPECS, [("count", 3)])  # type: ignore[arg-type]
+
+
+def test_mode_context_requires_mapping() -> None:
+    with pytest.raises(TypeError, match="must be a mapping"):
+        ModeContext(INFO, PetrifyConfig(), [("a", 1)])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("key", [1, _LyingStr("a"), None])
+def test_mode_context_rejects_non_str_keys(key: Any) -> None:
+    with pytest.raises(TypeError, match="keys must be strings"):
+        ModeContext(INFO, PetrifyConfig(), {key: 1, "b": 2})
+
+
+@pytest.mark.parametrize("text", ["1_000", "١٢", "inf", "-inf", "nan", "0x10", "1e"])
+def test_float_parse_is_ascii_strict(text: str) -> None:
+    spec = OptionSpec("level", "float", 0.0, "level")
+    with pytest.raises(ValueError, match="option 'level'"):
+        spec.parse(text)
+
+
+@pytest.mark.parametrize(("text", "expected"), [("1e2", 100.0), (".5", 0.5), ("-2.", -2.0)])
+def test_float_parse_accepts_plain_forms(text: str, expected: float) -> None:
+    assert OptionSpec("level", "float", 0.0, "level").parse(text) == expected
+
+
+def test_int_parse_of_huge_text_names_the_option() -> None:
+    with pytest.raises(ValueError, match="option 'count'"):
+        INT.parse("9" * 10_000)
+
+
+def test_float_parse_of_huge_text_names_the_option() -> None:
+    with pytest.raises(ValueError, match="option 'ratio'"):
+        FLOAT.parse("9" * 10_000)
