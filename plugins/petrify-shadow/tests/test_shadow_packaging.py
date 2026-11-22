@@ -27,12 +27,14 @@ import pytest
 from conftest import ShadowEntryPoint, read_pyproject
 from petrify_shadow import SHADOW, __version__
 from petrify_shadow.mode import ShadowMode
+from petrify_shadow.options import OPTIONS, parse_params
 
 import petrify.pipeline as pipeline
 from petrify.core import Frame, PetrifyConfig
+from petrify.core.config import mode_options_from
 from petrify.core.detections import Box, DetectionKind, Detections
 from petrify.core.frame import SourceInfo
-from petrify.core.plugin import ModeContext
+from petrify.core.plugin import ModeContext, resolve_options
 from petrify.core.registry import ENTRY_POINT_GROUP, build_mode, list_modes, load_mode
 from petrify.pipeline import OutputConfig, run_stream
 from tests.test_run_stream import FakeSource, ListSink, Scene, _live_config
@@ -79,30 +81,37 @@ def test_load_mode_returns_the_shadow_factory(shadow_entry_point: ShadowEntryPoi
     assert load_mode("shadow") is SHADOW
 
 
+def _default_ctx() -> ModeContext:
+    options = resolve_options(OPTIONS, {})
+    config = PetrifyConfig(mode="shadow", mode_options=mode_options_from(options))
+    return ModeContext(INFO, config, options)
+
+
 def test_build_mode_accepts_the_shadow_mode(shadow_entry_point: ShadowEntryPoint) -> None:
     factory = load_mode("shadow")
-    ctx = ModeContext(INFO, PetrifyConfig(mode="shadow"), {})
+    ctx = _default_ctx()
     mode = build_mode(factory, ctx)
     assert isinstance(mode, ShadowMode)
-    assert mode.requires == frozenset({DetectionKind.MOTION, DetectionKind.PERSONS})
+    # The default style is facebox, a face style.
+    assert mode.requires == frozenset({
+        DetectionKind.MOTION, DetectionKind.PERSONS, DetectionKind.FACES, DetectionKind.LANDMARKS,
+    })
     assert mode.detect_policy == "all"
-    # Nothing can differ between two shadow modes yet, so the previous one is kept.
+    # The same options give equal params, so the previous mode is kept.
     assert build_mode(factory, ctx, mode) is mode
 
 
 def test_factory_mode_and_entry_point_share_the_name_shadow(
     shadow_entry_point: ShadowEntryPoint,
 ) -> None:
-    mode = SHADOW.create(ModeContext(INFO, PetrifyConfig(mode="shadow"), {}))
+    mode = SHADOW.create(_default_ctx())
     assert shadow_entry_point.name == SHADOW.name == mode.name == "shadow"
 
 
 def test_factory_declares_a_region_mode_without_background_or_roi() -> None:
-    assert SHADOW.options == ()
+    assert SHADOW.options is OPTIONS
     assert SHADOW.needs_background is False
     assert SHADOW.roi_overlay is False
-    assert SHADOW.mandatory({}) == frozenset()
-    assert SHADOW.weakened({}) == ()
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +121,14 @@ def test_factory_declares_a_region_mode_without_background_or_roi() -> None:
 
 def test_stub_returns_the_input_itself_without_a_subject() -> None:
     frame = _frame()
-    assert ShadowMode().render(frame, Detections(), False) is frame.image
+    assert ShadowMode(parse_params({})).render(frame, Detections(), False) is frame.image
 
 
 def test_stub_returns_a_new_black_frame_with_a_subject() -> None:
     frame = _frame()
     frame.image.flags.writeable = False  # Any write to the input raises.
     before = frame.image.copy()
-    out = ShadowMode().render(frame, Detections(), True)
+    out = ShadowMode(parse_params({})).render(frame, Detections(), True)
     assert type(out) is np.ndarray
     assert out.shape == frame.image.shape
     assert out.dtype == frame.image.dtype
@@ -140,7 +149,11 @@ def test_run_stream_with_the_stub(
     shadow_entry_point: ShadowEntryPoint, caplog: pytest.LogCaptureFixture
 ) -> None:
     persons = FakePersons({i: PERSON for i in range(SCENE.enter, SCENE.gone)})
-    config = _live_config("running", mode="shadow", detector="person")
+    # bodybox needs only person boxes, which the fake detector provides; the
+    # default facebox would need the YuNet face detector.
+    config = _live_config(
+        "running", mode="shadow", detector="person", mode_options=(("styles", ("bodybox",)),)
+    )
     src = FakeSource(SCENE)
     sink = ListSink()
     with (
