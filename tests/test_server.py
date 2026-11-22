@@ -27,6 +27,8 @@ pytest.importorskip("uvicorn")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from petrify.core import FrameMeta, PetrifyConfig, SourceInfo  # noqa: E402
+from petrify.core.plugin import OptionSpec  # noqa: E402
+from petrify.core.registry import ModeEntry  # noqa: E402
 from petrify.server import app as server_app  # noqa: E402
 from petrify.server.app import (  # noqa: E402
     MAX_BODY_BYTES,
@@ -986,7 +988,10 @@ def _js_code() -> str:
 
 @pytest.mark.parametrize(
     "sink",
-    ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"],
+    ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function",
+     "createContextualFragment", "DOMParser", "srcdoc", "javascript:", "`", ".style",
+     'setAttribute("style"', "setAttribute(\"on", "Function(",
+     "setHTMLUnsafe", "parseHTMLUnsafe"],
 )
 def test_t3_app_js_has_no_html_or_code_sinks(sink: str) -> None:
     js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
@@ -1018,3 +1023,206 @@ def test_t4_fragment_is_stripped_from_the_address_bar() -> None:
     body = code[code.index("function readToken()") : code.index("return value;")]
     assert statement.search(body)
     assert body.index("window.location.hash") < statement.search(body).start()  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# T13: the mode and its options through the API and on the page
+# ---------------------------------------------------------------------------
+
+MODE_SPECS = (
+    OptionSpec("ratio", "float", 0.5, "How much <b>ratio</b>.", minimum=0.0, maximum=2.0,
+               runtime=True),
+    OptionSpec("shape", "choice", "box", "Fixed shape.", choices=("box", "ellipse")),
+)
+
+
+class _Factory:
+    name = "fake"
+    summary = "A fake mode."
+    options = MODE_SPECS
+
+    def weakened(self, options: Any) -> tuple[str, ...]:
+        return ("The ratio is high.",) if options["ratio"] > 1 else ()
+
+
+def _mode_control() -> RunControl:
+    config = PetrifyConfig(mode="fake", mode_options=(("ratio", 0.5), ("shape", "box")))
+    modes = (
+        ModeEntry("erase", "petrify.modes.erase:ERASE", None, None, True, None),
+        ModeEntry("fake", "fake_mod:F", "petrify-fake", "1.0", False, None),
+    )
+    return RunControl(config, (W, H), modes=modes, factory=_Factory())  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def mode_client() -> Iterator[tuple[TestClient, RunControl]]:
+    control = _mode_control()
+    _ended(control)
+    app = create_app(control, ScriptedFeed([]), token=TOKEN, port=PORT)  # type: ignore[arg-type]
+    with _client(app) as c:
+        yield c, control
+
+
+MODE_PATCH = b'{"mode_options": {"ratio": 2}}'
+
+
+def test_t13_state_returns_the_mode_and_the_modes(
+    mode_client: tuple[TestClient, RunControl],
+) -> None:
+    c, _ = mode_client
+    data = c.get("/api/state", headers=AUTH).json()
+    assert data["mode"]["name"] == "fake"
+    assert data["mode"]["origin"] == "petrify-fake 1.0"
+    assert data["mode"]["builtin"] is False
+    assert data["mode"]["options"][0] == {
+        "name": "ratio", "kind": "float", "value": 0.5, "default": 0.5, "choices": [],
+        "minimum": 0.0, "maximum": 2.0, "help": "How much <b>ratio</b>.", "runtime": True,
+    }
+    assert data["mode"]["options"][1]["runtime"] is False
+    assert [m["name"] for m in data["modes"]["listed"]] == ["erase", "fake"]
+    assert [m["active"] for m in data["modes"]["listed"]] == [False, True]
+    assert data["modes"]["omitted"] == 0
+    # The default control (no factory) keeps the old shape: see test_state_shape.
+
+
+def test_t13_mode_options_patch_round_trip(mode_client: tuple[TestClient, RunControl]) -> None:
+    c, control = mode_client
+    response = c.patch("/api/config", content=MODE_PATCH,
+                       headers={**AUTH, **JSON, "Origin": ORIGIN})
+    assert response.status_code == 200
+    options = response.json()["config"]["mode_options"]
+    assert options == {"ratio": 2.0, "shape": "box"}
+    assert "2.0" in response.text  # Stored as a float, not the int that was sent.
+    pending = control.take_pending()
+    assert pending is not None and pending.mode_options == (("ratio", 2.0), ("shape", "box"))
+    assert type(pending.mode_options_dict()["ratio"]) is float
+    control.report_applied(pending)
+    # The loop publishes the applied config after the next frame.
+    control.publish(RunSnapshot(config=config_to_dict(control.applied), ended=True))
+    data = c.get("/api/state", headers=AUTH).json()
+    assert data["mode"]["options"][0]["value"] == 2.0
+    assert data["config"]["mode_options"] == {"ratio": 2.0, "shape": "box"}
+    assert data["weakened"] == ["The ratio is high."]
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (b'{"mode_options": {"ratio": 3}}', "mode_options.ratio must be a number from 0 to 2"),
+        (b'{"mode_options": {"ratio": true}}', "mode_options.ratio must be a number"),
+        (b'{"mode_options": {"shape": "ellipse"}}', "mode_options.shape cannot be changed"),
+        (b'{"mode_options": {"<b>x</b>": 1}}', "mode option that does not exist"),
+        (b'{"mode_options": {"__proto__": 1}}', "mode option that does not exist"),
+        (b'{"mode_options": [1]}', "mode_options must be an object"),
+        (b'{"mode": "erase"}', "The mode cannot be changed"),
+    ],
+)
+def test_t13_invalid_mode_options_patch_is_a_422_like_other_patches(
+    mode_client: tuple[TestClient, RunControl], body: bytes, message: str
+) -> None:
+    c, control = mode_client
+    response = c.patch("/api/config", content=body, headers={**AUTH, **JSON})
+    assert response.status_code == 422
+    payload = response.json()
+    assert set(payload) == {"error"}
+    assert message in payload["error"]
+    assert "<b>" not in response.text
+    assert control.take_pending() is None
+
+
+def test_t13_mode_options_patch_without_a_factory_is_a_422(client: TestClient,
+                                                          control: RunControl) -> None:
+    response = client.patch("/api/config", content=MODE_PATCH, headers={**AUTH, **JSON})
+    assert response.status_code == 422
+    assert "does not report its mode" in response.json()["error"]
+    assert control.take_pending() is None
+
+
+@pytest.mark.parametrize(
+    ("headers", "status", "error"),
+    [
+        ({}, 401, "Unauthorized"),
+        ({"Authorization": "Bearer wrong-token-wrong-token-wrong"}, 401, "Unauthorized"),
+        ({**AUTH, "host": "evil.example"}, 400, "Bad request"),
+        ({**AUTH, "host": f"localhost:{PORT}"}, 400, "Bad request"),
+        ({**AUTH, "Origin": "http://evil.example"}, 403, "Forbidden"),
+        ({**AUTH, "Origin": f"http://localhost:{PORT}"}, 403, "Forbidden"),
+        ({**AUTH, "Origin": "null"}, 403, "Forbidden"),
+    ],
+    ids=["no-token", "wrong-token", "wrong-host", "localhost-host", "foreign-origin",
+         "localhost-origin", "null-origin"],
+)
+def test_t13_mode_options_patch_is_refused_like_other_patches(
+    mode_client: tuple[TestClient, RunControl], headers: dict[str, str], status: int, error: str
+) -> None:
+    c, control = mode_client
+    response = c.patch("/api/config", content=MODE_PATCH, headers={**JSON, **headers})
+    assert response.status_code == status
+    assert response.json() == {"error": error}
+    assert control.take_pending() is None
+    # The same refusal as an ordinary patch.
+    other = c.patch("/api/config", content=b'{"engine": {"lookahead": 5}}',
+                    headers={**JSON, **headers})
+    assert (other.status_code, other.json()) == (status, {"error": error})
+    assert control.take_pending() is None
+
+
+def test_t13_served_static_files_and_csp_are_unchanged(
+    mode_client: tuple[TestClient, RunControl],
+) -> None:
+    c, _ = mode_client
+    for path, name in (("/", "index.html"), ("/static/app.js", "app.js"),
+                       ("/static/app.css", "app.css")):
+        response = c.get(path)
+        assert response.status_code == 200
+        assert response.content == (STATIC_DIR / name).read_bytes()
+        assert response.headers["content-security-policy"] == (
+            "default-src 'self'; img-src 'self'; frame-ancestors 'none'; "
+            "base-uri 'none'; form-action 'none'"
+        )
+
+
+def test_t13_page_has_the_mode_section() -> None:
+    text = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    tags = {attrs.get("id"): (tag, attrs) for tag, attrs in _page().tags if attrs.get("id")}
+    assert "hidden" in tags["mode-section"][1]  # Shown only when the state has a mode.
+    assert "hidden" in tags["mode-plugin-notice"][1]
+    for needle in ("receives the unprocessed frames", "The mode cannot be changed during a run",
+                   "This mode has no options.", "Installed modes"):
+        assert needle in text, needle
+    assert tags["mode-list"][0] == "ul" and tags["mode-options"][0] == "div"
+    # The settings controls are unchanged: the mode controls are built by the script.
+    assert text.index('id="mode-section"') < text.index('id="settings"')
+
+
+def test_t13_page_reads_only_fields_the_snapshot_has() -> None:
+    js = _js_code()
+    data = _mode_control().snapshot().to_dict()
+    mode, modes = data["mode"], data["modes"]
+    checks = {
+        r"\bmode\.(\w+)": set(mode),
+        r"\bmodes\.(\w+)": set(modes),
+        r"\bopt\.(\w+)": set(mode["options"][0]),
+        r"\bitem\.(\w+)": set(modes["listed"][0]),
+    }
+    for pattern, keys in checks.items():
+        found = set(re.findall(pattern, js))
+        assert found, pattern
+        assert found <= keys, (pattern, found - keys)
+    assert "state.mode, state.modes" in js
+
+
+def test_t13_app_js_treats_option_names_as_data() -> None:
+    js = _js_code()
+    mode_code = js[js.index("var modeShape") : js.index("function render(state)")]
+    # No bracket access keyed by a name, no selector or id built from one.
+    assert not re.search(r"[\w)\]]\[[^\]]*\bname\b", js)
+    assert not re.search(r"querySelector(All)?\([^)]*\+", js)
+    assert not re.search(r"\$\([^)]*name", js)
+    assert not re.search(r"\.id\s*=\s*[^;]*name", js)
+    # The patch object has no prototype, and the name is defined as an own property.
+    assert "Object.create(null)" in mode_code
+    assert "Object.defineProperty(values, String(entry.opt.name)" in mode_code
+    # Untrusted text goes through textContent only.
+    assert "textContent" in mode_code
+    assert not re.search(r"\.(innerHTML|outerHTML|innerText)\b", js)

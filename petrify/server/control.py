@@ -27,6 +27,12 @@ detector able to fire (see :func:`apply_patch`), and a manual ROI box may cover
 at most the run's ``roi.max_area_cap`` of the frame, because the ROI region is
 shown live. Settings that still weaken the protection are listed in
 :attr:`RunSnapshot.weakened` (see :func:`weakened_protections`).
+
+When the control is given the run's mode factory, the page also sees the
+installed modes and the active mode's options (:attr:`RunSnapshot.mode` and
+:attr:`RunSnapshot.modes`), and a patch may change the options the mode marks
+``runtime``. Every string that comes from a plugin or from package metadata is
+untrusted: it is reduced to plain text and capped (see :func:`untrusted_text`).
 """
 
 from __future__ import annotations
@@ -35,12 +41,24 @@ import dataclasses
 import logging
 import math
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from petrify.core.config import BackgroundDiffConfig, PetrifyConfig, RoiConfig
+from petrify.core.config import (
+    BackgroundDiffConfig,
+    OptionValue,
+    PetrifyConfig,
+    RoiConfig,
+    mode_options_from,
+)
+from petrify.core.plugin import OptionSpec, _safe_text, check_option_specs
+from petrify.core.registry import BUILTIN_MODES
+
+if TYPE_CHECKING:
+    from petrify.core.plugin import ModeFactory
+    from petrify.core.registry import ModeEntry
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +92,23 @@ MAX_MIN_CONFIDENCE = 2.0
 MAX_SCALE = 1.5
 # A manual ROI larger than this share of the frame is listed as weakened.
 ROI_WEAKENED_SHARE = 0.05
+
+# Length caps for untrusted text (from a plugin or from package metadata).
+NAME_TEXT_LIMIT = 64
+ORIGIN_TEXT_LIMIT = 120
+SUMMARY_TEXT_LIMIT = 200
+HELP_TEXT_LIMIT = 300
+PROBLEM_TEXT_LIMIT = 300
+WEAKENED_TEXT_LIMIT = 300
+# At most this many installed modes are listed, and at most this many sentences
+# are taken from the mode's own weakened list.
+MAX_LISTED_MODES = 50
+MAX_MODE_WEAKENED = 10
+# Shown, as a weakened protection, when the mode cannot report its own list.
+MODE_WEAKENED_UNKNOWN = (
+    "The mode {name} could not report which protections its current options weaken; "
+    "treat its options as possibly weakening the protection."
+)
 
 # Top-level config keys that exist but are fixed for the whole run.
 _FIXED_SECTIONS = {
@@ -166,19 +201,28 @@ def apply_patch(
     patch: Any,
     frame_size: tuple[int, int],
     differ_defaults: BackgroundDiffConfig,
+    *,
+    mode_specs: tuple[OptionSpec, ...] | None = None,
 ) -> PetrifyConfig:
     """Return ``config`` with the partial update ``patch`` applied, or raise ``ValueError``.
 
-    ``patch`` mirrors the config's JSON shape, restricted to :data:`RUNTIME_FIELDS`::
+    ``patch`` mirrors the config's JSON shape, restricted to :data:`RUNTIME_FIELDS`
+    and the mode's runtime options::
 
         {"detector": "both",
          "motion": {"threshold": 300},
          "background_diff": {"enabled": true, "pixel_threshold": 30},
          "engine": {"lookahead": 20, "frame_budget_ms": null},
-         "roi": "disabled"}          # or [x, y, w, h]
+         "roi": "disabled",          # or [x, y, w, h]
+         "mode_options": {"strength": 4}}
 
     Nothing is applied unless every entry is valid. ``differ_defaults`` supplies
     the thresholds when the background differ is turned on without them.
+
+    ``mode_specs`` are the active mode's option specs; ``mode_options`` is
+    rejected when it is None (the control does not know the mode). Only an
+    option declared there with ``runtime`` set is accepted, and its value is
+    stored as the spec's ``validate`` returns it (see :func:`_mode_options_patch`).
 
     The ranges keep each detector meaningful: an area threshold is at most
     :data:`MAX_AREA_SHARE` of the downsampled ``frame_size`` its detector works
@@ -199,7 +243,9 @@ def apply_patch(
             _fail("The update contains a setting that does not exist")
         if key in _FIXED_SECTIONS:
             _fail(f"{_FIXED_SECTIONS[key].capitalize()} cannot be changed while the run is in progress")
-        if key not in ("detector", "motion", "person", "background_diff", "engine", "roi"):
+        if key not in (
+            "detector", "motion", "person", "background_diff", "engine", "roi", "mode_options"
+        ):
             _fail("The update contains a setting that does not exist")
 
     if "detector" in patch:
@@ -301,7 +347,60 @@ def apply_patch(
     if "roi" in patch:
         changes["roi"] = _roi(config.roi, patch["roi"], frame_size)
 
+    if "mode_options" in patch:
+        changes["mode_options"] = _mode_options_patch(config, patch["mode_options"], mode_specs)
+
     return dataclasses.replace(config, **changes)
+
+
+def _expected(spec: OptionSpec) -> str:
+    """What a valid value of ``spec`` is, for an error message (never the given value)."""
+    if spec.kind == "bool":
+        return "true or false"
+    if spec.kind in ("int", "float"):
+        what = "a whole number" if spec.kind == "int" else "a number"
+        low, high = spec.minimum, spec.maximum
+        if low is not None and high is not None:
+            return f"{what} from {_num(low)} to {_num(high)}"
+        if low is not None:
+            return f"{what} of at least {_num(low)}"
+        if high is not None:
+            return f"{what} of at most {_num(high)}"
+        return what
+    if spec.kind == "choice":
+        return "one of: " + ", ".join(spec.choices)
+    return "a list of distinct entries from: " + ", ".join(spec.choices)
+
+
+def _mode_options_patch(
+    config: PetrifyConfig, value: Any, specs: tuple[OptionSpec, ...] | None
+) -> tuple[tuple[str, OptionValue], ...]:
+    """Return ``config.mode_options`` with the runtime option changes in ``value``.
+
+    Every option already in the config is kept; the changed ones get the value
+    their spec's ``validate`` returns (so ``1`` for a float option is ``1.0``).
+    An unknown option name is not echoed; a known one is (it matches the name
+    pattern). The given value is never echoed.
+    """
+    if specs is None:
+        _fail("The mode options cannot be changed: this run does not report its mode")
+    if not isinstance(value, dict):
+        _fail("mode_options must be an object")
+    by_name = {spec.name: spec for spec in specs}
+    changed: dict[str, OptionValue] = {}
+    for name, given in value.items():
+        spec = by_name.get(name) if isinstance(name, str) else None
+        if spec is None:
+            _fail("The update contains a mode option that does not exist")
+        if not spec.runtime:
+            _fail(f"mode_options.{spec.name} cannot be changed while the run is in progress")
+        try:
+            changed[spec.name] = spec.validate(given)
+        except ValueError:
+            _fail(f"mode_options.{spec.name} must be {_expected(spec)}")
+    options = config.mode_options_dict()
+    options.update(changed)
+    return mode_options_from(options)
 
 
 def _roi(current: RoiConfig, value: Any, frame_size: tuple[int, int]) -> RoiConfig:
@@ -426,6 +525,64 @@ def weakened_protections(
     return found
 
 
+# ---------------------------------------------------------------------------
+# The mode, for the page
+# ---------------------------------------------------------------------------
+
+
+def untrusted_text(value: object, limit: int) -> str:
+    """Return ``value`` as plain text of at most ``limit`` characters; never raises.
+
+    For any string a plugin or package metadata supplies. Characters that are
+    not printable (control characters, line breaks, bidirectional overrides and
+    other format characters) become spaces, runs of whitespace become one space,
+    and text over ``limit`` is cut and ends with ``...``. A value whose ``str``
+    fails becomes its type name, as in :func:`petrify.core.plugin._safe_text`.
+    """
+    raw = _safe_text(value, use_repr=False, limit=4 * limit)
+    cleaned = " ".join("".join(ch if ch.isprintable() else " " for ch in raw).split())
+    if len(cleaned) > limit:
+        cleaned = cleaned[: max(0, limit - 3)].rstrip() + "..."
+    return cleaned
+
+
+def _option_value(value: OptionValue) -> Any:
+    """An option value as JSON data: a choices tuple becomes a list of plain text."""
+    if isinstance(value, tuple):
+        return [untrusted_text(item, NAME_TEXT_LIMIT) for item in value]
+    if isinstance(value, str):
+        return untrusted_text(value, NAME_TEXT_LIMIT)
+    return value
+
+
+def _option_info(spec: OptionSpec, value: OptionValue) -> dict[str, Any]:
+    """What the page needs to show one option: kind, value, default, bounds, help, runtime."""
+    return {
+        "name": untrusted_text(spec.name, NAME_TEXT_LIMIT),
+        "kind": spec.kind,
+        "value": _option_value(value),
+        "default": _option_value(spec.default),
+        "choices": [untrusted_text(choice, NAME_TEXT_LIMIT) for choice in spec.choices],
+        "minimum": spec.minimum,
+        "maximum": spec.maximum,
+        "help": untrusted_text(spec.help, HELP_TEXT_LIMIT),
+        "runtime": spec.runtime,
+    }
+
+
+def _entry_info(entry: ModeEntry, active: bool) -> dict[str, Any]:
+    """One listed mode, from its entry point metadata only (nothing is imported)."""
+    problem = entry.problem
+    return {
+        "name": untrusted_text(entry.name, NAME_TEXT_LIMIT),
+        "origin": untrusted_text(entry.origin, ORIGIN_TEXT_LIMIT),
+        "builtin": bool(entry.builtin),
+        "selectable": problem is None,
+        "problem": None if problem is None else untrusted_text(problem, PROBLEM_TEXT_LIMIT),
+        "active": active,
+    }
+
+
 def config_to_dict(config: PetrifyConfig) -> dict[str, Any]:
     """Return ``config`` as plain JSON-safe values (tuples become lists).
 
@@ -513,6 +670,11 @@ class RunSnapshot:
     (None until one happens); it stays until another one replaces it.
     ``weakened`` lists, as plain sentences, the protections the applied config
     weakens (see :func:`weakened_protections`); :class:`RunControl` fills it in.
+
+    ``mode`` (the active mode and its options, with the applied values) and
+    ``modes`` (the installed modes) are filled in by a :class:`RunControl` that
+    was given the run's mode factory; both stay None otherwise, and
+    :meth:`to_dict` then leaves them out, so the state keeps its earlier shape.
     """
 
     config: Mapping[str, Any]
@@ -525,6 +687,8 @@ class RunSnapshot:
     ended: bool = False
     last_error: str | None = None
     weakened: tuple[str, ...] = ()
+    mode: Mapping[str, Any] | None = None
+    modes: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.config, MappingProxyType):
@@ -532,10 +696,14 @@ class RunSnapshot:
         object.__setattr__(self, "weakened", tuple(str(w) for w in self.weakened))
         if self.roi is not None:
             object.__setattr__(self, "roi", tuple(int(v) for v in self.roi))
+        for name in ("mode", "modes"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, MappingProxyType):
+                object.__setattr__(self, name, _frozen(value))
 
     def to_dict(self) -> dict[str, Any]:
         """Return the snapshot as plain JSON-safe values."""
-        return {
+        data = {
             "config": _plain(self.config),
             "stats": dataclasses.asdict(self.stats),
             "timings": _plain(dataclasses.asdict(self.timings)),
@@ -547,6 +715,10 @@ class RunSnapshot:
             "last_error": self.last_error,
             "weakened": list(self.weakened),
         }
+        if self.mode is not None:
+            data["mode"] = _plain(self.mode)
+            data["modes"] = _plain(self.modes) if self.modes is not None else None
+        return data
 
 
 class RunControl:
@@ -560,13 +732,34 @@ class RunControl:
     thresholds. The config the run started with is kept: the weakened
     protections are computed against it, and each one that a change newly
     weakens is logged once, at warning level, when that change is applied.
+
+    ``factory`` is the run's already loaded mode factory and ``modes`` the
+    listed modes (:func:`petrify.core.registry.list_modes`, metadata only). With
+    a factory, the snapshot describes the modes and the active mode's options,
+    a patch may change the options marked ``runtime``, and the sentences of
+    ``factory.weakened`` join the weakened list. Without one (the default) the
+    control behaves as before and rejects every ``mode_options`` patch. No other
+    plugin is imported: ``modes`` is read as given.
     """
 
-    def __init__(self, config: PetrifyConfig, frame_size: tuple[int, int]) -> None:
+    def __init__(
+        self,
+        config: PetrifyConfig,
+        frame_size: tuple[int, int],
+        *,
+        modes: Sequence[ModeEntry] = (),
+        factory: ModeFactory | None = None,
+    ) -> None:
         width, height = frame_size
         if width < 1 or height < 1:
             raise ValueError(f"frame_size must be positive, got {frame_size}")
         self._frame_size = (int(width), int(height))
+        self._factory = factory
+        self._specs: tuple[OptionSpec, ...] | None = None
+        self._mode_head: dict[str, Any] = {}
+        self._modes: Mapping[str, Any] | None = None
+        if factory is not None:
+            self._init_mode(config, factory, tuple(modes))
         self._lock = threading.Lock()
         self._applied = config
         self._target = config  # Latest accepted: the pending config or the applied one.
@@ -578,15 +771,99 @@ class RunControl:
         self._startup_differ = self._differ_defaults
         self._raw_preview = False
         self._weakened = self._weakened_for(config)
+        self._mode = self._mode_for(config)
         self._last_error: str | None = None
         self._stop = threading.Event()
         self._snapshot = RunSnapshot(config=config_to_dict(config))
 
+    def _init_mode(
+        self, config: PetrifyConfig, factory: ModeFactory, modes: tuple[ModeEntry, ...]
+    ) -> None:
+        """Read what the page shows about the modes once; only ``factory`` is consulted."""
+        name = factory.name
+        if type(name) is not str or name != config.mode:
+            raise ValueError(
+                f"the factory is named {_safe_text(name)}, but the run's mode is {config.mode!r}"
+            )
+        self._specs = check_option_specs(factory.options)
+        try:
+            summary = factory.summary
+        except Exception:  # noqa: BLE001 (a plugin property; the page shows no summary)
+            summary = ""
+        active = next((e for e in modes if e.name == name and e.problem is None), None)
+        builtin = active.builtin if active is not None else name in BUILTIN_MODES
+        if active is not None:
+            origin = untrusted_text(active.origin, ORIGIN_TEXT_LIMIT)
+        else:
+            origin = "built in" if builtin else "unknown origin"
+        self._mode_head = {
+            "name": untrusted_text(name, NAME_TEXT_LIMIT),
+            "origin": origin,
+            "builtin": bool(builtin),
+            "summary": untrusted_text(summary, SUMMARY_TEXT_LIMIT),
+        }
+        listed = [_entry_info(e, e is active) for e in modes[:MAX_LISTED_MODES]]
+        self._modes = _frozen(
+            {"listed": listed, "omitted": max(0, len(modes) - MAX_LISTED_MODES)}
+        )
+
+    def _options_for(self, config: PetrifyConfig) -> dict[str, OptionValue]:
+        """Every declared option: the config's value, else the default."""
+        given = config.mode_options_dict()
+        return {spec.name: given.get(spec.name, spec.default) for spec in self._specs or ()}
+
+    def _mode_for(self, config: PetrifyConfig) -> Mapping[str, Any] | None:
+        """The active mode and its options with the values of ``config``, read-only."""
+        if self._factory is None:
+            return None
+        options = self._options_for(config)
+        return _frozen({
+            **self._mode_head,
+            "options": [_option_info(spec, options[spec.name]) for spec in self._specs or ()],
+        })
+
     def _weakened_for(self, config: PetrifyConfig) -> list[tuple[str, str]]:
-        return weakened_protections(
+        found = weakened_protections(
             config, self._startup, self._frame_size, raw_preview=self._raw_preview,
             startup_differ=self._startup_differ,
         )
+        if self._factory is not None:
+            found.extend(self._mode_weakened(config))
+        return found
+
+    def _mode_weakened(self, config: PetrifyConfig) -> list[tuple[str, str]]:
+        """The sentences of ``factory.weakened`` as (key, sentence) pairs; never raises.
+
+        When the call raises, or returns anything but a tuple of strings, the list
+        holds one fixed sentence saying the mode could not report its list: an
+        empty list would read as "nothing is weakened", which is not known then.
+        """
+        factory = self._factory
+        assert factory is not None
+        options = MappingProxyType(self._options_for(config))
+        sentences: list[str] = []
+        try:
+            result = factory.weakened(options)
+            ok = isinstance(result, tuple) and all(isinstance(s, str) for s in result)
+            if ok:
+                sentences = list(result)[:MAX_MODE_WEAKENED]
+        except (Exception, SystemExit) as exc:
+            logger.warning(
+                "The mode %s could not report its weakened protections: %s",
+                self._mode_head["name"], untrusted_text(type(exc).__name__, NAME_TEXT_LIMIT),
+            )
+            ok = False
+        if not ok:
+            return [(
+                "mode_weakened_unknown",
+                MODE_WEAKENED_UNKNOWN.format(name=self._mode_head["name"]),
+            )]
+        found: list[tuple[str, str]] = []
+        for sentence in sentences:
+            text = untrusted_text(sentence, WEAKENED_TEXT_LIMIT)
+            if text and all(text != seen for _, seen in found):
+                found.append((f"mode:{text}", text))
+        return found
 
     # -- server side ----------------------------------------------------
 
@@ -599,7 +876,10 @@ class RunControl:
         """
         with self._lock:
             try:
-                new = apply_patch(self._target, patch, self._frame_size, self._differ_defaults)
+                new = apply_patch(
+                    self._target, patch, self._frame_size, self._differ_defaults,
+                    mode_specs=self._specs,
+                )
             except ValueError as exc:
                 self._last_error = str(exc)
                 raise
@@ -618,14 +898,26 @@ class RunControl:
             self._weakened = self._weakened_for(self._applied)
 
     def snapshot(self) -> RunSnapshot:
-        """Return the latest published snapshot, with the current errors and weakened list."""
+        """Return the latest published snapshot, with the current errors and weakened list.
+
+        With a mode factory, ``mode`` and ``modes`` describe the modes, with the
+        option values of the applied config.
+        """
         with self._lock:
             snap = self._snapshot
             error = self._last_error
             weakened = tuple(sentence for _, sentence in self._weakened)
-        if snap.last_error == error and snap.weakened == weakened:
+            mode = self._mode
+        if (
+            snap.last_error == error
+            and snap.weakened == weakened
+            and snap.mode is mode
+            and snap.modes is self._modes
+        ):
             return snap
-        return dataclasses.replace(snap, last_error=error, weakened=weakened)
+        return dataclasses.replace(
+            snap, last_error=error, weakened=weakened, mode=mode, modes=self._modes
+        )
 
     # -- loop side ------------------------------------------------------
 
@@ -656,6 +948,7 @@ class RunControl:
                 self._differ_defaults = config.background_diff
             before = {key for key, _ in self._weakened}
             self._weakened = self._weakened_for(config)
+            self._mode = self._mode_for(config)
             new = [sentence for key, sentence in self._weakened if key not in before]
         for sentence in new:
             logger.warning("Weakened protection: %s", sentence)

@@ -58,6 +58,35 @@
     </dl>
   </section>
 
+  <section id="mode-section" aria-labelledby="mode-title" hidden>
+    <h2 id="mode-title">Mode</h2>
+    <dl class="status">
+      <dt>Active mode</dt><dd id="mode-name">-</dd>
+      <dt>Origin</dt><dd id="mode-origin">-</dd>
+      <dt>Description</dt><dd id="mode-summary">-</dd>
+    </dl>
+    <p id="mode-plugin-notice" class="notice notice-warning" hidden>
+      This mode comes from an installed plugin. It runs in the petrify process with
+      petrify's permissions and receives the unprocessed frames, people included.
+    </p>
+    <p class="notice">
+      The mode cannot be changed during a run. To use another mode, stop this run and
+      start a new one with --mode.
+    </p>
+
+    <h3 id="mode-options-title">Mode options</h3>
+    <p id="mode-no-options" hidden>This mode has no options.</p>
+    <p id="mode-fixed-note" hidden>
+      Options marked "fixed for this run" were set when the run started and cannot be
+      changed while it is in progress.
+    </p>
+    <div id="mode-options" class="settings" aria-labelledby="mode-options-title"></div>
+
+    <h3 id="mode-list-title">Installed modes</h3>
+    <ul id="mode-list" aria-labelledby="mode-list-title"></ul>
+    <p id="mode-list-omitted" hidden></p>
+  </section>
+
   <section aria-labelledby="settings-title">
     <h2 id="settings-title">Settings</h2>
     <p class="notice">

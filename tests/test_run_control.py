@@ -19,6 +19,12 @@ from petrify.core import (
     PetrifyConfig,
     RoiConfig,
 )
+from petrify.core.config import mode_options_from
+from petrify.core.plugin import OptionSpec
+from petrify.core.registry import ModeEntry, list_modes, load_mode
+from petrify.modes.erase import ERASE
+from petrify.pipeline import OutputConfig, run_stream
+from petrify.server import control as control_module
 from petrify.server.control import (
     RUNTIME_FIELDS,
     RunControl,
@@ -26,6 +32,16 @@ from petrify.server.control import (
     RunStats,
     SourceFacts,
     config_to_dict,
+    untrusted_text,
+)
+from tests.test_run_stream import QUIET, HookSource, ListSink
+from tests.test_run_stream import H as STREAM_H
+from tests.test_run_stream import W as STREAM_W
+from tests.test_run_stream_plugins import (  # noqa: F401 (fixtures used by name)
+    PLUGIN_MODULE,
+    _plugin_config,
+    fake_persons,
+    plugin,
 )
 
 SIZE = (320, 256)
@@ -621,3 +637,473 @@ def test_w2_each_newly_weakened_protection_is_logged_once(
         f"Weakened protection: {DIFFER_OFF}",
         f"Weakened protection: {_lookahead_below(5, 10)}",
     ]
+
+
+# ---------------------------------------------------------------------------
+# T13: the run's mode, its options, and runtime option changes
+# ---------------------------------------------------------------------------
+
+FAKE_SPECS = (
+    OptionSpec("flag", "bool", False, "A runtime flag.", runtime=True),
+    OptionSpec("flag_fixed", "bool", True, "A fixed flag."),
+    OptionSpec("count", "int", 3, "A runtime count.", minimum=1, maximum=10, runtime=True),
+    OptionSpec("count_fixed", "int", 2, "A fixed count.", minimum=0, maximum=5),
+    OptionSpec("ratio", "float", 0.5, "A runtime ratio.", minimum=0.0, maximum=2.0,
+               runtime=True),
+    OptionSpec("ratio_fixed", "float", 1.0, "A fixed ratio."),
+    OptionSpec("shape", "choice", "box", "A runtime shape.", choices=("box", "ellipse"),
+               runtime=True),
+    OptionSpec("shape_fixed", "choice", "box", "A fixed shape.", choices=("box", "ellipse")),
+    OptionSpec("parts", "choices", ("face",), "Runtime parts.",
+               choices=("face", "body", "hands"), runtime=True),
+    OptionSpec("parts_fixed", "choices", (), "Fixed parts.", choices=("face", "body")),
+)
+FAKE_DEFAULTS = {spec.name: spec.default for spec in FAKE_SPECS}
+
+
+class FakeFactory:
+    """The parts of a ModeFactory that RunControl reads; records every weakened call."""
+
+    needs_background = False
+    roi_overlay = False
+
+    def __init__(self, weakened: Any = (), *, name: str = "fake",
+                 summary: Any = "A fake mode for tests.",
+                 options: tuple[OptionSpec, ...] = FAKE_SPECS) -> None:
+        self.name = name
+        self.summary = summary
+        self.options = options
+        self._weakened = weakened
+        self.calls: list[Any] = []
+
+    def weakened(self, options: Any) -> Any:
+        self.calls.append(options)
+        if callable(self._weakened):
+            return self._weakened(options)
+        return self._weakened
+
+
+def _fake_config(**options: Any) -> PetrifyConfig:
+    return PetrifyConfig(mode="fake", mode_options=mode_options_from({**FAKE_DEFAULTS, **options}))
+
+
+def _entry(name: str, *, dist: str | None = "petrify-fake", version: str | None = "1.0",
+           builtin: bool = False, problem: str | None = None) -> ModeEntry:
+    return ModeEntry(name, f"fake_mod:{name.upper()}", dist, version, builtin, problem)
+
+
+FAKE_MODES = (
+    ModeEntry("erase", "petrify.modes.erase:ERASE", None, None, True, None),
+    _entry("fake"),
+    _entry("other", dist="petrify-other", version="2.3"),
+    _entry("Bad-Name", problem="invalid mode name 'Bad-Name'"),
+)
+
+
+def _fake_control(factory: FakeFactory | None = None, **options: Any) -> RunControl:
+    return RunControl(_fake_config(**options), SIZE, modes=FAKE_MODES,
+                      factory=factory or FakeFactory())
+
+
+def _apply_mode(control: RunControl, patch: dict[str, Any]) -> PetrifyConfig:
+    accepted = control.submit(patch)
+    assert control.take_pending() is accepted
+    control.report_applied(accepted)
+    return accepted
+
+
+@pytest.mark.parametrize(
+    ("name", "given", "stored"),
+    [
+        ("flag", True, True),
+        ("count", 7, 7),
+        ("count", 7.0, 7),
+        ("count", 10, 10),
+        ("ratio", 1, 1.0),
+        ("ratio", 2, 2.0),
+        ("ratio", 0.25, 0.25),
+        ("shape", "ellipse", "ellipse"),
+        ("parts", ["body", "face"], ("body", "face")),
+        ("parts", [], ()),
+    ],
+)
+def test_mode_option_runtime_change_is_accepted_in_its_declared_type(
+    name: str, given: Any, stored: Any
+) -> None:
+    control = _fake_control()
+    accepted = control.submit({"mode_options": {name: given}})
+    options = accepted.mode_options_dict()
+    assert options[name] == stored and type(options[name]) is type(stored)
+    # Every other option is kept as it was, in the declared order and type.
+    assert {k: v for k, v in options.items() if k != name} == {
+        k: v for k, v in FAKE_DEFAULTS.items() if k != name
+    }
+    assert [k for k, _ in accepted.mode_options] == sorted(FAKE_DEFAULTS)
+    assert accepted.mode == "fake"
+    assert control.take_pending() is accepted
+
+
+def test_mode_option_changes_build_on_each_other_and_mix_with_other_settings() -> None:
+    control = _fake_control()
+    control.submit({"mode_options": {"count": 4}})
+    accepted = control.submit({"mode_options": {"ratio": 1, "flag": True},
+                               "engine": {"lookahead": 5}})
+    options = accepted.mode_options_dict()
+    assert (options["count"], options["ratio"], options["flag"]) == (4, 1.0, True)
+    assert type(options["ratio"]) is float
+    assert accepted.engine.lookahead == 5
+    assert control.take_pending() is accepted
+
+
+def test_empty_mode_options_object_changes_nothing() -> None:
+    control = _fake_control()
+    accepted = control.submit({"mode_options": {}})
+    assert accepted.mode_options == _fake_config().mode_options
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        ({"mode_options": {"nope": 1}}, "mode option that does not exist"),
+        ({"mode_options": {"__proto__": 1}}, "mode option that does not exist"),
+        ({"mode_options": {"constructor": 1}}, "mode option that does not exist"),
+        ({"mode_options": {"flag_fixed": False}}, "mode_options.flag_fixed cannot be changed"),
+        ({"mode_options": {"count_fixed": 1}}, "mode_options.count_fixed cannot be changed"),
+        ({"mode_options": {"ratio_fixed": 1.5}}, "mode_options.ratio_fixed cannot be changed"),
+        ({"mode_options": {"shape_fixed": "ellipse"}},
+         "mode_options.shape_fixed cannot be changed"),
+        ({"mode_options": {"parts_fixed": ["body"]}},
+         "mode_options.parts_fixed cannot be changed"),
+        ({"mode_options": {"flag": 1}}, "mode_options.flag must be true or false"),
+        ({"mode_options": {"flag": "true"}}, "mode_options.flag must be true or false"),
+        ({"mode_options": {"flag": None}}, "mode_options.flag must be true or false"),
+        ({"mode_options": {"count": 1.5}}, "mode_options.count must be a whole number from 1"),
+        ({"mode_options": {"count": True}}, "mode_options.count must be a whole number"),
+        ({"mode_options": {"count": "3"}}, "mode_options.count must be a whole number"),
+        ({"mode_options": {"count": 0}}, "mode_options.count must be a whole number from 1 to 10"),
+        ({"mode_options": {"count": 11}}, "mode_options.count must be a whole number from 1"),
+        ({"mode_options": {"ratio": True}}, "mode_options.ratio must be a number from 0 to 2"),
+        ({"mode_options": {"ratio": "1"}}, "mode_options.ratio must be a number"),
+        ({"mode_options": {"ratio": float("nan")}}, "mode_options.ratio must be a number"),
+        ({"mode_options": {"ratio": float("inf")}}, "mode_options.ratio must be a number"),
+        ({"mode_options": {"ratio": 2.5}}, "mode_options.ratio must be a number from 0 to 2"),
+        ({"mode_options": {"ratio": -0.1}}, "mode_options.ratio must be a number"),
+        ({"mode_options": {"shape": "circle"}}, "mode_options.shape must be one of: box, ellipse"),
+        ({"mode_options": {"shape": 1}}, "mode_options.shape must be one of"),
+        ({"mode_options": {"parts": "face"}}, "mode_options.parts must be a list of distinct"),
+        ({"mode_options": {"parts": ["face", "face"]}}, "mode_options.parts must be a list"),
+        ({"mode_options": {"parts": ["nope"]}}, "entries from: face, body, hands"),
+        ({"mode_options": []}, "mode_options must be an object"),
+        ({"mode_options": "count=3"}, "mode_options must be an object"),
+        ({"mode_options": None}, "mode_options must be an object"),
+        ({"mode_options": 1}, "mode_options must be an object"),
+        ({"mode": "other"}, "The mode cannot be changed"),
+        ({"mode": "fake", "mode_options": {"count": 4}}, "The mode cannot be changed"),
+        # A valid change next to an invalid one: nothing is applied.
+        ({"mode_options": {"count": 4, "ratio": 9}}, "mode_options.ratio must be"),
+        ({"engine": {"lookahead": 5}, "mode_options": {"count": 99}}, "mode_options.count"),
+        ({"mode_options": {"count": 4}, "engine": {"lookahead": 9999}}, "engine.lookahead"),
+    ],
+)
+def test_invalid_mode_option_patch_is_rejected_and_changes_nothing(
+    patch: dict[str, Any], message: str
+) -> None:
+    control = _fake_control()
+    base = _apply_mode(control, {"mode_options": {"count": 5}})
+    with pytest.raises(ValueError, match=message):
+        control.submit(patch)
+    assert control.take_pending() is None
+    assert control.applied is base
+    assert control.snapshot().last_error is not None
+    # The next change builds on the unchanged config.
+    after = control.submit({"detector": "motion"})
+    assert after.mode_options == base.mode_options
+    assert after.engine == base.engine
+    assert dataclasses.replace(after, detector=base.detector) == base
+
+
+def test_rejected_mode_option_patch_keeps_an_earlier_pending_change() -> None:
+    control = _fake_control()
+    first = control.submit({"mode_options": {"count": 4}})
+    with pytest.raises(ValueError):
+        control.submit({"mode_options": {"count": 0}})
+    assert control.take_pending() is first
+
+
+@pytest.mark.parametrize("value", ["<b>x</b>", 123456789, [7, 8], {"k": "v"}])
+def test_mode_option_errors_do_not_echo_the_value_or_an_unknown_name(value: Any) -> None:
+    control = _fake_control()
+    for patch in ({"mode_options": {"count": value}}, {"mode_options": {"<i>name</i>": value}}):
+        with pytest.raises(ValueError) as info:
+            control.submit(patch)
+        text = str(info.value)
+        assert "<" not in text and "123456789" not in text and "'k'" not in text
+
+
+@pytest.mark.parametrize("patch", [{"mode_options": {"count": 4}}, {"mode_options": {}},
+                                   {"mode_options": "x"}])
+def test_without_a_factory_every_mode_options_patch_is_rejected(patch: dict[str, Any]) -> None:
+    control = RunControl(_fake_config(), SIZE)
+    with pytest.raises(ValueError, match="this run does not report its mode"):
+        control.submit(patch)
+    assert control.take_pending() is None
+
+
+def test_erase_has_no_options_to_change() -> None:
+    control = RunControl(PetrifyConfig(), SIZE, modes=list_modes([]), factory=ERASE)
+    with pytest.raises(ValueError, match="mode option that does not exist"):
+        control.submit({"mode_options": {"strength": 1}})
+    assert control.take_pending() is None
+
+
+def test_factory_must_be_the_runs_mode() -> None:
+    with pytest.raises(ValueError, match="the run's mode is 'fake'"):
+        RunControl(_fake_config(), SIZE, factory=FakeFactory(name="other"))
+
+
+# -- snapshot ---------------------------------------------------------------
+
+
+def test_defaults_keep_the_old_snapshot() -> None:
+    data = _control().snapshot().to_dict()
+    assert set(data) == {"config", "stats", "timings", "source", "background", "roi",
+                         "running", "ended", "last_error", "weakened"}
+    assert _control().snapshot().mode is None and _control().snapshot().modes is None
+
+
+def test_erase_snapshot_keeps_every_existing_field_and_value() -> None:
+    plain = _control().snapshot().to_dict()
+    with_mode = RunControl(PetrifyConfig(), SIZE, modes=list_modes([]),
+                           factory=ERASE).snapshot().to_dict()
+    assert {k: v for k, v in with_mode.items() if k not in ("mode", "modes")} == plain
+    assert with_mode["mode"] == {
+        "name": "erase",
+        "origin": "built in",
+        "builtin": True,
+        "summary": ERASE.summary,
+        "options": [],
+    }
+    assert with_mode["modes"] == {
+        "listed": [{"name": "erase", "origin": "built in", "builtin": True,
+                    "selectable": True, "problem": None, "active": True}],
+        "omitted": 0,
+    }
+
+
+def test_snapshot_lists_the_modes_and_the_active_modes_options() -> None:
+    control = _fake_control()
+    data = control.snapshot().to_dict()
+    assert json.loads(json.dumps(data, allow_nan=False)) == data
+    mode = data["mode"]
+    assert (mode["name"], mode["origin"], mode["builtin"], mode["summary"]) == (
+        "fake", "petrify-fake 1.0", False, "A fake mode for tests.")
+    by_name = {opt["name"]: opt for opt in mode["options"]}
+    assert [opt["name"] for opt in mode["options"]] == [spec.name for spec in FAKE_SPECS]
+    assert by_name["count"] == {
+        "name": "count", "kind": "int", "value": 3, "default": 3, "choices": [],
+        "minimum": 1, "maximum": 10, "help": "A runtime count.", "runtime": True,
+    }
+    assert by_name["parts"] == {
+        "name": "parts", "kind": "choices", "value": ["face"], "default": ["face"],
+        "choices": ["face", "body", "hands"], "minimum": None, "maximum": None,
+        "help": "Runtime parts.", "runtime": True,
+    }
+    assert by_name["ratio_fixed"]["runtime"] is False
+    assert by_name["ratio_fixed"]["value"] == 1.0
+    assert by_name["shape"]["choices"] == ["box", "ellipse"]
+    assert data["modes"] == {
+        "listed": [
+            {"name": "erase", "origin": "built in", "builtin": True, "selectable": True,
+             "problem": None, "active": False},
+            {"name": "fake", "origin": "petrify-fake 1.0", "builtin": False,
+             "selectable": True, "problem": None, "active": True},
+            {"name": "other", "origin": "petrify-other 2.3", "builtin": False,
+             "selectable": True, "problem": None, "active": False},
+            {"name": "Bad-Name", "origin": "petrify-fake 1.0", "builtin": False,
+             "selectable": False, "problem": "invalid mode name 'Bad-Name'", "active": False},
+        ],
+        "omitted": 0,
+    }
+
+
+def test_snapshot_option_values_follow_the_applied_config() -> None:
+    control = _fake_control()
+    accepted = control.submit({"mode_options": {"count": 8, "parts": ["hands"]}})
+
+    def values() -> dict[str, Any]:
+        return {o["name"]: o["value"] for o in control.snapshot().to_dict()["mode"]["options"]}
+
+    assert values()["count"] == 3  # Accepted, not yet applied by the loop.
+    control.take_pending()
+    control.report_applied(accepted)
+    assert values()["count"] == 8 and values()["parts"] == ["hands"]
+    assert values()["count_fixed"] == 2
+
+
+def test_a_mode_without_an_entry_and_a_cap_on_listed_modes() -> None:
+    many = tuple(_entry(f"m{i}") for i in range(70))
+    control = RunControl(_fake_config(), SIZE, modes=many, factory=FakeFactory())
+    data = control.snapshot().to_dict()
+    assert data["mode"]["origin"] == "unknown origin" and data["mode"]["builtin"] is False
+    assert len(data["modes"]["listed"]) == 50 and data["modes"]["omitted"] == 20
+    assert not any(item["active"] for item in data["modes"]["listed"])
+
+
+def test_snapshot_imports_no_listed_plugin() -> None:
+    _fake_control().snapshot().to_dict()
+    assert "fake_mod" not in sys.modules
+
+
+def _is_plain(text: str, limit: int) -> bool:
+    return len(text) <= limit and all(ch.isprintable() for ch in text) and "  " not in text
+
+
+def test_untrusted_strings_are_plain_text_and_capped() -> None:
+    nasty = "<script>alert(1)</script>\n\r\t\x00\x1b[31m‮evil⁦ " * 200
+    spec = OptionSpec("count", "int", 3, nasty, runtime=True)
+    factory = FakeFactory(name="fake", summary=nasty, options=(spec,),
+                          weakened=(nasty, nasty + "x"))
+    modes = (
+        ModeEntry("fake", "m:F", nasty, nasty, False, None),
+        ModeEntry(nasty, "m:F", nasty, None, False, nasty),
+    )
+    config = PetrifyConfig(mode="fake", mode_options=(("count", 3),))
+    data = RunControl(config, SIZE, modes=modes, factory=factory).snapshot().to_dict()
+    mode = data["mode"]
+    assert _is_plain(mode["summary"], control_module.SUMMARY_TEXT_LIMIT)
+    assert _is_plain(mode["origin"], control_module.ORIGIN_TEXT_LIMIT)
+    assert _is_plain(mode["options"][0]["help"], control_module.HELP_TEXT_LIMIT)
+    assert mode["summary"].endswith("...")
+    for item in data["modes"]["listed"]:
+        assert _is_plain(item["name"], control_module.NAME_TEXT_LIMIT)
+        assert _is_plain(item["origin"], control_module.ORIGIN_TEXT_LIMIT)
+        if item["problem"] is not None:
+            assert _is_plain(item["problem"], control_module.PROBLEM_TEXT_LIMIT)
+    assert data["weakened"]
+    for sentence in data["weakened"]:
+        assert _is_plain(sentence, control_module.WEAKENED_TEXT_LIMIT)
+    assert len(data["weakened"]) == 1  # Both sentences are the same once capped.
+
+
+def test_untrusted_text_never_raises() -> None:
+    class Hostile:
+        def __str__(self) -> str:
+            raise RuntimeError("no")
+
+    assert untrusted_text(Hostile(), 40) == "<Hostile object>"
+    assert untrusted_text("a\nb​c", 40) == "a b c"
+    assert untrusted_text("x" * 50, 10) == "xxxxxxx..."
+
+
+def test_a_summary_that_cannot_be_read_shows_no_summary() -> None:
+    class Raising(FakeFactory):
+        def __getattribute__(self, name: str) -> Any:
+            if name == "summary":
+                raise RuntimeError("broken")
+            return super().__getattribute__(name)
+
+    control = RunControl(_fake_config(), SIZE, factory=Raising())
+    assert control.snapshot().to_dict()["mode"]["summary"] == ""
+
+
+# -- weakened ---------------------------------------------------------------
+
+
+def _high_count(options: Any) -> tuple[str, ...]:
+    if options["count"] > 5:
+        return (f"count is {options['count']}: fewer frames are hidden.",)
+    return ()
+
+
+def test_mode_weakened_sentences_are_listed_and_recomputed_after_each_change(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    factory = FakeFactory(_high_count)
+    control = _fake_control(factory)
+    assert control.snapshot().to_dict()["weakened"] == []
+    with caplog.at_level(logging.WARNING, logger="petrify.server.control"):
+        _apply_mode(control, {"mode_options": {"count": 8}})
+        assert control.snapshot().weakened == ("count is 8: fewer frames are hidden.",)
+        _apply_mode(control, {"mode_options": {"count": 9}})
+        _apply_mode(control, {"mode_options": {"count": 2}})
+    assert control.snapshot().weakened == ()
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert messages == [
+        "Weakened protection: count is 8: fewer frames are hidden.",
+        "Weakened protection: count is 9: fewer frames are hidden.",
+    ]
+    # The factory saw every option, read-only.
+    last = factory.calls[-1]
+    assert dict(last) == {**FAKE_DEFAULTS, "count": 2}
+    with pytest.raises(TypeError):
+        last["count"] = 1
+
+
+def test_mode_weakened_sentences_follow_the_built_in_ones() -> None:
+    factory = FakeFactory(("The mode shows faces.",))
+    control = RunControl(
+        dataclasses.replace(_fake_config(), background_diff=None), SIZE, factory=factory
+    )
+    assert control.snapshot().weakened == (DIFFER_OFF, "The mode shows faces.")
+
+
+def test_mode_weakened_is_capped_in_number() -> None:
+    factory = FakeFactory(tuple(f"Sentence {i}." for i in range(30)))
+    assert len(_fake_control(factory).snapshot().weakened) == control_module.MAX_MODE_WEAKENED
+
+
+def _raises(options: Any) -> Any:
+    raise RuntimeError("plugin bug")
+
+
+def _exits(options: Any) -> Any:
+    raise SystemExit(3)
+
+
+@pytest.mark.parametrize(
+    "weakened",
+    [_raises, _exits, ["a list"], "a string", None, ("ok", 3), (b"bytes",)],
+    ids=["raises", "system-exit", "list", "string", "none", "non-string-item", "bytes"],
+)
+def test_mode_weakened_failure_shows_a_fixed_sentence(weakened: Any) -> None:
+    control = _fake_control(FakeFactory(weakened))
+    expected = control_module.MODE_WEAKENED_UNKNOWN.format(name="fake")
+    assert control.snapshot().weakened == (expected,)
+    # The snapshot still works and is JSON-safe; a change is still accepted and applied.
+    _apply_mode(control, {"mode_options": {"count": 4}})
+    data = control.snapshot().to_dict()
+    assert data["weakened"] == [expected]
+    assert json.loads(json.dumps(data)) == data
+
+
+# -- end to end through run_stream ------------------------------------------
+
+
+@pytest.mark.usefixtures("plugin", "fake_persons")
+def test_runtime_option_change_reaches_the_mode_while_the_run_continues() -> None:
+    plugin_module = sys.modules[PLUGIN_MODULE]
+    config = _plugin_config()
+    factory = load_mode("paint")
+    control = RunControl(config, (STREAM_W, STREAM_H), modes=list_modes(), factory=factory)
+    seen: dict[str, Any] = {}
+
+    def change() -> None:
+        seen["accepted"] = control.submit({"mode_options": {"strength": 7}})
+
+    def check() -> None:
+        seen["mode"] = control.snapshot().to_dict()["mode"]
+
+    sink = ListSink()
+    report = run_stream(HookSource(QUIET, hooks={30: change, 60: check}), config,
+                        OutputConfig(), sinks=[sink], control=control)
+    assert len(sink.images) == QUIET.total  # The run went on to the end.
+    assert report.stats.reconfigurations == 1
+    strengths = [ctx.options["strength"] for ctx in plugin_module.CONTEXTS]
+    assert strengths[0] == 3 and strengths[-1] == 7
+    assert dict(plugin_module.CONTEXTS[-1].config.mode_options)["strength"] == 7
+    assert control.applied is seen["accepted"]
+    options = {opt["name"]: opt for opt in seen["mode"]["options"]}
+    assert options["strength"]["value"] == 7 and options["strength"]["runtime"] is True
+    assert options["fail"]["runtime"] is False
+    assert seen["mode"]["origin"] == "petrify-t11-plugins 0.1"
+    assert control.snapshot().last_error is None

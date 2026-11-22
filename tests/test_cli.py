@@ -1342,3 +1342,43 @@ def test_t12_building_the_run_parser_does_not_discover_modes() -> None:
         _build_run_parser().format_usage()
         args = _build_run_parser().parse_args(["--source", IN, "--mode", "erase"])
     assert args.mode == "erase"
+
+
+# ---------------------------------------------------------------------------
+# T13: the web run gives the control the loaded mode and the listed modes
+# ---------------------------------------------------------------------------
+
+
+def test_t13_web_run_control_knows_the_erase_mode(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    from petrify.modes.erase import ERASE
+
+    rs, _, _ = _web_run(["--source", IN, "--web", "--web-port", "0"], capsys, caplog)
+    data = rs.seen["kwargs"]["control"].snapshot().to_dict()  # type: ignore[attr-defined]
+    assert data["mode"] == {"name": "erase", "origin": "built in", "builtin": True,
+                            "summary": ERASE.summary, "options": []}
+    erase = [m for m in data["modes"]["listed"] if m["name"] == "erase"]
+    assert erase == [{"name": "erase", "origin": "built in", "builtin": True,
+                      "selectable": True, "problem": None, "active": True}]
+
+
+def test_t13_web_run_control_knows_a_plugin_mode_and_imports_no_other(
+    t12_plugins: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    rs, _, _ = _web_run(["--source", IN, "--web", "--web-port", "0", "--mode", "kinds",
+                         "--mode-option", "count=4"], capsys, caplog)
+    control = rs.seen["kwargs"]["control"]  # type: ignore[attr-defined]
+    data = control.snapshot().to_dict()
+    assert (data["mode"]["name"], data["mode"]["origin"], data["mode"]["builtin"]) == (
+        "kinds", T12_ORIGIN, False)
+    options = {opt["name"]: opt for opt in data["mode"]["options"]}
+    assert options["count"]["value"] == 4 and options["flag"]["runtime"] is True
+    listed = {(m["name"], m["origin"]): m for m in data["modes"]["listed"]}
+    assert listed[("kinds", T12_ORIGIN)]["active"] is True
+    assert listed[("broken", T12_ORIGIN)]["selectable"] is True
+    assert listed[("erase", T12_ORIGIN)]["selectable"] is False
+    # The runtime option is accepted through the control the page uses.
+    assert control.submit({"mode_options": {"flag": True}}).mode_options_dict()["flag"] is True
+    for name in (T12_OTHER, T12_BROKEN, T12_SLOW):
+        assert not _imported(t12_plugins, name)

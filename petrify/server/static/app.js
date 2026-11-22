@@ -154,6 +154,309 @@
     $("weakened").hidden = items.length === 0;
   }
 
+  /* The mode section. Every string in state.mode and state.modes comes from a
+     plugin or from package metadata: it is only ever set with textContent or as
+     a property value. Option names are data: controls are kept in an array in
+     the order the server lists them, never looked up or keyed by name. */
+  var modeShape = null;
+  var modeEntries = [];
+  var shownModeList = null;
+
+  function clear(el) {
+    while (el.firstChild) {
+      el.removeChild(el.firstChild);
+    }
+  }
+
+  function element(tag, className, content) {
+    var el = document.createElement(tag);
+    if (className) {
+      el.className = className;
+    }
+    if (content !== undefined) {
+      el.textContent = String(content);
+    }
+    return el;
+  }
+
+  function optionText(value) {
+    if (typeof value === "boolean") {
+      return value ? "on" : "off";
+    }
+    if (Array.isArray(value)) {
+      return value.length ? value.map(String).join(", ") : "none";
+    }
+    if (value === null || value === undefined) {
+      return "n/a";
+    }
+    return String(value);
+  }
+
+  function isNumber(value) {
+    return typeof value === "number" && isFinite(value);
+  }
+
+  function rangeText(opt) {
+    var low = isNumber(opt.minimum) ? opt.minimum : null;
+    var high = isNumber(opt.maximum) ? opt.maximum : null;
+    if (low !== null && high !== null) {
+      return low + " to " + high;
+    }
+    if (low !== null) {
+      return "at least " + low;
+    }
+    if (high !== null) {
+      return "at most " + high;
+    }
+    return "";
+  }
+
+  function optionShape(options) {
+    return JSON.stringify(options.map(function (opt) {
+      return [opt.name, opt.kind, opt.runtime, opt.choices, opt.minimum, opt.maximum, opt.help];
+    }));
+  }
+
+  function choiceList(opt) {
+    return Array.isArray(opt.choices) ? opt.choices.map(String) : [];
+  }
+
+  function buildOption(opt, index) {
+    var entry = { opt: opt, inputs: [], editing: false, timer: null };
+    var id = "mode-opt-" + index;
+    var kind = String(opt.kind);
+    var runtime = opt.runtime === true;
+    var labelText = String(opt.name) + (runtime ? "" : " (fixed for this run)");
+    var range = rangeText(opt);
+    if (range && (kind === "int" || kind === "float")) {
+      labelText += " (" + range + ")";
+    }
+    var wrap;
+    if (kind === "choices") {
+      wrap = element("fieldset");
+      wrap.appendChild(element("legend", "", labelText));
+      choiceList(opt).forEach(function (choice, j) {
+        var row = element("div", "field field-check");
+        var box = element("input");
+        box.type = "checkbox";
+        box.id = id + "-" + j;
+        box.value = choice;
+        var label = element("label", "", choice);
+        label.htmlFor = box.id;
+        row.appendChild(box);
+        row.appendChild(label);
+        wrap.appendChild(row);
+        entry.inputs.push(box);
+      });
+    } else {
+      wrap = element("div", kind === "bool" ? "field field-check" : "field");
+      var input;
+      if (kind === "bool") {
+        input = element("input");
+        input.type = "checkbox";
+      } else if (kind === "choice") {
+        input = element("select");
+        choiceList(opt).forEach(function (choice) {
+          var choiceEl = element("option", "", choice);
+          choiceEl.value = choice;
+          input.appendChild(choiceEl);
+        });
+      } else {
+        input = element("input");
+        input.type = "number";
+        input.step = kind === "int" ? "1" : "any";
+        input.inputMode = kind === "int" ? "numeric" : "decimal";
+        if (isNumber(opt.minimum)) {
+          input.min = String(opt.minimum);
+        }
+        if (isNumber(opt.maximum)) {
+          input.max = String(opt.maximum);
+        }
+      }
+      input.id = id;
+      var mainLabel = element("label", "", labelText);
+      mainLabel.htmlFor = id;
+      if (kind === "bool") {
+        wrap.appendChild(input);
+        wrap.appendChild(mainLabel);
+      } else {
+        wrap.appendChild(mainLabel);
+        wrap.appendChild(input);
+      }
+      entry.inputs.push(input);
+    }
+    entry.help = element("span", "help", opt.help ? String(opt.help) : "");
+    entry.help.id = id + "-help";
+    entry.applied = element("span", "applied");
+    entry.error = element("span", "error");
+    entry.error.id = id + "-error";
+    entry.error.setAttribute("aria-live", "polite");
+    wrap.appendChild(entry.help);
+    wrap.appendChild(entry.applied);
+    wrap.appendChild(entry.error);
+    entry.inputs.forEach(function (input) {
+      input.setAttribute("data-mode-option", "");
+      input.setAttribute("aria-describedby", entry.help.id + " " + entry.error.id);
+      input.disabled = !runtime || ended;
+      var eventName = input.tagName === "SELECT" || input.type === "checkbox" ? "change" : "input";
+      input.addEventListener(eventName, function () {
+        scheduleOption(entry);
+      });
+    });
+    entry.root = wrap;
+    return entry;
+  }
+
+  function setOption(entry, value) {
+    var kind = entry.opt.kind;
+    var first = entry.inputs[0];
+    if (kind === "bool") {
+      first.checked = value === true;
+    } else if (kind === "choices") {
+      var picked = Array.isArray(value) ? value.map(String) : [];
+      entry.inputs.forEach(function (box) {
+        box.checked = picked.indexOf(box.value) !== -1;
+      });
+    } else if (first && document.activeElement !== first) {
+      first.value = value === null || value === undefined ? "" : String(value);
+    }
+  }
+
+  function readOption(entry) {
+    var kind = entry.opt.kind;
+    var first = entry.inputs[0];
+    if (kind === "bool") {
+      return { ok: true, value: first.checked };
+    }
+    if (kind === "choice") {
+      return { ok: true, value: first.value };
+    }
+    if (kind === "choices") {
+      return {
+        ok: true,
+        value: entry.inputs.filter(function (box) {
+          return box.checked;
+        }).map(function (box) {
+          return box.value;
+        })
+      };
+    }
+    return numberValue(first, kind === "int" ? "int" : "float");
+  }
+
+  function sendOption(entry) {
+    var read = readOption(entry);
+    if (!read.ok) {
+      entry.error.textContent = "Not sent: " + read.message;
+      entry.editing = false;
+      return;
+    }
+    /* A prototype-less object with the name defined as an own property: a name
+       such as __proto__ or constructor stays an ordinary key. */
+    var values = Object.create(null);
+    Object.defineProperty(values, String(entry.opt.name), {
+      value: read.value,
+      enumerable: true
+    });
+    entry.error.textContent = "Sending...";
+    api("PATCH", "/api/config", { mode_options: values }).then(function (result) {
+      entry.editing = false;
+      if (result.status === 200) {
+        entry.error.textContent = "";
+      } else {
+        entry.error.textContent = "Rejected: " + String(result.data.error || "the change was not accepted.");
+      }
+    }).catch(function () {
+      entry.editing = false;
+      entry.error.textContent = "Not sent: petrify could not be reached.";
+    });
+  }
+
+  function scheduleOption(entry) {
+    if (ended || entry.opt.runtime !== true) {
+      return;
+    }
+    entry.editing = true;
+    if (entry.timer) {
+      window.clearTimeout(entry.timer);
+    }
+    entry.timer = window.setTimeout(function () {
+      entry.timer = null;
+      sendOption(entry);
+    }, DEBOUNCE_MS);
+  }
+
+  function showModeOptions(options) {
+    var shape = optionShape(options);
+    if (shape !== modeShape) {
+      modeShape = shape;
+      modeEntries.forEach(function (entry) {
+        if (entry.timer) {
+          window.clearTimeout(entry.timer);
+        }
+      });
+      var box = $("mode-options");
+      clear(box);
+      modeEntries = options.map(buildOption);
+      modeEntries.forEach(function (entry) {
+        box.appendChild(entry.root);
+      });
+    }
+    $("mode-no-options").hidden = options.length !== 0;
+    $("mode-fixed-note").hidden = !options.some(function (opt) {
+      return opt.runtime !== true;
+    });
+    options.forEach(function (opt, i) {
+      var entry = modeEntries[i];
+      entry.applied.textContent = "Applied: " + optionText(opt.value) +
+        " (default: " + optionText(opt.default) + ")";
+      if (!entry.editing) {
+        setOption(entry, opt.value);
+      }
+    });
+  }
+
+  function showModeList(modes) {
+    var listed = modes && Array.isArray(modes.listed) ? modes.listed : [];
+    var key = JSON.stringify(modes || null);
+    if (key === shownModeList) {
+      return;
+    }
+    shownModeList = key;
+    var ul = $("mode-list");
+    clear(ul);
+    listed.forEach(function (item) {
+      var origin = item.builtin === true ? "built in" : "plugin " + String(item.origin);
+      var status;
+      if (item.active === true) {
+        status = "the mode of this run";
+      } else if (item.selectable === true) {
+        status = "installed, can be selected when a new run starts";
+      } else {
+        status = "cannot be selected: " + String(item.problem);
+      }
+      ul.appendChild(element("li", "", String(item.name) + " (" + origin + "): " + status));
+    });
+    var omitted = modes && isNumber(modes.omitted) ? modes.omitted : 0;
+    var more = $("mode-list-omitted");
+    more.textContent = omitted ? omitted + " more installed modes are not listed." : "";
+    more.hidden = !omitted;
+  }
+
+  function showMode(mode, modes) {
+    if (!mode || typeof mode !== "object") {
+      return;
+    }
+    $("mode-section").hidden = false;
+    var builtin = mode.builtin === true;
+    text("mode-name", String(mode.name));
+    text("mode-origin", builtin ? "Built in" : "Plugin " + String(mode.origin));
+    text("mode-summary", mode.summary ? String(mode.summary) : "None given");
+    $("mode-plugin-notice").hidden = builtin;
+    showModeOptions(Array.isArray(mode.options) ? mode.options : []);
+    showModeList(modes);
+  }
+
   function render(state) {
     var stats = state.stats;
     var timings = state.timings;
@@ -181,6 +484,7 @@
     $("raw-figure").hidden = !state.raw_preview;
     showWeakened(state.weakened);
     showApplied(state.config, state);
+    showMode(state.mode, state.modes);
     if (!streamsStarted && !state.ended) {
       streamsStarted = true;
       $("stream-processed").src = "/stream.mjpg?token=" + encodeURIComponent(token);
@@ -214,6 +518,9 @@
       el.disabled = true;
     });
     document.querySelectorAll("[data-roi-part]").forEach(function (el) {
+      el.disabled = true;
+    });
+    document.querySelectorAll("[data-mode-option]").forEach(function (el) {
       el.disabled = true;
     });
     $("stop-button").disabled = true;

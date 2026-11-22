@@ -225,6 +225,24 @@ button:disabled {
   font-weight: 600;
 }
 
+h3 {
+  font-size: 1rem;
+  margin: 16px 0 4px;
+}
+
+.help {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.field-check .help {
+  grid-column: 1 / -1;
+}
+
+#mode-list li {
+  overflow-wrap: anywhere;
+}
+
 .roi-box {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));

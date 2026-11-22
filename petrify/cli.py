@@ -1227,7 +1227,7 @@ def _run_main(argv: list[str]) -> int:
         # so does a live run ended with Ctrl-C: its outputs were finalized. A missing
         # FFmpeg is a fatal error (exit 1), not a missing input (exit 2).
         if args.web:
-            _run_with_web(args, settings, source)
+            _run_with_web(args, settings, source, factory=factory, modes=catalog.entries())
         elif args.realtime:
             run_stream(source, settings.config, settings.outputs, realtime=True)
         else:
@@ -1249,13 +1249,21 @@ def _run_main(argv: list[str]) -> int:
     return 0
 
 
-def _run_with_web(args: argparse.Namespace, settings: _RunSettings, source: Any) -> None:
+def _run_with_web(
+    args: argparse.Namespace,
+    settings: _RunSettings,
+    source: Any,
+    *,
+    factory: Any,
+    modes: tuple[Any, ...],
+) -> None:
     """Run the stream with the local web page: serve it on a thread, process on this one.
 
     The processing loop stays on the calling (main) thread; the server runs on a
     daemon thread and is stopped when the run ends for any reason. The process
     does not wait after the run: the page then reports that the run has ended.
-    The link printed here is the only place the token is shown.
+    The link printed here is the only place the token is shown. ``factory`` is
+    the loaded mode and ``modes`` the listed ones (metadata only), for the page.
     """
     from petrify.pipeline import run_stream  # noqa: PLC0415
     from petrify.server.app import create_app, serve_in_thread  # noqa: PLC0415
@@ -1264,7 +1272,12 @@ def _run_with_web(args: argparse.Namespace, settings: _RunSettings, source: Any)
 
     try:
         token = secrets.token_urlsafe(32)
-        control = RunControl(settings.config, (source.info.width, source.info.height))
+        control = RunControl(
+            settings.config,
+            (source.info.width, source.info.height),
+            modes=modes,
+            factory=factory,
+        )
         processed = MjpegSink()
         raw = MjpegSink() if args.web_raw_preview else None
         app = create_app(control, processed, token=token, raw=raw, port=args.web_port)
