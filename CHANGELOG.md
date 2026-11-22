@@ -65,9 +65,19 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Tracking and models
 - `--track` and `--track-hold N` (default 15) in `petrify run`: a greedy IoU box tracker (`petrify.detectors.tracker`) that holds person boxes and faces for N frames after a miss, without moving them. The erase mode does not accept it
-- `--model-dir` and `petrify.models`: model files are looked up in an explicit path, `--model-dir`, `PETRIFY_MODEL_DIR`, then the per-user data directory, and loaded only when their size and SHA-256 match a pinned value. petrify never downloads anything. No model is listed yet, so `--model-dir` has no effect until a detector that needs one exists
-- Config sections for the planned YuNet face, DNN person, and segmentation detectors. The detectors themselves are not implemented yet
-- `petrify.background.any_person` combines several background sample checks into one. Only the HOG check exists so far
+- `--model-dir` and `petrify.models`: model files are looked up in an explicit path, `--model-dir`, `PETRIFY_MODEL_DIR`, then the per-user data directory, and loaded only when their size and SHA-256 match a pinned value. petrify never downloads anything
+- Config sections for the YuNet face, DNN person, and segmentation detectors
+- `petrify.background.any_person` combines several background sample checks into one
+
+#### Model-based detectors
+- YuNet face detector (`petrify.detectors.face_yunet.FaceYuNetDetector`, `--faces`, `--face-score-threshold`, default 0.6): face boxes with five landmarks (right eye, left eye, nose tip, right mouth corner, left mouth corner). Boxes are rounded outward. Frames with a side of 32 px or less are refused and fail closed
+- NanoDet-Plus person detector (`petrify.detectors.person_dnn.PersonDnnDetector`, `--person-detector {hog,dnn}`, default `hog`, and `--dnn-score-threshold`, default 0.4). With `dnn` it replaces HOG for `--detector person` and `both`; the locked background pre-scan still uses HOG. Overlapping boxes are merged into their union, then padded by 10 percent of their width and 7 percent of their height on each side. It misses people smaller than about 110 px tall on a 1080p frame, and on the 640x480 demo clip takes about 34 ms per frame (about 77 ms at 1080p)
+- PP-HumanSeg person segmenter (`petrify.detectors.segment.PersonSegmenter`, `--segment`, `--segment-threshold`, default 0.5): a full-resolution person mask that keeps every pixel the model flagged when it is resized to the frame. It misses small, distant people and marks parts of empty scenes
+- The three model files are pinned in `petrify.models.KNOWN_MODELS` with their size, SHA-256, source (the OpenCV model zoo), and license: `face_detection_yunet_2023mar.onnx` (MIT), `object_detection_nanodet_2022nov.onnx` (Apache-2.0), and `human_segmentation_pphumanseg_2023mar.onnx` (Apache-2.0). `--model-dir` is now used. The log names the file each detector was loaded from
+- `--background-check NAMES`: the detectors that check the samples of a `running` or `calibrate` background, from `hog`, `yunet`, and `dnn` (default `hog`). A warning names them when they reject 50 samples in a row and the background is still not ready
+- `petrify.background.detector_check` turns a frame detector into a background sample check
+- Warnings when `--person-detector dnn` is given with `--detector motion`, when `--faces`, `--segment`, or `--background-check` has no effect for the mode, and when the DNN person detector runs without the background differ
+- The web page shows which person detector the run uses
 
 ### Changed
 - `petrify INPUT OUTPUT` now runs through the streaming engine (`petrify.pipeline.run_file`) instead of the two-pass pipeline. Output for the same input and flags is unchanged, verified frame for frame against recorded fixtures. Background selection and timestamp ROI auto-detection still pre-scan the file before the processing pass
@@ -83,6 +93,12 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `Detections.subject_present` also counts a face or a mask pixel as a subject
 - A mode or stage that returns something other than a `numpy.ndarray` with the input frame's shape and dtype, or, on a frame where a subject is present, an array that may share memory with the input image, now fails that frame closed
 - `petrify run` builds the mode through the registry: a detector is built only when the mode requires what it provides, the background only when the mode needs one, and the ROI stage only when the mode allows it
+- `SegmentConfig.min_area_share` now accepts 0 and defaults to 0 (off). With the previous default a frame where the model flagged only part of a visible person counted as having no person
+- `BackgroundConfig.sample_checkers` no longer accepts `segment`: the segmenter marks parts of empty scenes, so as a check it would reject nearly every sample
+- Every model file a run needs, for its detectors and its background checks, is loaded and verified at startup, before any frame is read. A missing or corrupt model stops the run with one `Fatal error:` line (exit code 1); during a run, a settings change that needs one is rejected and the run continues
+- `petrify run` refuses to start when the mode requires faces, landmarks, or a mask and the detector that provides it is not enabled (`--faces`, `--segment`), and when a `first_hit` mode requires faces, landmarks, or a mask together with another kind (it must declare `detect_policy = "all"`). Before, a mode that required them together with motion or person boxes received `None` in those fields
+- `petrify run` rejects `--dnn-score-threshold`, `--face-score-threshold`, and `--segment-threshold` without their detector flag, and `--background-check` with `--no-background-check` or a `locked` background (usage error, exit code 2)
+- With `--person-detector dnn` the web page rejects changes to the HOG settings, and a raised HOG threshold is not listed as a weakened protection while the DNN is in use
 
 ### Removed
 - MOG2 pre-warmup: it never had an effect, because its model was reset before use

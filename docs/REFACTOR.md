@@ -1,6 +1,6 @@
 # petrify refactor plan: real-time core + plugin modes
 
-Status: phases 0 to 3 are done. Phase 4 is half done: the plugin API, the mode registry, the tracker, and the model file lookup have landed; the new detectors (YuNet faces, DNN person boxes, person segmentation) have not, because their model files are not available yet. Phases 5 and 6 are planned and not implemented yet.
+Status: phases 0 to 3 are done. Phase 4 is done, pending the user's sign-off: the plugin API, the mode registry, the tracker, the model file lookup, and the YuNet face, DNN person, and segmentation detectors have landed. Phases 5 and 6 are planned and not implemented yet.
 
 ## Goals
 
@@ -92,9 +92,9 @@ petrify/
     motion.py        # existing MOG2
     bgdiff.py        # existing; returns a flag only (a mask output is not implemented yet)
     person_hog.py    # existing HOG, now returns boxes
-    person_dnn.py    # (not yet) fast person boxes via cv2.dnn for real-time CCTV
-    face_yunet.py    # (not yet) faces + 5 landmarks (cv2.FaceDetectorYN)
-    segment.py       # (not yet) person segmentation mask (optional extra)
+    person_dnn.py    # NanoDet-Plus person boxes via cv2.dnn (--person-detector dnn)
+    face_yunet.py    # faces + 5 landmarks (cv2.FaceDetectorYN, --faces)
+    segment.py       # PP-HumanSeg person segmentation mask via cv2.dnn (--segment)
     tracker.py       # greedy IoU tracker + TrackerRefiner: holds person boxes and faces
                      # for N frames after a miss, without motion extrapolation
   background/        # locked | running | calibrate; vetting.py: person_free, any_person
@@ -200,7 +200,12 @@ Design points that later phases (the detectors, `petrify-shadow`, CCTV hardening
 - `Engine.reconfigure(detectors=...)` alone does not reset a refiner; only refiners that are passed or newly activated are reset. The pipeline therefore hands the refiners over whenever the detectors change (`pipeline._rebuild_components`).
 - Plugin code is trusted. There is no sandbox, and the plugin receives the unprocessed frames. The registry's and the engine's checks guard against mistakes only.
 - Text from package metadata (names, versions, problems) is untrusted even for a plugin that is not selected, and is reduced to printable ASCII on the page. Text from the loaded plugin is reduced to plain text and capped.
-- No detector provides `faces`, `landmarks`, or `mask` yet, and `BackgroundConfig.sample_checkers` accepts the planned detectors' names although only the HOG check exists. The background sample check still depends on HOG alone.
+- The DNN person detector replaces HOG for frame detection; it does not add to it. It misses far subjects: no person smaller than about 110 px tall on a 1080p frame was found (the frame is scaled to 416 px), so on CCTV footage the background differ is what covers distant people. It is also slower: about 34 ms per frame on the 640x480 demo clip and about 77 ms at 1080p, so a 25 fps 1080p live source drops frames.
+- The segmenter marks parts of empty scenes (false positives) and misses small, distant people. It is therefore not offered as a background sample checker, and it should not be the only person signal on CCTV footage.
+- Under `"first_hit"` the engine skips later detectors once one fires, so a mode that requires `faces`, `landmarks`, or `mask` together with another kind would get `None` in those fields on most frames with a subject. `registry.build_mode` refuses such a mode; it must declare `detect_policy = "all"`.
+- Model path reporting uses a module-level record in `petrify/models.py` (`_LOADED_PATHS`, read with `pop_loaded_path`), because detectors receive only the bytes. It is process-global state shared by every load, not a value returned with the bytes.
+- The locked background pre-scan still uses HOG only, whatever `--person-detector` and `--background-check` say.
+- The `--background-check` thresholds are tied to the detector flags: the `dnn` and `yunet` checkers use `--dnn-score-threshold` and `--face-score-threshold`, which are accepted only with `--person-detector dnn` and `--faces`. A checker's threshold can only be set by also enabling that detector: for `dnn` that replaces HOG on the frames, and for `yunet` with `erase` the run warns that `--faces` has no effect, although the threshold does apply to the checker.
 
 ## Phases
 
@@ -210,7 +215,7 @@ Design points that later phases (the detectors, `petrify-shadow`, CCTV hardening
 | 1 | Core engine refactor (done) | `petrify in.mp4 out.mp4` matches the golden output through the new engine. |
 | 2 | Live sources + sinks (done) | Webcam, RTSP, image folder, and push API inputs; preview, ffmpeg pipe, and virtual cam outputs. Erase mode runs live. |
 | 3 | Webapp (done) | Live feed visible in the browser; erase config tweakable live. |
-| 4 | Plugin API + new detectors (partly done) | Done: entry-point loading, the mode contract and registry, `--mode`, `--mode-option`, `--list-modes`, detection policies and refiners in the engine, the tracker (`--track`), model file lookup with pinned SHA-256 (`--model-dir`), and the Mode section of the web page. Remaining: the YuNet face, DNN person, and segmentation detectors and their model files, which are not available yet. |
+| 4 | Plugin API + new detectors (done, pending sign-off) | Entry-point loading, the mode contract and registry, `--mode`, `--mode-option`, `--list-modes`, detection policies and refiners in the engine, the tracker (`--track`), model file lookup with pinned SHA-256 (`--model-dir`), the Mode section of the web page, and the YuNet face (`--faces`), DNN person (`--person-detector dnn`), and segmentation (`--segment`) detectors with their three pinned model files, a startup check of every model file a run needs, and `--background-check`. |
 | 5 | `petrify-shadow` plugin | All styles implemented and stackable. |
 | 6 | CCTV hardening | Head-from-body fallback, multi-camera, performance budgets, fail-closed tests. |
 

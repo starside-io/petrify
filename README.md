@@ -229,9 +229,78 @@ petrify ships no mode plugin yet. [docs/PLUGINS.md](docs/PLUGINS.md) describes h
 |---|---|
 | `--track` | Enable the box tracker: a person or face box is held for a few frames after the detector stops finding it. Only for modes that use boxes; the erase mode does not accept it, and the run stops with an error |
 | `--track-hold N` | Frames a tracked box is held after its last detection (implies `--track`). Default: 15 |
-| `--model-dir DIR` | Directory searched first for detector model files. The detectors available so far need no model files, so it has no effect yet |
+| `--model-dir DIR` | Directory searched first for detector model files, before `PETRIFY_MODEL_DIR` and the per-user model directory. Only the [model-based detectors](#model-based-detectors) and their background checks use it |
 
-Model files, once detectors need them, are looked up in this order: an explicit path in the config, `--model-dir`, the `PETRIFY_MODEL_DIR` environment variable, then the per-user data directory (`~/Library/Application Support/petrify/models` on macOS, `$XDG_DATA_HOME/petrify/models` or `~/.local/share/petrify/models` on Linux, `%LOCALAPPDATA%\petrify\models` on Windows). A file is loaded only when its size and SHA-256 match the value pinned in petrify's code. petrify never downloads anything.
+### Model-based detectors
+
+Three detectors run an ONNX model from the [OpenCV model zoo](https://github.com/opencv/opencv_zoo) through OpenCV. They are off by default, and without their flags a run behaves as before.
+
+| Detector | Flag | What it is for |
+|---|---|---|
+| NanoDet-Plus person boxes | `--person-detector dnn` | Person boxes for `--detector person` and `both`, in place of HOG |
+| YuNet faces | `--faces` | Face boxes with five landmarks, for a mode that uses faces or face landmarks |
+| PP-HumanSeg person mask | `--segment` | A pixel mask of people, for a mode that uses a person mask |
+
+| Flag | Meaning |
+|---|---|
+| `--person-detector {hog,dnn}` | Person box detector used by `--detector person` and `both`. Default: `hog`. With `--detector motion` it has no effect, and a warning says so |
+| `--dnn-score-threshold FLOAT` | Minimum score in (0, 1) to accept a DNN person box. Default: 0.4. Needs `--person-detector dnn` |
+| `--faces` | Enable the YuNet face detector |
+| `--face-score-threshold FLOAT` | Minimum score in (0, 1) to accept a face. Default: 0.6. Needs `--faces` |
+| `--segment` | Enable the PP-HumanSeg person segmenter |
+| `--segment-threshold FLOAT` | Person probability in (0, 1) from which a pixel belongs to the mask. Default: 0.5. Needs `--segment` |
+| `--background-check NAMES` | Detectors that check the frames a `running` or `calibrate` background is learned from, comma-separated: `hog`, `yunet`, `dnn`. Default: `hog`. See [Background strategies](#background-strategies) |
+
+No built-in mode uses faces or a mask yet: the region modes that would (face blur, silhouette) are planned for phase 5 of the [refactor plan](docs/REFACTOR.md). Today `--faces` and `--segment` only matter to a [plugin mode](docs/PLUGINS.md) that requires faces, landmarks, or a mask. With `erase` they have no effect, and a warning says so.
+
+#### Limits, before you choose one
+
+- **DNN person boxes replace HOG, they do not add to it.** With `--person-detector dnn` HOG no longer runs on the frames. The locked background pre-scan still uses HOG.
+- **The DNN misses small people.** The frame is scaled down to 416 px for the model, and no person smaller than about 110 px tall on a 1080p frame was found. Wide frames shrink people further. The background differ covers that gap only while it is on: with `--no-bg-diff`, or a mode that does not use it, a warning says that small or distant people can be shown.
+- **The DNN is slower than HOG.** On the 640x480 demo clip erase with `--detector person --person-detector dnn` takes about 34 ms per frame, against a few ms with HOG, and freezes 611 of 655 frames against 494 with HOG. At 1080p it takes about 77 ms per frame, so a 25 fps 1080p live source drops frames.
+- **DNN person boxes are estimates.** Each box is padded by 10 percent of its width and 7 percent of its height on each side, because the model's boxes were measured to fall short of the person. An outstretched arm can still stick out of the box.
+- **The segmenter is tuned for close, large people.** It misses small, distant people and marks parts of empty scenes. That is why it is not offered as a background check, and it should not be the only person signal on CCTV footage.
+- **The face detector refuses tiny frames.** A frame with a side of 32 px or less is not processed and fails closed (black). One face detector instance is not thread-safe.
+
+#### Model files
+
+petrify never downloads a model. You place the files yourself, and petrify loads a file only when its size and SHA-256 match the values pinned in its code (`petrify/models.py`):
+
+| File | Detector | Size (bytes) | SHA-256 | License |
+|---|---|---|---|---|
+| `face_detection_yunet_2023mar.onnx` | YuNet faces | 232589 | `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4` | MIT |
+| `object_detection_nanodet_2022nov.onnx` | NanoDet-Plus person boxes | 3800954 | `4b82da9944b88577175ee23a459dce2e26e6e4be573def65b1055dc2d9720186` | Apache-2.0 |
+| `human_segmentation_pphumanseg_2023mar.onnx` | PP-HumanSeg person mask | 6163938 | `552d8a984054e59b5d773d24b9b12022b22046ceb2bbc4c9aaeaceb36a9ddf24` | Apache-2.0 |
+
+To get them, download each file by hand from the OpenCV model zoo at github.com/opencv/opencv_zoo: `models/face_detection_yunet/`, `models/object_detection_nanodet/`, and `models/human_segmentation_pphumanseg/`. Keep the file names as they are. You only need the files of the detectors you enable.
+
+Each file is looked up in this order, and the first location where a file of that name exists is the only one used (a wrong file there stops the run instead of falling through to the next location):
+
+1. `--model-dir DIR`
+2. the directory in the `PETRIFY_MODEL_DIR` environment variable
+3. the per-user data directory: `~/Library/Application Support/petrify/models` on macOS; `$XDG_DATA_HOME/petrify/models` (when the variable is an absolute path) or else `~/.local/share/petrify/models` on Linux; `%LOCALAPPDATA%\petrify\models` on Windows, falling back to `%USERPROFILE%\AppData\Local\petrify\models`
+
+For library use, a `model_path` in the detector's config section names one file and replaces the search.
+
+Every model file a run needs, for its detectors and its background checks, is loaded and verified at startup, before any frame is read. The log names the file used (`Detector PersonDnnDetector ready: model PATH loaded and verified`). A missing or corrupt file stops the run with one `Fatal error:` line (exit code 1). For a missing file it lists the locations searched, the expected size and SHA-256, the source, and the license; for a corrupt one, the expected and actual size or SHA-256. During a run, a change from the web page that would need a missing or corrupt model is rejected and the run continues.
+
+```bash
+# Erase with DNN person boxes in place of HOG
+petrify run --source input.mp4 --output out.mp4 \
+    --detector both --person-detector dnn --model-dir ~/petrify-models
+```
+
+#### Startup errors and warnings
+
+petrify refuses to start, before reading any frame, when:
+
+- a threshold flag is given without its detector: `--dnn-score-threshold` without `--person-detector dnn`, `--face-score-threshold` without `--faces`, `--segment-threshold` without `--segment` (usage error, exit code 2)
+- `--background-check` is combined with `--no-background-check`, used with a `locked` background, or names a detector other than `hog`, `yunet`, or `dnn` (usage error, exit code 2)
+- the mode requires faces, landmarks, or a mask and its detector is not enabled, for example `The mode 'NAME' requires faces but no enabled detector provides it; enable the YuNet face detector with --faces` (exit code 1)
+- a mode with the `first_hit` detection policy requires faces, landmarks, or a mask together with another kind (exit code 1; see [docs/PLUGINS.md](docs/PLUGINS.md))
+- a model file it needs is missing or fails its size or SHA-256 check (exit code 1)
+
+It logs a warning when `--person-detector dnn` is given with `--detector motion`, when `--faces` or `--segment` is given for a mode that does not use it, when `--background-check` is given for a mode that uses no background, when the DNN person detector runs without the background differ, and when the background sample check has rejected 50 samples in a row while the background is still not ready.
 
 ### Sources
 
@@ -282,7 +351,7 @@ During warmup ROI detection nothing is pasted until the region locks. A detected
 | `running` | Rolling median of recent frames with no subject |
 | `calibrate` | Median of the first `--calibrate-seconds` (default 3), while the scene is empty |
 
-Frames are written black until the background is ready. With `running` or `calibrate`, every frame the background is learned from is first checked with the HOG person detector, and a frame in which it finds a person is not used. `--no-background-check` turns that check off and is unsafe. At startup petrify logs a warning that a person in view while the background is learned can be absorbed into it. The check reduces this but does not eliminate it: start with the scene empty either way. See [Before you rely on it](#before-you-rely-on-it).
+Frames are written black until the background is ready. With `running` or `calibrate`, every frame the background is learned from is first checked, by default with the HOG person detector, and a frame in which it finds a person is not used. `--background-check NAMES` chooses the checkers from `hog`, `yunet` (faces), and `dnn` (person boxes); a frame is not used when any of them finds a person. The list replaces the default, so include `hog` to keep it, for example `--background-check hog,dnn`. `yunet` and `dnn` need their [model files](#model-files). A model checker uses the score threshold of its detector flag, and those flags need the detector enabled for the frames too (`--dnn-score-threshold` needs `--person-detector dnn`, `--face-score-threshold` needs `--faces`), so without them the checker runs at its default threshold. The segmenter is not offered as a checker, because it marks parts of empty scenes and would reject almost every sample. When the checkers reject 50 samples in a row and the background is still not ready, a warning names them. `--no-background-check` turns the check off and is unsafe. At startup petrify logs a warning that a person in view while the background is learned can be absorbed into it. The check reduces this but does not eliminate it: start with the scene empty either way. See [Before you rely on it](#before-you-rely-on-it).
 
 ### Fail closed
 
@@ -300,7 +369,7 @@ The page shows the processed feed (what the outputs receive), the run's status (
 
 - the detector (`motion`, `person`, `both`)
 - the motion detector's area and variance thresholds and shadow detection
-- the person detector's minimum confidence, minimum box area, and pyramid scale
+- the HOG person detector's minimum confidence, minimum box area, and pyramid scale. The page shows which person detector the run uses; with `--person-detector dnn` these HOG settings do not apply, and a change to them is rejected
 - the background differ (on or off) and its pixel and area thresholds
 - the lookahead and the frame budget
 - the ROI: disabled, or a manual box no larger than the run's `--roi-max-area` of the frame
@@ -329,8 +398,8 @@ Security model:
 Known limitations, in particular for live use:
 
 1. **Live paths are unverified on real hardware.** Webcams (`camera:N`), stream URLs, `--virtualcam`, and `--preview` were developed and tested against test doubles. They have not been verified with real cameras, streams, virtual camera drivers, or windows.
-2. **An online background can absorb a person.** With `--background running` or `calibrate`, a person in view while the background is learned can be absorbed into it and then shown on frozen frames after they leave. The person check on background samples reduces this, but it uses the HOG pedestrian detector, which often misses a seated person framed from the chest up (the usual webcam view). Start with the scene empty. Do not rely on erase mode on a webcam for privacy yet.
-3. **The stronger detectors are not there yet.** Face detection (YuNet), DNN person boxes, and person segmentation are planned but not implemented: they need model files that are not available yet. Erase still relies on MOG2, HOG, and the background differ alone, and so does the background sample check. `--model-dir` has no effect until such a detector exists.
+2. **An online background can absorb a person.** With `--background running` or `calibrate`, a person in view while the background is learned can be absorbed into it and then shown on frozen frames after they leave. The person check on background samples reduces this, but by default it uses the HOG pedestrian detector, which often misses a seated person framed from the chest up (the usual webcam view). `--background-check` can add the face and DNN person checks. Start with the scene empty. Do not rely on erase mode on a webcam for privacy yet.
+3. **The model-based detectors have measured limits.** The DNN person detector misses people smaller than about 110 px tall on a 1080p frame and replaces HOG rather than adding to it. The segmenter misses small, distant people and marks parts of empty scenes. No built-in mode uses faces or a mask yet. See [Limits, before you choose one](#limits-before-you-choose-one).
 4. **A plugin mode is trusted code.** It runs in the petrify process and receives the unprocessed frames. petrify does not sandbox or vet it.
 5. **The timestamp ROI is shown live.** Anything inside the ROI region is not anonymized, by design.
 6. **A slow entry at the frame edge can show through.** A subject entering slowly at the edge of the frame can be partly visible for a few frames before it is detected, more so with a small `--lookahead` (the `camera:N` default is 3).
@@ -385,6 +454,8 @@ input video
 | **BackgroundDiffer** (static diff) | *Everything* different from the empty-corridor reference: moving or still, full or partial, near or far | Nothing, as long as the background frame is clean |
 
 The static background differ is the safety net. Because its reference never adapts, a person standing perfectly still for 60 seconds is still detected on every single frame. They are simply always different from the known-empty scene.
+
+In `petrify run`, `--person-detector dnn` puts the NanoDet-Plus person detector in the HOG slot. It is slower and misses small, distant people. See [Model-based detectors](#model-based-detectors).
 
 ---
 

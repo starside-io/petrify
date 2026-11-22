@@ -2,7 +2,7 @@
 
 A mode decides what petrify writes for each frame. The built-in mode, `erase`, shows the clean background while a subject is present and the live frame otherwise. A plugin is an installed Python package that adds another mode, selected with `petrify run --mode NAME`.
 
-This guide describes the contract as it is implemented today. Read [What is not available yet](#what-is-not-available-yet) before you plan a mode: the face, DNN person, and segmentation detectors do not exist yet, so a mode can only rely on motion, HOG person boxes, and the background differ.
+This guide describes the contract as it is implemented today. Read [Which detector provides what](#which-detector-provides-what) before you plan a mode: faces, landmarks, and the person mask come from model-based detectors that the user must enable with a flag and supply model files for, and each has measured limits.
 
 ## Trust model
 
@@ -180,7 +180,7 @@ A mode is the last step before the outputs. These rules are what keeps a person 
 - [ ] **Cover the whole frame when you have no regions to draw on.** A region mode (one that blurs or masks boxes, faces, or a mask) receives no regions on frames frozen by the lookahead or the cold start, and a field that is `None` means "not computed", not "nothing found". When `subject_present` is True and the regions you need are missing or empty, cover everything.
 - [ ] **Never return the input image, or a view of it, on a frame where `subject_present` is True.** Return a new array. petrify checks this with `numpy.may_share_memory` and writes the frame black otherwise; even a view of a disjoint slice is rejected. When `subject_present` is False the mode may return `frame.image` itself.
 - [ ] **Return an image of the right type.** It must be a `numpy.ndarray` (not a subclass) with the input frame's shape and dtype (BGR `uint8`, height by width by 3). petrify checks this and writes the frame black otherwise.
-- [ ] **Declare `detect_policy` on the mode.** `"first_hit"` stops running stateless detectors on a frame once one has found a subject, which suits a mode that only needs a yes or no. `"all"` runs every active detector on every frame, which a mode that draws on regions needs. A plugin mode without `detect_policy` is refused at startup, because the default `"first_hit"` would hand a region mode incomplete regions.
+- [ ] **Declare `detect_policy` on the mode.** `"first_hit"` stops running stateless detectors on a frame once one has found a subject, which suits a mode that only needs a yes or no. `"all"` runs every active detector on every frame, which a mode that draws on regions needs. A plugin mode without `detect_policy` is refused at startup, because the default `"first_hit"` would hand a region mode incomplete regions. A mode that requires `faces`, `landmarks`, or `mask` together with any other kind must declare `"all"`; with `"first_hit"` it is refused at startup (see [The `first_hit` rule](#the-first_hit-rule)).
 - [ ] **Set `roi_overlay = False` on the factory of a region mode.** The ROI overlay stage pastes the live pixels of the timestamp region over the mode's output. That is right for `erase`, which shows a frozen background with a live clock, and wrong for a mode that obscures regions: a face inside the ROI would be pasted back unobscured. The setting is per mode, and a mode with `roi_overlay = False` gets no ROI stage at all.
 - [ ] **Declare `mandatory` kinds** for detections the mode cannot work without. Every kind in `mandatory` must be provided by an active detector or refiner, or petrify refuses to start (and refuses a settings change that would remove it). A non-empty `mandatory` requires `detect_policy = "all"`. The factory's `mandatory(options)` must return the same set as the mode's `mandatory` attribute (missing means empty).
 - [ ] **Give runtime number options a `minimum` and a `maximum`.** An `int` or `float` option with `runtime=True` must declare both, so a value sent from the web page is always bounded; `OptionSpec` raises `ValueError` otherwise.
@@ -277,8 +277,8 @@ A mode name that is registered by more than one distribution, that is not a vali
 
 Before a mode sees them, detector results go through these steps:
 
-- **Only what the mode requires runs.** A detector is active when it provides a kind in the mode's `requires`. petrify refuses to start when the mode requires detections and no active detector or refiner provides any of them.
-- **Built-in detectors.** `motion` (MOG2) is built with `--detector motion` or `both`, `persons` (HOG) with `--detector person` or `both`, and `background_diff` only for a mode with `needs_background` (unless `--no-bg-diff`). A mode that requires `background_diff` without a background is refused unless the differ is turned off.
+- **Only what the mode requires runs.** A detector is active when it provides a kind in the mode's `requires`. petrify refuses to start when the mode requires detections and no active detector or refiner provides any of them, and when it requires `faces`, `landmarks`, or `mask` and the detector that provides that kind is not enabled (see [Which detector provides what](#which-detector-provides-what)).
+- **Built-in detectors.** `motion` (MOG2) is built with `--detector motion` or `both`, `persons` (HOG, or the DNN with `--person-detector dnn`) with `--detector person` or `both`, and `background_diff` only for a mode with `needs_background` (unless `--no-bg-diff`). A mode that requires `background_diff` without a background is refused unless the differ is turned off. The face detector and the segmenter are built only when enabled and the mode requires what they provide.
 - **Validated and normalized.** Each detector result is checked: a field may be set only when the detector declares the matching kind, flags become Python `bool`, boxes must have integer coordinates and non-negative size, and the mask must be a `bool` array of the frame's height and width. A malformed result fails the frame closed (black). The mode receives new objects built from the checked values, never the detector's own.
 - **Boxes are clipped to the frame.** A box that starts before 0 or extends past the edge is clipped; a box wholly outside becomes a zero-area box on the nearest edge. Landmark points are not clipped.
 - **The mask is a read-only copy.**
@@ -286,8 +286,139 @@ Before a mode sees them, detector results go through these steps:
 - **Refiners run after the detectors.** With `--track` (or `--track-hold N`), petrify adds a box tracker for `persons` and for `faces` when the mode requires them. It holds the last box of a lost subject for N frames (default 15) without moving it. Refiners need `detect_policy = "all"`, which is why `erase` refuses `--track`. Refiners do not run on a frame whose detection failed; that frame is written black.
 - **A subject is present** when motion, a person box, a background difference, a face, or a mask pixel is found.
 
+## Which detector provides what
+
+| `DetectionKind` | Detector | Enabled by |
+|---|---|---|
+| `MOTION` | MOG2 | `--detector motion` (the default) or `both` |
+| `PERSONS` | HOG, or NanoDet-Plus with `--person-detector dnn` | `--detector person` or `both` |
+| `BACKGROUND_DIFF` | The static background differ | A factory with `needs_background`, unless `--no-bg-diff` |
+| `FACES` | YuNet | `--faces` |
+| `LANDMARKS` | YuNet (on the faces it returns) | `--faces` |
+| `MASK` | PP-HumanSeg | `--segment` |
+
+YuNet, NanoDet-Plus, and PP-HumanSeg need model files that the user places on disk; petrify never downloads them. The README's [Model-based detectors](../README.md#model-based-detectors) section lists the files, where petrify looks for them, and the measured limits of each detector. Read the limits before you rely on one: the segmenter, for example, misses small, distant people and marks parts of empty scenes.
+
+When a mode requires `faces`, `landmarks`, or `mask` and the user did not enable the detector that provides it, petrify refuses to start, whatever else the mode requires:
+
+```
+Fatal error: The mode 'facebox' requires faces but no enabled detector provides it; enable the YuNet face detector with --faces
+```
+
+The same check rejects a settings change from the web page that would leave such a kind without its detector. `motion` and `persons` keep the older rule: the run starts as long as at least one required kind is provided, which is what lets `erase` run with `--detector motion`.
+
+Every model file a run needs is loaded and verified at startup, before any frame is read. A missing or corrupt file stops the run with `Fatal error:` (exit code 1).
+
+### The `first_hit` rule
+
+Under `"first_hit"` the engine skips the later detectors on a frame where an earlier one fired, so a mode that needs faces together with motion, for example, would get `faces = None` on most frames with a subject. petrify therefore refuses, at startup, a `"first_hit"` mode whose `requires` contains `faces` or `landmarks` together with a kind other than those two, or `mask` together with any other kind. Such a mode must declare `detect_policy = "all"`. A mode that requires only `faces` and `landmarks`, or only `mask`, may keep `"first_hit"`, since a single detector runs.
+
+### What the mode receives
+
+Each field below is `None` when it was not computed (its detector is not active, or `"first_hit"` skipped it on that frame) and empty when the detector ran and found nothing: an empty tuple, or a mask with no True pixel. On a gap-filled or cold-start frame the fields hold what the detectors found on that frame itself, usually nothing.
+
+- **`detections.faces`**: a tuple of `petrify.core.detections.Face`. `face.box` is a `Box` with integer `x`, `y`, `w`, `h` in pixels of the full frame, rounded outward to whole pixels and clipped to the frame, and `score` set to the detector's confidence. YuNet runs on the full-resolution frame. A frame with a side of 32 px or less is refused and written black.
+- **`face.landmarks`**: set exactly when `LANDMARKS` is provided (it is, whenever `--faces` is on): a tuple of five `(x, y)` float points in frame pixels, in this order: right eye, left eye, nose tip, right mouth corner, left mouth corner. Landmark points are not clipped and can lie outside the frame.
+- **`detections.mask`**: a read-only `numpy` array of dtype `bool` and shape `(H, W)`, the full resolution of the frame. True marks a person pixel. The model runs on a 192 by 192 input; when its output is resized to the frame, every pixel the model flagged is kept. `--segment-threshold` sets the probability from which a pixel is a person.
+- **`detections.persons`** from the DNN: boxes padded by 10 percent of their width and 7 percent of their height on each side, overlapping candidates merged into their union rather than dropped. An outstretched arm can still stick out of a box.
+
+With `--track`, the box tracker also holds face boxes for `--track-hold` frames after a miss.
+
+## A mode that uses faces
+
+This plugin adds a `facebox` mode: it paints every detected face box with a flat gray level, and covers the whole frame when a subject is present but no face was found. It is a sketch for trying out the face detector, not a safe anonymizer: it shows every body, and a face YuNet misses is shown. Package it like the `blackout` example, with the entry point `facebox = "petrify_facebox:FACEBOX"`.
+
+```python
+"""A petrify mode that paints every detected face box with a flat gray level."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+import numpy as np
+
+from petrify.core.detections import DetectionKind, Detections
+from petrify.core.frame import Frame
+from petrify.core.plugin import Mode, ModeContext, OptionSpec
+
+_REQUIRES = frozenset({DetectionKind.FACES})
+
+
+class FaceboxMode:
+    name = "facebox"
+    requires = _REQUIRES
+    detect_policy = "all"  # A region mode: it draws on the boxes.
+    mandatory = _REQUIRES  # Without the face detector there is nothing to draw on.
+
+    def __init__(self, level: int) -> None:
+        self.level = level
+
+    def render(self, frame: Frame, detections: Detections, subject_present: bool) -> np.ndarray:
+        if not subject_present:
+            return frame.image
+        faces = detections.faces
+        if not faces:
+            # Gap-filled or cold-start frame, or faces not computed: cover everything.
+            return np.full_like(frame.image, self.level)
+        out = frame.image.copy()  # A new array, never a view of frame.image.
+        for face in faces:
+            b = face.box
+            out[b.y : b.y + b.h, b.x : b.x + b.w] = self.level
+        return out
+
+
+class FaceboxFactory:
+    name = "facebox"
+    summary = "Paint every detected face box with a flat gray level."
+    options = (
+        OptionSpec(
+            name="level",
+            kind="int",
+            default=0,
+            help="Gray level of the boxes, 0 (black) to 255 (white).",
+            minimum=0,
+            maximum=255,
+            runtime=True,
+        ),
+    )
+    needs_background = False
+    roi_overlay = False  # A face inside the timestamp region must not be pasted back.
+
+    def requires(self, options: Mapping[str, object]) -> frozenset[DetectionKind]:
+        return _REQUIRES
+
+    def mandatory(self, options: Mapping[str, object]) -> frozenset[DetectionKind]:
+        return _REQUIRES
+
+    def weakened(self, options: Mapping[str, object]) -> tuple[str, ...]:
+        return ()
+
+    def create(self, ctx: ModeContext, previous: Mode | None = None) -> Mode:
+        level = ctx.options["level"]
+        if isinstance(previous, FaceboxMode) and previous.level == level:
+            return previous
+        return FaceboxMode(level)
+
+
+FACEBOX = FaceboxFactory()
+```
+
+Without `--faces` the run stops at startup with the error shown in [Which detector provides what](#which-detector-provides-what). With it, on the 1169-frame 1080p driveway clip (log excerpt, progress bar and FFmpeg lines left out; the model file was in `PETRIFY_MODEL_DIR`):
+
+```
+$ petrify run --source camera.mp4 --mode facebox --faces --output out.mp4
+[WARNING] petrify.cli: The mode 'facebox' comes from the installed plugin petrify-facebox 0.1.0. It runs in the petrify process with petrify's permissions and receives the unprocessed frames, people included.
+[INFO] petrify.sources.file: Input: camera.mp4  |  1920x1080 @ 25.00 fps  |  ~1169 frames
+[INFO] petrify.cli: Source: camera.mp4 (file), mode: facebox
+[INFO] petrify.pipeline: Detector FaceYuNetDetector ready: model .../face_detection_yunet_2023mar.onnx loaded and verified
+[INFO] petrify.pipeline: Detector mode: motion
+[INFO] petrify.pipeline: ROI: not used, the mode 'facebox' does not allow the overlay
+[INFO] petrify.pipeline: Run done: frames=1169 frozen=1034 pass-through=135 failed-closed=0 (over budget 0) source-dropped=0 sink-failures=0
+```
+
+YuNet found a face on 805 frames, and those frames have the face box painted. The other 229 frames counted as frozen are gap-filled or cold-start frames with no face of their own, and are covered whole. `Detector mode: motion` reports the `--detector` setting; MOG2 does not run, since the mode does not require motion.
+
 ## What is not available yet
 
-- **No face, DNN person, or segmentation detector.** `DetectionKind.FACES`, `LANDMARKS`, and `MASK` exist in the contract, but no detector provides them yet: YuNet faces, DNN person boxes, and person segmentation need model files that are not available yet. A mode that requires only those kinds is refused at startup. A mode that requires them alongside motion or persons will receive `None` in those fields; declare them `mandatory` if the mode cannot work without them.
-- **No model files.** petrify has a local model lookup with pinned SHA-256 checks, but its list of known models is empty, and `--model-dir` has no effect yet. petrify never downloads anything.
+- **No built-in mode uses faces or a mask.** `erase` uses motion, person boxes, and the background differ only, so `--faces` and `--segment` matter only to a plugin mode today.
 - **No `petrify-shadow` plugin.** The face blur, eye bar, and silhouette modes are planned for Phase 5 of the [refactor plan](REFACTOR.md).
