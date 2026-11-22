@@ -21,5 +21,6 @@ from __future__ import annotations
 from petrify.detectors.bgdiff import BackgroundDiffer
 from petrify.detectors.motion import MotionDetector
 from petrify.detectors.person_hog import PersonDetector
+from petrify.detectors.tracker import TrackerRefiner
 
-__all__ = ["BackgroundDiffer", "MotionDetector", "PersonDetector"]
+__all__ = ["BackgroundDiffer", "MotionDetector", "PersonDetector", "TrackerRefiner"]

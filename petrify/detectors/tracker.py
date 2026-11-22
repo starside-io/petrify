@@ -14,14 +14,19 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-"""Greedy IoU box tracker that keeps ids stable and holds boxes through short misses."""
+"""Greedy IoU box tracker that keeps ids stable and holds boxes through short misses.
+
+:class:`TrackerRefiner` puts the tracker into the engine as a refiner.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from petrify.core.detections import Box
+from petrify.core.config import TrackerConfig
+from petrify.core.detections import Box, DetectionKind, Detections, Face
+from petrify.core.frame import Frame
 
 
 @dataclass(frozen=True)
@@ -182,3 +187,138 @@ class IouTracker:
 
         self._tracks = sorted(detected + held, key=lambda t: t.track_id)
         return tuple(self._tracks)
+
+
+class TrackerRefiner:
+    """Engine refiner that keeps person boxes or faces covered through short misses.
+
+    It feeds one kind of box to an :class:`IouTracker` on every frame it sees and
+    returns only the boxes of held tracks, so the engine's union is "detected
+    this frame plus held from earlier frames" without duplicating this frame's
+    detections. A held box is the last matched box, unchanged: there is no
+    motion extrapolation, so when the camera or the subject moves the held box
+    covers where the subject was, not where it is.
+
+    ``kind`` selects what is tracked:
+
+    - ``DetectionKind.PERSONS``: ``consumes = provides = {PERSONS}``. The result
+      sets ``persons`` to the held boxes.
+    - ``DetectionKind.FACES``: the result sets ``faces`` to held :class:`Face`
+      objects. With ``landmarks=True``, ``consumes = provides = {FACES,
+      LANDMARKS}``, so the engine only accepts the refiner when an active
+      detector provides landmarks, and every held face carries the last
+      landmarks seen for its track. With ``landmarks=False``, ``consumes =
+      provides = {FACES}`` and held faces carry no landmarks, even when the
+      detector provided some, so the result always passes
+      :func:`petrify.core.detections.check_detections` for its ``provides``.
+
+    A field that is None ("not computed") is treated as an empty tuple: the frame
+    counts as a miss for every track, so held boxes keep ageing out instead of
+    being held forever. When no track is held the result is an empty
+    ``Detections()``, so the refiner never turns a "not computed" field into
+    "nothing found".
+
+    Boxes with non-positive width or height are ignored by the tracker, so a
+    zero-area box (for example one clipped to the frame edge) is never held.
+
+    The engine does not run refiners on a frame whose detection failed, so such
+    frames do not age the tracks: a hold then lasts more wall-clock frames, which
+    keeps a region covered longer. The input ``Detections`` is never mutated.
+
+    Parameters
+    ----------
+    kind:
+        ``DetectionKind.PERSONS`` or ``DetectionKind.FACES``.
+    iou_threshold, hold_frames, max_tracks:
+        Passed to the internal :class:`IouTracker`.
+    landmarks:
+        Faces only: True when the face detector provides landmarks.
+    """
+
+    def __init__(
+        self,
+        kind: DetectionKind,
+        *,
+        iou_threshold: float,
+        hold_frames: int,
+        max_tracks: int,
+        landmarks: bool = False,
+    ) -> None:
+        if kind is DetectionKind.PERSONS:
+            if landmarks:
+                raise ValueError("landmarks=True is only valid for DetectionKind.FACES")
+            kinds = frozenset({DetectionKind.PERSONS})
+        elif kind is DetectionKind.FACES:
+            kinds = (
+                frozenset({DetectionKind.FACES, DetectionKind.LANDMARKS})
+                if landmarks
+                else frozenset({DetectionKind.FACES})
+            )
+        else:
+            raise ValueError(
+                f"kind must be DetectionKind.PERSONS or DetectionKind.FACES, got {kind!r}"
+            )
+        self.kind = kind
+        self.landmarks = landmarks
+        self.consumes: frozenset[DetectionKind] = kinds
+        self.provides: frozenset[DetectionKind] = kinds
+        self._tracker = IouTracker(
+            iou_threshold=iou_threshold, hold_frames=hold_frames, max_tracks=max_tracks
+        )
+        # Last landmarks seen per live face track, keyed by track_id.
+        self._payload: dict[int, tuple[tuple[float, float], ...] | None] = {}
+
+    @classmethod
+    def from_config(
+        cls, kind: DetectionKind, config: TrackerConfig, *, landmarks: bool = False
+    ) -> TrackerRefiner:
+        """Build a refiner with every tracker setting taken from ``config``."""
+        return cls(
+            kind,
+            iou_threshold=config.iou_threshold,
+            hold_frames=config.hold_frames,
+            max_tracks=config.max_tracks,
+            landmarks=landmarks,
+        )
+
+    def reset(self) -> None:
+        """Drop every track and every stored face payload."""
+        self._tracker.reset()
+        self._payload = {}
+
+    def refine(self, frame: Frame, detections: Detections) -> Detections:
+        """Advance the tracker one frame and return only the held boxes or faces."""
+        if self.kind is DetectionKind.PERSONS:
+            held = tuple(t.box for t in self._tracker.update(detections.persons or ()) if t.held)
+            return Detections(persons=held) if held else Detections()
+        return self._refine_faces(detections.faces or ())
+
+    def _refine_faces(self, faces: tuple[Face, ...]) -> Detections:
+        # The tracker stores the detection Box object itself, so a matched track
+        # finds its face by the identity of its box.
+        face_of_box = {id(face.box): face for face in faces}
+        tracks = self._tracker.update([face.box for face in faces])
+        payload: dict[int, tuple[tuple[float, float], ...] | None] = {}
+        held: list[Face] = []
+        for track in tracks:
+            previous = self._payload.get(track.track_id)
+            if track.held:
+                points = previous
+                if self.landmarks:
+                    if points is None:
+                        raise ValueError(
+                            f"held face track {track.track_id} has no landmarks but "
+                            "LANDMARKS is provided"
+                        )
+                    held.append(Face(box=track.box, landmarks=points))
+                else:
+                    held.append(Face(box=track.box))
+            elif self.landmarks:
+                seen = face_of_box[id(track.box)].landmarks
+                points = previous if seen is None else seen
+            else:
+                points = None
+            payload[track.track_id] = points
+        # Rebuilt from live tracks only, so payloads of dropped tracks are freed.
+        self._payload = payload
+        return Detections(faces=tuple(held)) if held else Detections()
