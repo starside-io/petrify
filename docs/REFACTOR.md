@@ -1,6 +1,6 @@
 # petrify refactor plan: real-time core + plugin modes
 
-Status: phases 0 to 3 are done. Phases 4 to 6 are planned and not implemented yet.
+Status: phases 0 to 3 are done. Phase 4 is half done: the plugin API, the mode registry, the tracker, and the model file lookup have landed; the new detectors (YuNet faces, DNN person boxes, person segmentation) have not, because their model files are not available yet. Phases 5 and 6 are planned and not implemented yet.
 
 ## Goals
 
@@ -69,14 +69,19 @@ If a detector raises, or the per-frame time budget is exceeded, the output frame
 
 ## Proposed structure
 
+Files marked "(not yet)" do not exist.
+
 ```
 petrify/
   core/
     frame.py         # Frame: image, timestamp, index, source metadata
-    detections.py    # Detections: motion flag, person boxes, faces + landmarks, mask
-    engine.py        # source -> detectors -> lookahead -> mode -> sinks
+    detections.py    # Detections: motion flag, person boxes, faces + landmarks, mask; check_detections
+    engine.py        # source -> detectors -> refiners -> lookahead -> mode -> stages -> sinks
     config.py        # typed config, hot-swappable at a frame boundary
-    plugin.py        # Stage / Mode protocol + entry-point registry
+    plugin.py        # protocols (Detector, Refiner, Mode, Stage, Sink, Source) + mode contract
+                     # (ModeFactory, ModeContext, OptionSpec)
+    registry.py      # petrify.modes entry point discovery, load_mode, build_mode
+  models.py          # local model file lookup with pinned SHA-256; never downloads
   sources/
     file.py          # video files (supports pre-scan)
     camera.py        # webcam by index (AVFoundation / V4L2 / DirectShow)
@@ -85,15 +90,16 @@ petrify/
     push.py          # library API: PushSession(engine, w, h).push(image) -> image | None
   detectors/
     motion.py        # existing MOG2
-    bgdiff.py        # existing, extended to return a mask
+    bgdiff.py        # existing; returns a flag only (a mask output is not implemented yet)
     person_hog.py    # existing HOG, now returns boxes
-    person_dnn.py    # fast person boxes via cv2.dnn for real-time CCTV
-    face_yunet.py    # faces + 5 landmarks (cv2.FaceDetectorYN)
-    segment.py       # person segmentation mask (optional extra)
-    tracker.py       # IoU tracker + hold boxes for N frames after a miss
-  background/        # locked | running | calibrate
+    person_dnn.py    # (not yet) fast person boxes via cv2.dnn for real-time CCTV
+    face_yunet.py    # (not yet) faces + 5 landmarks (cv2.FaceDetectorYN)
+    segment.py       # (not yet) person segmentation mask (optional extra)
+    tracker.py       # greedy IoU tracker + TrackerRefiner: holds person boxes and faces
+                     # for N frames after a miss, without motion extrapolation
+  background/        # locked | running | calibrate; vetting.py: person_free, any_person
   modes/
-    erase.py         # today's petrify: frame freeze (later: mask-level erase)
+    erase.py         # today's petrify: frame freeze (later: mask-level erase); ERASE factory
   stages/
     roi_overlay.py   # live timestamp paste (existing Compositor)
   sinks/
@@ -101,13 +107,16 @@ petrify/
     virtualcam.py    # pyvirtualcam
     mjpeg.py         # localhost stream for the webapp
     preview.py       # cv2 window (requires non-headless OpenCV)
-    rtsp.py          # later: re-publish for an NVR
+    threaded.py      # ThreadedSink: writes a wrapped sink on a worker thread
+    rtsp.py          # (not yet) re-publish for an NVR
   server/
     app.py           # FastAPI: config API + MJPEG stream + stats
-    static/index.html
+    control.py       # RunControl: thread-safe hand-off between the loop and the server,
+                     # runtime bounds, weakened protections, the mode for the page
+    static/          # index.html, app.js, app.css
   cli.py             # `petrify run --source ... --mode ...`; legacy `petrify in out` kept
 
-plugins/petrify-shadow/      # separate package with its own pyproject
+plugins/petrify-shadow/      # (not yet) separate package with its own pyproject
   petrify_shadow/
     mode.py          # ShadowMode: declares required detections per style
     styles/          # gaussian, pixelate, noise, eyebar, facebox,
@@ -116,8 +125,15 @@ plugins/petrify-shadow/      # separate package with its own pyproject
 
 ### Plugin mechanism
 
-- Modes register through the `petrify.modes` Python entry point.
-- Installing `petrify-shadow` makes `--mode shadow` available in the CLI and lists it in the webapp automatically.
+Implemented in phase 4. [PLUGINS.md](PLUGINS.md) is the guide for plugin authors; this is the summary.
+
+- A plugin publishes a `ModeFactory` instance under the `petrify.modes` entry point group (`name = "module:attr"`). `petrify run --mode NAME` selects it, `--mode-option KEY=VALUE` sets its options, and `--list-modes` lists the modes.
+- Built-in modes are declared in code (`registry.BUILTIN_MODES`), so `erase` works from a source checkout and an installed package can neither remove nor shadow it. A name registered more than once, an invalid name, or a value that is not `module:attr` is listed as not selectable with the reason. Discovery reads metadata only and never raises: a distribution with unreadable metadata is skipped with a warning. Only the selected mode is imported.
+- The factory declares `name`, `summary`, `options` (`OptionSpec`), `needs_background`, `roi_overlay`, and the methods `requires(options)`, `mandatory(options)`, `create(ctx, previous)`, and `weakened(options)`. `create` receives a `ModeContext` (source info, the whole config, the resolved options, and the background when the factory needs one) and returns `previous` when nothing the mode depends on changed.
+- The mode has `name`, `requires`, `render(frame, detections, subject_present)`, a `detect_policy` (`"first_hit"` or `"all"`, required for a plugin mode), and optionally `mandatory`. When `subject_present` is True the mode must cover the subject, cover the whole frame when it has no regions to draw on, and return an array that does not share memory with the input image; the engine checks the type, shape, dtype, and memory and fails the frame closed otherwise.
+- Option values have one canonical type per kind (`bool`, `int`, `float`, `choice`, `choices`), because the pipeline detects a settings change with `!=`. An option marked `runtime` can be changed from the web page; a runtime number option must declare both bounds.
+- `build_mode` checks what `create` returns. A `ValueError` from the factory means the settings are not acceptable: at startup the run stops with the message, and during a run the change is rejected and the previous settings stay. Any other exception, or a broken contract, raises `ModeLoadError`: the plugin is faulty. At startup that also stops the run; during a run it is reported as a rejected change.
+- Installing `petrify-shadow` (phase 5) will make `--mode shadow` available in the CLI and list it on the web page without changes to core.
 - Keeping shadow as its own package proves the plugin API is real and keeps heavy dependencies (e.g. `mediapipe`) out of core.
 
 ## Shadow mode styles
@@ -161,6 +177,8 @@ Profiles are presets of defaults, not code forks. Every value can be overridden.
 
 Implemented in phase 3 (`petrify run --web`): the processed MJPEG feed, the opt-in raw preview (`--web-raw-preview`), run stats and per-stage timings, a stop button, and controls for the erase settings only (detector, detector thresholds, background differ, lookahead, frame budget, ROI), with a list of weakened protections. Changes are sent over REST only (the page polls the state); there is no WebSocket. Mode, style, strength, box padding, hold frames, and the debug overlay belong to later phases.
 
+Added in phase 4: a Mode section that shows the active mode, its origin and options, and the installed modes, with controls for the options the mode marks `runtime`, the mode's own weakened protections in the weakened list, and a trust notice for a plugin mode. The mode cannot be switched during a run. Style, strength, box padding, and the debug overlay are planned as options of the shadow mode; hold frames are set with `--track-hold` and are not changeable from the page.
+
 ## Findings from phases 2 and 3
 
 Design points that later phases must address:
@@ -171,6 +189,19 @@ Design points that later phases must address:
 - A lasting lighting change freezes the output of an online background, which keeps showing the old background.
 - The live paths (webcams, streams, virtual camera, preview) were developed against test doubles and still need verification on real hardware.
 
+## Findings from phase 4
+
+Design points that later phases (the detectors, `petrify-shadow`, CCTV hardening) must respect:
+
+- The ROI overlay pastes the live pixels of the timestamp region over the mode's output. It is a per-mode choice (`ModeFactory.roi_overlay`): right for erase, wrong for any mode that obscures regions, which must set it to False, since a face inside the ROI would be pasted back unobscured.
+- Frames frozen by the lookahead (gap fill, cold start, the frames around a reconfiguration) carry no regions: only the frame's own detections, usually none. A region mode must cover the whole frame on such frames. Holding regions across those frames needs another mechanism than the boolean lookahead.
+- A mode cannot tell a cold-start or gap-filled frame from a frame with a detected subject: it only receives `subject_present`.
+- Refiners do not run on a frame whose detection failed (that frame is black). Tracks do not age on such frames, so a hold lasts more wall-clock frames.
+- `Engine.reconfigure(detectors=...)` alone does not reset a refiner; only refiners that are passed or newly activated are reset. The pipeline therefore hands the refiners over whenever the detectors change (`pipeline._rebuild_components`).
+- Plugin code is trusted. There is no sandbox, and the plugin receives the unprocessed frames. The registry's and the engine's checks guard against mistakes only.
+- Text from package metadata (names, versions, problems) is untrusted even for a plugin that is not selected, and is reduced to printable ASCII on the page. Text from the loaded plugin is reduced to plain text and capped.
+- No detector provides `faces`, `landmarks`, or `mask` yet, and `BackgroundConfig.sample_checkers` accepts the planned detectors' names although only the HOG check exists. The background sample check still depends on HOG alone.
+
 ## Phases
 
 | # | Phase | Done when |
@@ -179,7 +210,7 @@ Design points that later phases must address:
 | 1 | Core engine refactor (done) | `petrify in.mp4 out.mp4` matches the golden output through the new engine. |
 | 2 | Live sources + sinks (done) | Webcam, RTSP, image folder, and push API inputs; preview, ffmpeg pipe, and virtual cam outputs. Erase mode runs live. |
 | 3 | Webapp (done) | Live feed visible in the browser; erase config tweakable live. |
-| 4 | Plugin API + new detectors | YuNet, segmentation, DNN person detector, tracker. Entry-point loading works. |
+| 4 | Plugin API + new detectors (partly done) | Done: entry-point loading, the mode contract and registry, `--mode`, `--mode-option`, `--list-modes`, detection policies and refiners in the engine, the tracker (`--track`), model file lookup with pinned SHA-256 (`--model-dir`), and the Mode section of the web page. Remaining: the YuNet face, DNN person, and segmentation detectors and their model files, which are not available yet. |
 | 5 | `petrify-shadow` plugin | All styles implemented and stackable. |
 | 6 | CCTV hardening | Head-from-body fallback, multi-camera, performance budgets, fail-closed tests. |
 

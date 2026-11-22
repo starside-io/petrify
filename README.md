@@ -202,7 +202,36 @@ petrify run --source rtsp://camera.local/stream --output out.mp4 \
 petrify run --source 'frames/*.png' --fps 10 --output out.mp4
 ```
 
-The run form is selected when the first argument that is not an option is `run` and `--source` is given. Otherwise the arguments are `INPUT OUTPUT`, so a file named `run` still works: `petrify run out.mp4`.
+The run form is selected when the first argument that is not an option is `run` and `--source` (or `--list-modes`) is given. Otherwise the arguments are `INPUT OUTPUT`, so a file named `run` still works: `petrify run out.mp4`.
+
+### Modes and plugins
+
+| Flag | Meaning |
+|---|---|
+| `--mode NAME` | The processing mode. Default: `erase` (built in), which freezes the subject out of the scene. Installed plugins can add modes |
+| `--mode-option KEY=VALUE` | Set an option of the selected mode; repeat it for several options. The erase mode has none |
+| `--list-modes` | Print the available modes and exit; needs no `--source`. With `--mode NAME`, also print that mode's options (kind, default, range or choices, whether it can be changed while running) |
+
+```bash
+petrify run --list-modes
+petrify run --list-modes --mode NAME
+```
+
+A plugin is a Python package that registers a mode under the `petrify.modes` entry point group. `--list-modes` reads package metadata only and imports no plugin except the one named by `--mode`. A mode name registered twice, or a plugin that tries to use the name `erase`, is listed as not selectable with the reason. A package with unreadable metadata is skipped with a warning.
+
+> **A mode plugin is ordinary Python code.** It runs in the petrify process with petrify's permissions and receives the unprocessed frames, people included. Install only plugins you trust. petrify's checks on a plugin catch mistakes, not a hostile plugin. When the selected mode is a plugin, the run logs a warning naming its package and version.
+
+petrify ships no mode plugin yet. [docs/PLUGINS.md](docs/PLUGINS.md) describes how to write one.
+
+### Tracking and model files
+
+| Flag | Meaning |
+|---|---|
+| `--track` | Enable the box tracker: a person or face box is held for a few frames after the detector stops finding it. Only for modes that use boxes; the erase mode does not accept it, and the run stops with an error |
+| `--track-hold N` | Frames a tracked box is held after its last detection (implies `--track`). Default: 15 |
+| `--model-dir DIR` | Directory searched first for detector model files. The detectors available so far need no model files, so it has no effect yet |
+
+Model files, once detectors need them, are looked up in this order: an explicit path in the config, `--model-dir`, the `PETRIFY_MODEL_DIR` environment variable, then the per-user data directory (`~/Library/Application Support/petrify/models` on macOS, `$XDG_DATA_HOME/petrify/models` or `~/.local/share/petrify/models` on Linux, `%LOCALAPPDATA%\petrify\models` on Windows). A file is loaded only when its size and SHA-256 match the value pinned in petrify's code. petrify never downloads anything.
 
 ### Sources
 
@@ -257,7 +286,7 @@ Frames are written black until the background is ready. With `running` or `calib
 
 ### Fail closed
 
-A frame that cannot be processed safely is written black and counted: a detector error, the background not ready yet, or a frame over `--frame-budget-ms` (the per-frame time budget for detection plus rendering; no budget by default). The end-of-run summary reports how many frames failed closed.
+A frame that cannot be processed safely is written black and counted: a detector error or malformed detector result, a mode or stage error or an output image of the wrong shape or type, the background not ready yet, or a frame over `--frame-budget-ms` (the per-frame time budget for detection plus rendering; no budget by default). The end-of-run summary reports how many frames failed closed.
 
 ### The web page
 
@@ -275,10 +304,13 @@ The page shows the processed feed (what the outputs receive), the run's status (
 - the background differ (on or off) and its pixel and area thresholds
 - the lookahead and the frame budget
 - the ROI: disabled, or a manual box no larger than the run's `--roi-max-area` of the frame
+- the options the active mode marks as changeable while running
 
 The values are bounded more tightly than on the command line, so every detector can still fire. The background strategy, the source, the outputs, the mode, the encoding, the MOG2 history, and the downsample factors are fixed for the run. Changes are applied at the next frame boundary, and each one briefly freezes the output: the frames buffered at that moment and at least one lookahead window after them show the background. A change of only the frame budget freezes nothing.
 
-A "Weakened protections" list on the page names every setting in effect that can let a person be shown: the background differ off, the person detector alone with the differ off, a detector threshold more than twice its startup value, a lookahead below its startup value or 0, a manual ROI over 5 percent of the frame, and the raw preview. Each newly weakened protection is also logged as a warning.
+A Mode section shows the active mode, its origin (built in, or the plugin's package and version), its description, its options with their current values, and the installed modes. Only options the mode marks as changeable while running get a control; the others are shown as fixed for the run. The mode itself cannot be switched during a run: stop the run and start a new one with `--mode`. When the mode comes from a plugin, the section shows a notice that it runs in the petrify process with petrify's permissions and receives the unprocessed frames.
+
+A "Weakened protections" list on the page names every setting in effect that can let a person be shown: the background differ off, the person detector alone with the differ off, a detector threshold more than twice its startup value, a lookahead below its startup value or 0, a manual ROI over 5 percent of the frame, and the raw preview. It also lists the sentences the active mode reports for its own options; a mode that cannot report them is listed as possibly weakening the protection. Each newly weakened protection is also logged as a warning.
 
 `--realtime` processes a video file or image folder no faster than its frame rate, so it can be watched on the page. It changes no output frame and is ignored for live sources.
 
@@ -287,6 +319,8 @@ Security model:
 - The server listens on `127.0.0.1` only, and every request must carry a `Host` of exactly `127.0.0.1:PORT`. Use the printed `http://127.0.0.1:PORT/` link: `localhost` is refused on purpose, because the server does not listen on `[::1]`, where another local user could.
 - The link holds a per-run token. Whoever has the link controls the run, so do not share it. The token is never logged, and the server's access log is off.
 - The unprocessed input feed is never served unless the run was started with `--web-raw-preview`, which shows it next to the processed feed and lists it as a weakened protection.
+- The page does not protect against the active mode: a plugin mode runs in the petrify process and receives the unprocessed frames whatever the page shows.
+- Text that comes from a plugin (its description, option help, weakened sentences, error messages) is shown as plain text, with control and formatting characters removed and the length capped. Text from package metadata (mode names, package names, versions) is reduced to printable ASCII, other characters shown as `?`, so a name cannot pass for another mode's. Only runtime mode options can be changed, and a numeric one only within the bounds the mode declares.
 
 ---
 
@@ -295,11 +329,13 @@ Security model:
 Known limitations, in particular for live use:
 
 1. **Live paths are unverified on real hardware.** Webcams (`camera:N`), stream URLs, `--virtualcam`, and `--preview` were developed and tested against test doubles. They have not been verified with real cameras, streams, virtual camera drivers, or windows.
-2. **An online background can absorb a person.** With `--background running` or `calibrate`, a person in view while the background is learned can be absorbed into it and then shown on frozen frames after they leave. The person check on background samples reduces this, but it uses the HOG pedestrian detector, which often misses a seated person framed from the chest up (the usual webcam view). Start with the scene empty. Do not rely on erase mode on a webcam for privacy yet; stronger detectors are planned.
-3. **The timestamp ROI is shown live.** Anything inside the ROI region is not anonymized, by design.
-4. **A slow entry at the frame edge can show through.** A subject entering slowly at the edge of the frame can be partly visible for a few frames before it is detected, more so with a small `--lookahead` (the `camera:N` default is 3).
-5. **A lasting lighting change freezes an online background.** With `running` or `calibrate` and the background differ on (the default), a lasting change in lighting makes every frame differ from the learned background, so the output freezes and keeps showing the old background.
-6. **Golden parity tests need demo clips that are not in the repository.** Without `data/camera.mp4` and `data/camera2.mp4` they are skipped.
+2. **An online background can absorb a person.** With `--background running` or `calibrate`, a person in view while the background is learned can be absorbed into it and then shown on frozen frames after they leave. The person check on background samples reduces this, but it uses the HOG pedestrian detector, which often misses a seated person framed from the chest up (the usual webcam view). Start with the scene empty. Do not rely on erase mode on a webcam for privacy yet.
+3. **The stronger detectors are not there yet.** Face detection (YuNet), DNN person boxes, and person segmentation are planned but not implemented: they need model files that are not available yet. Erase still relies on MOG2, HOG, and the background differ alone, and so does the background sample check. `--model-dir` has no effect until such a detector exists.
+4. **A plugin mode is trusted code.** It runs in the petrify process and receives the unprocessed frames. petrify does not sandbox or vet it.
+5. **The timestamp ROI is shown live.** Anything inside the ROI region is not anonymized, by design.
+6. **A slow entry at the frame edge can show through.** A subject entering slowly at the edge of the frame can be partly visible for a few frames before it is detected, more so with a small `--lookahead` (the `camera:N` default is 3).
+7. **A lasting lighting change freezes an online background.** With `running` or `calibrate` and the background differ on (the default), a lasting change in lighting makes every frame differ from the learned background, so the output freezes and keeps showing the old background.
+8. **Golden parity tests need demo clips that are not in the repository.** Without `data/camera.mp4` and `data/camera2.mp4` they are skipped.
 
 ---
 

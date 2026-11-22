@@ -46,11 +46,28 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Sink isolation: sinks receive only the output image and frame metadata, never the input frame. A failing non-critical sink is dropped and counted while the run continues; a failing critical sink aborts the run
 - Frame time budget (`frame_budget_ms`): a frame over budget fails closed to black and is counted
 - The engine refuses to start when its mode requires detections and no detector provides any, and rejects re-entrant calls
+- Per-mode detection policy (`Mode.detect_policy`): `"first_hit"` (erase) stops the stateless detectors at the first hit, `"all"` runs every active detector on every frame. `Mode.mandatory` names detection kinds that must have an active detector or refiner, or the engine refuses to start or to reconfigure
+- Refiners (`petrify.core.plugin.Refiner`) run after the detectors and add detections; they require the `"all"` policy and do not run on a frame whose detection failed
 
 #### Web page
 - `--web`, `--web-port` (default 8765), and `--web-raw-preview` (optional extra `petrify[web]`): a local page that shows the processed feed, the run status and timings, and a stop button, and changes the detector, detector thresholds, background differ, lookahead, frame budget, and ROI while the run is in progress. Each change is applied at the next frame boundary and briefly freezes the output
 - A "Weakened protections" list on the page and in the log: the background differ off, the person detector alone with the differ off, a threshold more than twice its startup value, a lookahead below its startup value or 0, a manual ROI over 5 percent of the frame, and the raw preview
 - `petrify.server.control.RunControl`, the thread-safe link between the processing loop and the server
+- A Mode section on the page: the active mode, its origin, description, and options, and the installed modes. Options the mode marks as `runtime` can be changed while the run is in progress; the others are shown as fixed. A plugin mode is marked with a notice that it runs in the petrify process and receives the unprocessed frames. The mode cannot be switched during a run
+- The "Weakened protections" list also holds the sentences the active mode reports for its options (`ModeFactory.weakened`), or a sentence saying the mode could not report them
+
+#### Modes and plugins
+- Mode plugins: an installed package registers a mode under the `petrify.modes` entry point group, and `petrify run --mode NAME` selects it (`petrify.core.registry`). The built-in `erase` cannot be shadowed. A plugin that is not selected is never imported. A distribution whose metadata cannot be read is skipped with a warning, and a mode name that is invalid, registered more than once, or not `module:attr` is listed as not selectable with the reason
+- `petrify run --list-modes` lists the modes without a `--source`; with `--mode NAME` it also prints that mode's options. `--mode-option KEY=VALUE` sets an option of the selected mode
+- The mode contract in `petrify.core.plugin`: `ModeFactory` (`name`, `summary`, `options`, `needs_background`, `roi_overlay`, `requires`, `mandatory`, `create`, `weakened`), `ModeContext`, and `OptionSpec` with the kinds `bool`, `int`, `float`, `choice`, and `choices`, each stored in one canonical type. A `runtime` number option must declare a minimum and a maximum. A plugin mode must declare `detect_policy`
+- When the selected mode comes from a plugin, the run logs a warning that it runs in the petrify process with petrify's permissions and receives the unprocessed frames
+- `docs/PLUGINS.md`, a guide to writing a mode plugin
+
+#### Tracking and models
+- `--track` and `--track-hold N` (default 15) in `petrify run`: a greedy IoU box tracker (`petrify.detectors.tracker`) that holds person boxes and faces for N frames after a miss, without moving them. The erase mode does not accept it
+- `--model-dir` and `petrify.models`: model files are looked up in an explicit path, `--model-dir`, `PETRIFY_MODEL_DIR`, then the per-user data directory, and loaded only when their size and SHA-256 match a pinned value. petrify never downloads anything. No model is listed yet, so `--model-dir` has no effect until a detector that needs one exists
+- Config sections for the planned YuNet face, DNN person, and segmentation detectors. The detectors themselves are not implemented yet
+- `petrify.background.any_person` combines several background sample checks into one. Only the HOG check exists so far
 
 ### Changed
 - `petrify INPUT OUTPUT` now runs through the streaming engine (`petrify.pipeline.run_file`) instead of the two-pass pipeline. Output for the same input and flags is unchanged, verified frame for frame against recorded fixtures. Background selection and timestamp ROI auto-detection still pre-scan the file before the processing pass
@@ -61,6 +78,11 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Optional extras `web` (FastAPI, uvicorn) and `virtualcam` (pyvirtualcam); `httpx` added to the `dev` extra for the web tests
 - In `petrify run`, `--hwaccel` is passed to the FFmpeg process that encodes `--output` but does not speed anything up, since petrify decodes the source itself; the help says so
 - A live run ended with Ctrl-C finalizes its outputs; a second Ctrl-C while they are finalized aborts. A live run that fails keeps the recording written up to that point and logs the error. FFmpeg runs in its own session, so a Ctrl-C reaches petrify only
+- Detector results are validated and normalized before they are merged (`petrify.core.detections.check_detections`). A detector that returns a malformed result now gives a black frame, counted as failed closed, instead of aborting the run. A detector's `provides` must hold `DetectionKind` members. Boxes reach the mode clipped to the frame, and the mask as a read-only copy
+- `Detections.merged` returns the union of both results (flags OR-ed, boxes and faces concatenated, masks OR-ed) instead of letting the other side's fields override this one's
+- `Detections.subject_present` also counts a face or a mask pixel as a subject
+- A mode or stage that returns something other than a `numpy.ndarray` with the input frame's shape and dtype, or, on a frame where a subject is present, an array that may share memory with the input image, now fails that frame closed
+- `petrify run` builds the mode through the registry: a detector is built only when the mode requires what it provides, the background only when the mode needs one, and the ROI stage only when the mode allows it
 
 ### Removed
 - MOG2 pre-warmup: it never had an effect, because its model was reset before use
@@ -77,6 +99,8 @@ petrify adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The unprocessed feed is served only with `--web-raw-preview`, and is then listed as a weakened protection
 - Values set from the web page are bounded so every detector can still fire, and a manual ROI set there may not exceed the `--roi-max-area` cap, since its region is shown live
 - `--output` equal to the input file, or to one of the images of an image folder source, is rejected
+- A mode plugin is trusted code with petrify's permissions and the unprocessed frames; there is no sandbox. The checks on a plugin (factory and mode shape, names, option specs, `requires` and `mandatory`, output images) guard against mistakes, not against a hostile plugin
+- Text from a plugin is shown on the web page as plain text with a length cap, and text from package metadata as printable ASCII, so a listed name cannot pass for another mode's. The ROI overlay, which pastes live pixels, runs only for a mode that allows it (`roi_overlay`), so a mode that obscures regions does not get them pasted back
 
 ---
 
