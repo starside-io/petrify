@@ -1245,6 +1245,25 @@ _MODEL_OF: dict[type, ModelSpec] = {
 }
 
 
+def _builds_motion(config: PetrifyConfig, requires: frozenset[DetectionKind]) -> bool:
+    """True when the run builds the motion detector for ``config`` and ``requires``."""
+    return config.detector in ("motion", "both") and _wants(MotionDetector, requires)
+
+
+def _builds_person(config: PetrifyConfig, requires: frozenset[DetectionKind]) -> bool:
+    """True when the run builds a person box detector (HOG or DNN).
+
+    The detector selection and the tracker refiners both read this, so a
+    persons refiner exists exactly when a detector feeds it person boxes.
+    """
+    return config.detector in ("person", "both") and _wants(PersonDetector, requires)
+
+
+def _builds_faces(config: PetrifyConfig, requires: frozenset[DetectionKind]) -> bool:
+    """True when the run builds the face detector; shared with the refiners as above."""
+    return config.faces is not None and _wants(FaceYuNetDetector, requires)
+
+
 def _person_detector(
     config: PetrifyConfig, models: _ModelDetectors
 ) -> PersonDetector | PersonDnnDetector:
@@ -1258,7 +1277,7 @@ def _faces_detector(
     config: PetrifyConfig, requires: frozenset[DetectionKind], models: _ModelDetectors
 ) -> FaceYuNetDetector | None:
     """The face detector when the config enables it and the mode requires faces or landmarks."""
-    if config.faces is None or not _wants(FaceYuNetDetector, requires):
+    if not _builds_faces(config, requires):
         return None
     return models.get(FaceYuNetDetector, config.faces)
 
@@ -1289,9 +1308,9 @@ def _frame_detectors(
     """
     motion = None
     person = None
-    if config.detector in ("motion", "both") and _wants(MotionDetector, requires):
+    if _builds_motion(config, requires):
         motion = MotionDetector.from_config(config.motion)
-    if config.detector in ("person", "both") and _wants(PersonDetector, requires):
+    if _builds_person(config, requires):
         person = _person_detector(config, models)
     return motion, person, _faces_detector(config, requires, models), _segmenter(
         config, requires, models
@@ -1336,29 +1355,109 @@ def _uses_sample_check(factory: ModeFactory, config: PetrifyConfig) -> bool:
 
 
 def _refiners(config: PetrifyConfig, requires: frozenset[DetectionKind]) -> tuple[Refiner, ...]:
-    """Build the tracker refiners for the kinds the mode requires, or none without a tracker."""
+    """Build the tracker refiners, or none without a tracker.
+
+    A refiner is built for a kind only when the mode requires it and the run
+    builds the detector that provides it: a refiner with no source of boxes would
+    make the engine refuse to start (for example persons with ``--detector motion``).
+    """
     tracker = config.tracker
     if tracker is None:
         return ()
+    persons, faces, landmarks = _tracked_kinds(config, requires)
     refiners: list[Refiner] = []
-    if DetectionKind.PERSONS in requires:
+    if persons:
         refiners.append(TrackerRefiner.from_config(DetectionKind.PERSONS, tracker))
-    if DetectionKind.FACES in requires:
+    if faces:
         refiners.append(
             TrackerRefiner.from_config(
-                DetectionKind.FACES, tracker, landmarks=DetectionKind.LANDMARKS in requires
+                DetectionKind.FACES, tracker, landmarks=landmarks
             )
         )
     return tuple(refiners)
 
 
-def _tracked_kinds(requires: frozenset[DetectionKind]) -> tuple[bool, bool, bool]:
-    """What :func:`_refiners` builds for ``requires``: persons, faces, landmarks."""
+def _tracked_kinds(
+    config: PetrifyConfig, requires: frozenset[DetectionKind]
+) -> tuple[bool, bool, bool]:
+    """What :func:`_refiners` builds for ``config`` and ``requires``: persons, faces, landmarks.
+
+    It depends on the detector settings as well as on ``requires``, so a live
+    switch of ``config.detector`` or of the face section rebuilds the refiners.
+    """
+    # The faces refiner also serves a mode that requires landmarks without faces:
+    # with landmarks it provides {faces, landmarks}, so the engine keeps it active.
+    faces = _builds_faces(config, requires)
     return (
-        DetectionKind.PERSONS in requires,
-        DetectionKind.FACES in requires,
-        DetectionKind.LANDMARKS in requires,
+        DetectionKind.PERSONS in requires and _builds_person(config, requires),
+        faces,
+        faces and DetectionKind.LANDMARKS in requires,
     )
+
+
+# The kinds the tracker can hold, each with the kinds that make a mode want it held.
+_HOLDABLE: tuple[tuple[DetectionKind, frozenset[DetectionKind]], ...] = (
+    (DetectionKind.PERSONS, frozenset({DetectionKind.PERSONS})),
+    (DetectionKind.FACES, frozenset({DetectionKind.FACES, DetectionKind.LANDMARKS})),
+)
+
+TRACKER_UNTRACKED_WARNING = (
+    "The tracker (--track) does not hold {kind}: the mode {mode!r} requires {kind} but "
+    "no detector the run builds provides them (detector: {detector}), so {kind} are "
+    "not held between detections"
+)
+
+TRACKER_NOTHING_TO_HOLD_WARNING = (
+    "The tracker (--track) has nothing to hold: the mode {mode!r} requires neither "
+    "persons nor faces, so the tracker has no effect"
+)
+
+
+def untracked_kinds(
+    config: PetrifyConfig, requires: frozenset[DetectionKind]
+) -> tuple[DetectionKind, ...]:
+    """The kinds the tracker would hold for the mode but cannot, as no detector provides them.
+
+    Empty without a tracker. Derived from :func:`_tracked_kinds`, so it names
+    exactly the holdable kinds that :func:`_refiners` builds no refiner for.
+    """
+    if config.tracker is None:
+        return ()
+    persons, faces, _ = _tracked_kinds(config, requires)
+    tracked = {DetectionKind.PERSONS: persons, DetectionKind.FACES: faces}
+    return tuple(
+        kind for kind, wanted_by in _HOLDABLE if wanted_by & requires and not tracked[kind]
+    )
+
+
+def _warn_untracked(config: PetrifyConfig, requires: frozenset[DetectionKind]) -> None:
+    """Log that the tracker leaves a required kind unheld, or that it has nothing to hold.
+
+    Without this, ``--track`` would silently do nothing for those kinds.
+    """
+    if config.tracker is None:
+        return
+    if not any(wanted_by & requires for _, wanted_by in _HOLDABLE):
+        logger.warning(TRACKER_NOTHING_TO_HOLD_WARNING.format(mode=config.mode))
+        return
+    for kind in untracked_kinds(config, requires):
+        logger.warning(
+            TRACKER_UNTRACKED_WARNING.format(
+                kind=kind.value, mode=config.mode, detector=config.detector
+            )
+        )
+
+
+def _check_tracker_policy(config: PetrifyConfig, mode: Mode) -> None:
+    """Refuse the tracker with a 'first_hit' mode, whatever refiners happen to be built.
+
+    The rule must not depend on the detector settings: otherwise a run could
+    start with the tracker and a later detector switch would be refused for it.
+    The policy is read after :func:`build_mode`, which has validated it; a mode
+    without the attribute gets the engine's default, 'first_hit'.
+    """
+    if config.tracker is not None and getattr(mode, "detect_policy", "first_hit") == "first_hit":
+        raise ValueError(TRACKER_FIRST_HIT_ERROR.format(mode=config.mode))
 
 
 def _background_differ(
@@ -1489,8 +1588,10 @@ def _build_components(
     refiners = _refiners(config, requires)
     # The engine rejects active refiners under 'first_hit', but only once the mode
     # is built, which for erase is after the background scan has read frames. The
-    # built-in erase mode's policy is a class constant, so it is checked here.
-    if refiners and factory is ERASE and EraseMode.detect_policy == "first_hit":
+    # built-in erase mode's policy is a class constant, so it is checked here. It
+    # tests the tracker setting, not the refiners built: with --detector motion no
+    # refiner is built, and --track must still be refused rather than ignored.
+    if config.tracker is not None and factory is ERASE and EraseMode.detect_policy == "first_hit":
         raise ValueError(TRACKER_FIRST_HIT_ERROR.format(mode=config.mode))
     models = _ModelDetectors(config)
     motion, person, faces, segment = _frame_detectors(config, requires, models)
@@ -1515,6 +1616,12 @@ def _build_components(
         logger.warning(DNN_WITHOUT_DIFFER_WARNING)
     ctx = _mode_context(source.info, config, factory, options, background)
     mode = build_mode(factory, ctx)
+    # A plugin's policy is known only now. Frames were read before this point only
+    # when the mode needs a background or the ROI is auto-detected; no sink is open.
+    _check_tracker_policy(config, mode)
+    # After the policy check, so a run refused for the tracker is not also told
+    # which kinds the tracker would not hold.
+    _warn_untracked(config, requires)
     components = _Components(
         config=config,
         motion=motion,
@@ -1573,12 +1680,12 @@ def _rebuild_components(
     requires = _mode_requires(factory, options, new)
     models = old.models if new.models == old.models.models else _ModelDetectors(new)
     motion: MotionDetector | None = None
-    if new.detector in ("motion", "both") and _wants(MotionDetector, requires):
+    if _builds_motion(new, requires):
         motion = old.motion
         if motion is None or new.motion != cfg.motion:
             motion = MotionDetector.from_config(new.motion)
     person: PersonDetector | PersonDnnDetector | None = None
-    if new.detector in ("person", "both") and _wants(PersonDetector, requires):
+    if _builds_person(new, requires):
         if new.person_dnn is not None:
             person = models.get(PersonDnnDetector, new.person_dnn)
         else:
@@ -1599,11 +1706,15 @@ def _rebuild_components(
                 differ = BackgroundDiffer.from_model(old.background, new.background_diff)
     ctx = _mode_context(old.source, new, factory, options, old.background)
     mode = build_mode(factory, ctx, old.mode)
+    # The same rule as at startup, so a rebuild cannot accept what startup refuses.
+    _check_tracker_policy(new, mode)
     roi_stage = old.roi_stage
     if roi_stage is not None and new.roi != cfg.roi:
         roi_stage = RoiOverlay(new.roi.box if new.roi.mode == "manual" else None)
     refiners = old.refiners
-    if new.tracker != cfg.tracker or _tracked_kinds(requires) != _tracked_kinds(old.requires):
+    if new.tracker != cfg.tracker or _tracked_kinds(new, requires) != _tracked_kinds(
+        cfg, old.requires
+    ):
         refiners = _refiners(new, requires)
 
     built = _Components(
@@ -1667,6 +1778,12 @@ def _apply_pending(
         return components
     if live and new.background_diff is None and components.config.background_diff is not None:
         logger.warning(NO_BG_DIFF_LIVE_WARNING)
+    if (new.tracker, _tracked_kinds(new, built.requires)) != (
+        components.config.tracker,
+        _tracked_kinds(components.config, components.requires),
+    ):
+        # Logged only once the engine accepted the change, so a rejected one says nothing.
+        _warn_untracked(new, built.requires)
     if kwargs:
         logger.info("Settings changed at a frame boundary: %s", ", ".join(sorted(kwargs)))
     control.report_applied(new)

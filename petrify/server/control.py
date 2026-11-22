@@ -116,6 +116,13 @@ MODE_WEAKENED_MORE = (
     "The mode {name} reported {count} more weakened protections that are not listed here."
 )
 
+# Shown, as a weakened protection, for each kind the mode requires that the tracker
+# is on for but cannot hold, because no detector in use provides it.
+TRACKER_UNTRACKED_WEAKENED = (
+    "The tracker is on but does not hold {kind}: no detector in use provides them, "
+    "so {kind} are not held between detections."
+)
+
 # Top-level config keys that exist but are fixed for the whole run.
 _FIXED_SECTIONS = {
     "background": "the background strategy and its settings",
@@ -855,7 +862,7 @@ class RunControl:
         # latest generation is installed (see report_applied).
         self._generation = 0
         self._builtin_part = self._builtin_weakened(config)
-        self._mode_part = self._mode_weakened(config) if factory is not None else []
+        self._mode_part = self._mode_part_for(config) if factory is not None else []
         self._weakened = self._builtin_part + self._mode_part
         self._announced = {key for key, _ in self._weakened}
         self._mode = self._mode_for(config)
@@ -917,6 +924,40 @@ class RunControl:
             config, self._startup, self._frame_size, raw_preview=self._raw_preview,
             startup_differ=self._startup_differ,
         )
+
+    def _mode_part_for(self, config: PetrifyConfig) -> list[tuple[str, str]]:
+        """The part of the weakened list that runs plugin code; never under the lock."""
+        return self._mode_weakened(config) + self._tracker_weakened(config)
+
+    def _tracker_weakened(self, config: PetrifyConfig) -> list[tuple[str, str]]:
+        """One sentence per kind the tracker cannot hold; never raises.
+
+        What the mode requires comes from ``factory.requires`` (plugin code: never
+        call it with the lock held). When it fails or returns something else than
+        a frozenset of kinds, nothing is listed here: the run itself refuses such
+        a mode. The kinds come from the pipeline's own rule, so the page and the
+        startup warning name the same ones.
+        """
+        if config.tracker is None:
+            return []
+        factory = self._factory
+        assert factory is not None
+        # Imported here: the pipeline loads OpenCV, which this module does not need otherwise.
+        from petrify.core.detections import DetectionKind  # noqa: PLC0415
+        from petrify.pipeline import untracked_kinds  # noqa: PLC0415
+
+        try:
+            requires = factory.requires(MappingProxyType(self._options_for(config)))
+        except (Exception, SystemExit):  # noqa: BLE001 (plugin code; the run reports it)
+            return []
+        if not isinstance(requires, frozenset) or not all(
+            isinstance(kind, DetectionKind) for kind in requires
+        ):
+            return []
+        return [
+            (f"untracked:{kind.value}", TRACKER_UNTRACKED_WEAKENED.format(kind=kind.value))
+            for kind in untracked_kinds(config, requires)
+        ]
 
     def _mode_weakened(self, config: PetrifyConfig) -> list[tuple[str, str]]:
         """The sentences of ``factory.weakened`` as (key, sentence) pairs; never raises.
@@ -1070,7 +1111,7 @@ class RunControl:
             if self._factory is None:
                 new = self._announce()
         if self._factory is not None:
-            part = self._mode_weakened(config)  # Plugin code: outside the lock.
+            part = self._mode_part_for(config)  # Plugin code: outside the lock.
             with self._lock:
                 if generation != self._generation:
                     return  # A newer config was applied; its own call installs its list.

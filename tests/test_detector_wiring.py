@@ -32,9 +32,11 @@ from petrify.core.config import (
     PersonHogConfig,
     PetrifyConfig,
     SegmentConfig,
+    TrackerConfig,
     mode_options_from,
 )
 from petrify.core.detections import Box, DetectionKind, Detections, Face, MalformedDetections
+from petrify.core.engine import _resolve
 from petrify.core.frame import Frame
 from petrify.core.registry import ENTRY_POINT_GROUP, ModeLoadError
 from petrify.detectors import FaceYuNetDetector, PersonDnnDetector, PersonSegmenter
@@ -49,6 +51,9 @@ from petrify.pipeline import (
     SAMPLE_CHECK_STUCK_WARNING,
     SAMPLE_REJECTION_STREAK,
     SEGMENT_NOT_USED_WARNING,
+    TRACKER_FIRST_HIT_ERROR,
+    TRACKER_NOTHING_TO_HOLD_WARNING,
+    TRACKER_UNTRACKED_WARNING,
     OutputConfig,
     run_stream,
 )
@@ -144,6 +149,10 @@ MASK = KindsFactory("mask", {K.MASK})
 PERSONS = KindsFactory("persons", {K.PERSONS})
 MOTION_FACES = KindsFactory("motionfaces", {K.MOTION, K.FACES})
 EVERYTHING = KindsFactory("everything", {K.MOTION, K.PERSONS, K.FACES, K.LANDMARKS, K.MASK})
+TRACKED = KindsFactory("tracked", {K.MOTION, K.PERSONS, K.FACES, K.LANDMARKS})
+MOTION_PERSONS = KindsFactory("motionpersons", {K.MOTION, K.PERSONS})
+FIRST_HIT_MOTION_PERSONS = KindsFactory("fhmotionpersons", {K.MOTION, K.PERSONS}, "first_hit")
+LANDMARKS_ONLY = KindsFactory("landmarksonly", {K.LANDMARKS})
 FIRST_HIT_FACES = KindsFactory("fhfaces", {K.FACES, K.LANDMARKS}, "first_hit")
 FIRST_HIT_MASK = KindsFactory("fhmask", {K.MASK}, "first_hit")
 FIRST_HIT_MOTION_FACES = KindsFactory("fhmotionfaces", {K.MOTION, K.FACES}, "first_hit")
@@ -160,6 +169,10 @@ _ENTRY_POINTS = {
     "persons": "PERSONS",
     "motionfaces": "MOTION_FACES",
     "everything": "EVERYTHING",
+    "tracked": "TRACKED",
+    "motionpersons": "MOTION_PERSONS",
+    "fhmotionpersons": "FIRST_HIT_MOTION_PERSONS",
+    "landmarksonly": "LANDMARKS_ONLY",
     "fhfaces": "FIRST_HIT_FACES",
     "fhmask": "FIRST_HIT_MASK",
     "fhmotionfaces": "FIRST_HIT_MOTION_FACES",
@@ -1287,3 +1300,284 @@ def test_first_hit_option_that_mixes_kinds_is_rejected_on_rebuild(builds: ModelB
     components, _ = pipeline._build_components(FakeSource(), config)
     with pytest.raises(ValueError, match='must declare detect_policy = "all"'):
         pipeline._rebuild(components, _use(config, "faces"))
+
+
+# ---------------------------------------------------------------------------
+# Tracker refiners follow the detectors the run builds
+# ---------------------------------------------------------------------------
+
+
+def _tracked_config(detector: str) -> PetrifyConfig:
+    # The DNN stands in for HOG, so person boxes come from a fake detector.
+    return _plugin_config(
+        "tracked", detector=detector, faces=FaceYuNetConfig(), person_dnn=PersonDnnConfig(),
+        tracker=TrackerConfig(),
+    )
+
+
+def _refined(refiners: Any) -> list[tuple[DetectionKind, bool]]:
+    return [(r.kind, r.landmarks) for r in refiners]
+
+
+@pytest.mark.usefixtures("plugin")
+def test_tracker_with_detector_motion_starts_with_the_faces_refiner_only(
+    builds: ModelBuilds,
+) -> None:
+    config = _tracked_config("motion")
+    components, _ = pipeline._build_components(FakeSource(), config)
+    assert components.person is None
+    assert _refined(components.refiners) == [(DetectionKind.FACES, True)]
+    report = run_stream(FakeSource(Scene(total=30)), config, OutputConfig(), sinks=[ListSink()])
+    assert report.stats.frames == 30
+    assert report.stats.failed_closed == 0
+
+
+@pytest.mark.usefixtures("plugin")
+def test_tracker_with_detector_both_builds_both_refiners(builds: ModelBuilds) -> None:
+    components, _ = pipeline._build_components(FakeSource(), _tracked_config("both"))
+    assert _refined(components.refiners) == [
+        (DetectionKind.PERSONS, False), (DetectionKind.FACES, True)
+    ]
+
+
+@pytest.mark.usefixtures("plugin")
+def test_switching_the_detector_rebuilds_the_refiners(builds: ModelBuilds) -> None:
+    motion = _tracked_config("motion")
+    components, _ = pipeline._build_components(FakeSource(), motion)
+    person = dataclasses.replace(motion, detector="person")
+    rebuilt, kwargs = pipeline._rebuild(components, person)
+    assert _refined(rebuilt.refiners) == [
+        (DetectionKind.PERSONS, False), (DetectionKind.FACES, True)
+    ]
+    assert kwargs["refiners"] == list(rebuilt.refiners)
+    back, kwargs = pipeline._rebuild(rebuilt, motion)
+    assert _refined(back.refiners) == [(DetectionKind.FACES, True)]
+    assert kwargs["refiners"] == list(back.refiners)
+
+
+class _QueueControl(RunControl):
+    """A RunControl whose next pending config can be set directly."""
+
+    def __init__(self, config: PetrifyConfig) -> None:
+        super().__init__(config, (W, H))
+        self.queued: PetrifyConfig | None = None
+
+    def take_pending(self) -> PetrifyConfig | None:
+        queued, self.queued = self.queued, None
+        return queued if queued is not None else super().take_pending()
+
+
+@pytest.mark.usefixtures("plugin")
+def test_a_live_detector_switch_hands_the_new_refiners_to_the_engine(
+    builds: ModelBuilds,
+) -> None:
+    motion = _tracked_config("motion")
+    person = dataclasses.replace(motion, detector="person")
+    control = _QueueControl(motion)
+
+    def queue(config: PetrifyConfig) -> Callable[[], None]:
+        def hook() -> None:
+            control.queued = config
+        return hook
+
+    received: list[list[tuple[DetectionKind, bool]]] = []
+    real = pipeline.Engine.reconfigure
+
+    def spy(self: Any, **kwargs: Any) -> Any:
+        received.append(_refined(kwargs["refiners"]))
+        return real(self, **kwargs)
+
+    src = HookSource(Scene(total=60), hooks={20: queue(person), 40: queue(motion)})
+    with mock.patch.object(pipeline.Engine, "reconfigure", spy):
+        report = run_stream(src, motion, OutputConfig(), sinks=[ListSink()], control=control)
+    assert received == [
+        [(DetectionKind.PERSONS, False), (DetectionKind.FACES, True)],
+        [(DetectionKind.FACES, True)],
+    ]
+    assert report.stats.reconfigurations == 2
+    assert report.stats.frames == 60
+    assert control.snapshot().last_error is None
+
+
+@pytest.mark.usefixtures("plugin")
+def test_persons_only_with_detector_motion_still_fails_at_startup(
+    builds: ModelBuilds,
+) -> None:
+    # Nothing provides persons here. The tracker no longer adds a refiner without a
+    # source, so the engine's rule that some detector must provide a required kind
+    # is what refuses the run, instead of the refiner check.
+    config = _plugin_config("persons", detector="motion", tracker=TrackerConfig())
+    components, _ = pipeline._build_components(FakeSource(), config)
+    assert components.refiners == ()
+    sink = ListSink()
+    with pytest.raises(ValueError, match="no detector or refiner provides any of them"):
+        run_stream(FakeSource(), config, OutputConfig(), sinks=[sink])
+    assert sink.opened == 0
+
+
+def _tracker_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "The tracker (--track)" in r.getMessage()]
+
+
+@pytest.mark.usefixtures("plugin")
+def test_tracker_without_a_person_detector_warns_that_persons_are_not_held(
+    builds: ModelBuilds, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = _plugin_config("motionpersons", detector="motion", tracker=TrackerConfig())
+    with caplog.at_level(logging.WARNING):
+        components, _ = pipeline._build_components(FakeSource(), config)
+    assert components.refiners == ()
+    assert _tracker_warnings(caplog) == [
+        TRACKER_UNTRACKED_WARNING.format(kind="persons", mode="motionpersons", detector="motion")
+    ]
+    assert pipeline.untracked_kinds(config, components.requires) == (DetectionKind.PERSONS,)
+
+
+@pytest.mark.usefixtures("plugin")
+def test_tracker_holding_every_required_kind_does_not_warn(
+    builds: ModelBuilds, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        pipeline._build_components(FakeSource(), _tracked_config("both"))
+    assert _tracker_warnings(caplog) == []
+
+
+@pytest.mark.usefixtures("plugin")
+def test_tracker_in_a_mode_without_persons_or_faces_warns_it_has_nothing_to_hold(
+    builds: ModelBuilds, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = _plugin_config("mask", segment=SegmentConfig(), tracker=TrackerConfig())
+    with caplog.at_level(logging.WARNING):
+        components, _ = pipeline._build_components(FakeSource(), config)
+    assert components.refiners == ()
+    assert _tracker_warnings(caplog) == [TRACKER_NOTHING_TO_HOLD_WARNING.format(mode="mask")]
+
+
+@pytest.mark.usefixtures("plugin")
+def test_a_live_switch_that_drops_the_persons_refiner_warns(
+    builds: ModelBuilds, caplog: pytest.LogCaptureFixture
+) -> None:
+    both = _tracked_config("both")
+    motion = dataclasses.replace(both, detector="motion")
+    control = _QueueControl(both)
+
+    def queue(config: PetrifyConfig) -> Callable[[], None]:
+        def hook() -> None:
+            control.queued = config
+        return hook
+
+    untracked = TRACKER_UNTRACKED_WARNING.format(
+        kind="persons", mode="tracked", detector="motion"
+    )
+    src = HookSource(Scene(total=40), hooks={10: queue(motion), 20: queue(motion),
+                                             30: queue(both)})
+    with caplog.at_level(logging.WARNING):
+        report = run_stream(src, both, OutputConfig(), sinks=[ListSink()], control=control)
+    # Once for the switch to motion; not again when nothing changes, nor when the
+    # switch back gives the persons refiner its detector again.
+    assert _tracker_warnings(caplog) == [untracked]
+    assert report.stats.reconfigurations == 2
+
+
+@pytest.mark.usefixtures("plugin")
+@pytest.mark.parametrize(("mode", "sections"), [
+    ("fhmotionpersons", {}),
+    ("fhfaces", {"faces": FaceYuNetConfig()}),
+])
+def test_tracker_with_a_first_hit_plugin_mode_is_refused_at_startup(
+    builds: ModelBuilds, mode: str, sections: dict[str, Any]
+) -> None:
+    # Detector motion builds no refiner for fhmotionpersons: the rule must not
+    # depend on that.
+    config = _plugin_config(mode, detector="motion", tracker=TrackerConfig(), **sections)
+    with pytest.raises(ValueError) as excinfo:
+        pipeline._build_components(FakeSource(), config)
+    assert str(excinfo.value) == TRACKER_FIRST_HIT_ERROR.format(mode=mode)
+    src = FakeSource()
+    sink = ListSink()
+    with pytest.raises(ValueError, match="the tracker \\(--track\\) is active"):
+        run_stream(src, config, OutputConfig(), sinks=[sink])
+    assert sink.opened == 0 and src.yielded == []
+
+
+@pytest.mark.usefixtures("plugin")
+def test_a_rebuild_that_turns_the_tracker_on_for_a_first_hit_mode_is_refused(
+    builds: ModelBuilds,
+) -> None:
+    config = _plugin_config("fhmotionpersons", detector="motion")
+    components, _ = pipeline._build_components(FakeSource(), config)
+    with pytest.raises(ValueError) as excinfo:
+        pipeline._rebuild(components, dataclasses.replace(config, tracker=TrackerConfig()))
+    assert str(excinfo.value) == TRACKER_FIRST_HIT_ERROR.format(mode="fhmotionpersons")
+
+
+@pytest.mark.usefixtures("fake_person_check")
+@pytest.mark.parametrize("detector", ["motion", "person", "both"])
+def test_a_rebuild_that_turns_the_tracker_on_for_erase_is_refused(
+    builds: ModelBuilds, detector: str
+) -> None:
+    config = _live_config("running", detector=detector)
+    components, _ = pipeline._build_components(FakeSource(), config)
+    with pytest.raises(ValueError) as excinfo:
+        pipeline._rebuild(components, dataclasses.replace(config, tracker=TrackerConfig()))
+    assert str(excinfo.value) == TRACKER_FIRST_HIT_ERROR.format(mode="erase")
+
+
+@pytest.mark.usefixtures("plugin")
+def test_a_landmarks_only_mode_gets_the_faces_refiner(builds: ModelBuilds) -> None:
+    config = _plugin_config("landmarksonly", faces=FaceYuNetConfig(), tracker=TrackerConfig())
+    components, _ = pipeline._build_components(FakeSource(), config)
+    assert _refined(components.refiners) == [(DetectionKind.FACES, True)]
+    _, active, _ = _resolve(components.detectors, components.refiners, components.mode)
+    assert active == components.refiners  # Active: it provides landmarks.
+    report = run_stream(FakeSource(Scene(total=30)), config, OutputConfig(), sinks=[ListSink()])
+    assert report.stats.failed_closed == 0
+
+
+@pytest.mark.usefixtures("plugin")
+def test_a_rejected_detector_switch_keeps_the_refiners_and_their_tracks(
+    builds: ModelBuilds,
+) -> None:
+    # HOG is replaced by a fake that sees the subject, so the persons refiner has
+    # tracks to hold; the switch to the DNN fails to load its model and is rejected.
+    config = dataclasses.replace(_tracked_config("both"), person_dnn=None,
+                                 tracker=TrackerConfig(hold_frames=50))
+    switch = dataclasses.replace(config, detector="person", person_dnn=PersonDnnConfig())
+    control = _QueueControl(config)
+    engines: list[Any] = []
+    seen: dict[str, list[tuple[int, list[Any]]]] = {}
+    real_init = pipeline.Engine.__init__
+
+    def init(self: Any, *args: Any, **kwargs: Any) -> None:
+        real_init(self, *args, **kwargs)
+        engines.append(self)
+
+    def record(label: str) -> Callable[[], None]:
+        def hook() -> None:
+            seen[label] = [(id(r), list(r._tracker._tracks)) for r in engines[0].refiners]
+        return hook
+
+    def queue() -> None:
+        builds.fail[PersonDnnDetector] = ModelNotFoundError("Model 'x' was not found")
+        control.queued = switch
+
+    scene = Scene(total=40, enter=5, stand=7, leave=9, gone=11)
+    src = HookSource(scene, hooks={15: record("before"), 16: queue, 18: record("after")})
+    fake_hog = FakeModelDetector(PersonDnnDetector, None, ())
+    with (
+        mock.patch.object(pipeline.Engine, "__init__", init),
+        mock.patch.object(pipeline.PersonDetector, "from_config", return_value=fake_hog),
+    ):
+        report = run_stream(src, config, OutputConfig(), sinks=[ListSink()], control=control)
+    assert report.stats.reconfigurations == 0
+    assert control.snapshot().last_error is not None
+    before, after = seen["before"], seen["after"]
+    assert [kind for kind, _ in _refined(engines[0].refiners)] == [
+        DetectionKind.PERSONS, DetectionKind.FACES
+    ]
+    assert [rid for rid, _ in after] == [rid for rid, _ in before]
+    assert all(tracks for _, tracks in before)  # Both refiners were holding a track.
+    assert [[t.track_id for t in tracks] for _, tracks in after] == [
+        [t.track_id for t in tracks] for _, tracks in before
+    ]

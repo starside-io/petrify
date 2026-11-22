@@ -20,7 +20,8 @@ from petrify.core import (
     PetrifyConfig,
     RoiConfig,
 )
-from petrify.core.config import mode_options_from
+from petrify.core.config import TrackerConfig, mode_options_from
+from petrify.core.detections import DetectionKind
 from petrify.core.plugin import OptionSpec
 from petrify.core.registry import ModeEntry, list_modes, load_mode
 from petrify.modes.erase import ERASE
@@ -1503,3 +1504,32 @@ def test_t8b_no_hog_weakened_sentence_while_the_dnn_runs() -> None:
 def test_t8b_the_snapshot_names_the_active_person_detector() -> None:
     assert _control().snapshot().to_dict()["person_detector"] == "hog"
     assert _control(_dnn_config()).snapshot().to_dict()["person_detector"] == "dnn"
+
+
+class _RequiresFactory(FakeFactory):
+    """A FakeFactory whose mode requires motion and persons."""
+
+    def requires(self, options: Any) -> Any:
+        return frozenset({DetectionKind.MOTION, DetectionKind.PERSONS})
+
+
+def test_a_kind_the_tracker_cannot_hold_is_listed_as_weakened() -> None:
+    untracked = control_module.TRACKER_UNTRACKED_WEAKENED.format(kind="persons")
+    config = dataclasses.replace(_fake_config(), detector="motion", tracker=TrackerConfig())
+    control = RunControl(config, SIZE, factory=_RequiresFactory())
+    assert untracked in control.snapshot().weakened
+    control.report_applied(dataclasses.replace(config, detector="both"))
+    assert untracked not in control.snapshot().weakened
+    control.report_applied(config)
+    assert untracked in control.snapshot().weakened
+    control.report_applied(dataclasses.replace(config, tracker=None))
+    assert untracked not in control.snapshot().weakened
+
+
+def test_a_tracked_kind_is_not_listed_and_a_failing_requires_lists_nothing() -> None:
+    config = dataclasses.replace(_fake_config(), detector="both", tracker=TrackerConfig())
+    weakened = RunControl(config, SIZE, factory=_RequiresFactory()).snapshot().weakened
+    assert not any("tracker" in sentence for sentence in weakened)
+    motion = dataclasses.replace(config, detector="motion")
+    weakened = RunControl(motion, SIZE, factory=FakeFactory()).snapshot().weakened
+    assert not any("tracker" in sentence for sentence in weakened)  # No requires method.
