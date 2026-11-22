@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "petrify-shadow"
+version = "0.1.0"
+description = "A petrify mode plugin that obscures faces and bodies while a subject is present."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# OpenCV is not declared: petrify already depends on the headless wheel, and a
+# second cv2 wheel would conflict with it.
+dependencies = [
+    "petrify>=0.1.0,<0.2",
+    "numpy>=1.24",
+]
+
+[project.entry-points."petrify.modes"]
+shadow = "petrify_shadow:SHADOW"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/petrify_shadow"]

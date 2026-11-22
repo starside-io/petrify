@@ -83,7 +83,7 @@ strict = false
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "plugins/petrify-shadow/tests"]
 addopts = "-v"
 markers = [
     "golden: parity tests against committed golden fixtures (slow, need the demo clips in data/)",
