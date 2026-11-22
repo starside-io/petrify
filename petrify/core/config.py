@@ -65,6 +65,18 @@ def _check_unit(owner: str, value: object, *, high_closed: bool) -> None:
         raise ValueError(f"{owner} must be a number in {bound}, got {value!r}")
 
 
+def _check_share(owner: str, value: object) -> None:
+    """Require a real finite number (bool rejected) in [0, 1]."""
+    ok = (
+        isinstance(value, (int, float))
+        and type(value) in (int, float)
+        and math.isfinite(value)
+        and 0 <= value <= 1
+    )
+    if not ok:
+        raise ValueError(f"{owner} must be a number in [0, 1], got {value!r}")
+
+
 def _check_model_path(owner: str, value: object) -> None:
     if value is None:
         return
@@ -327,14 +339,16 @@ class SegmentConfig:
 
     threshold: float = 0.5
     dilate_px: int = 0  # Safety margin grown around the mask, in pixels.
-    # Mask share of the frame from which the frame counts as containing a person.
-    min_area_share: float = 0.002
+    # Mask share of the frame below which the mask is dropped and the frame counts
+    # as having no person. Off (0.0) by default: the rule can hide real partial
+    # detections, such as only the head or legs of a person.
+    min_area_share: float = 0.0
     model_path: str | None = None  # Explicit model file; None searches the model directories.
 
     def __post_init__(self) -> None:
         _check_unit("SegmentConfig.threshold", self.threshold, high_closed=False)
         _check_int("SegmentConfig.dilate_px", self.dilate_px, 0, MAX_DILATE_PX)
-        _check_unit("SegmentConfig.min_area_share", self.min_area_share, high_closed=True)
+        _check_share("SegmentConfig.min_area_share", self.min_area_share)
         _check_model_path("SegmentConfig.model_path", self.model_path)
 
 

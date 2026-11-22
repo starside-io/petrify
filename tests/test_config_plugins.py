@@ -52,7 +52,7 @@ def test_section_defaults() -> None:
         score_threshold=0.4, nms_threshold=0.5, model_path=None
     )
     assert SegmentConfig() == SegmentConfig(
-        threshold=0.5, dilate_px=0, min_area_share=0.002, model_path=None
+        threshold=0.5, dilate_px=0, min_area_share=0.0, model_path=None
     )
     assert TrackerConfig() == TrackerConfig(iou_threshold=0.3, hold_frames=15, max_tracks=256)
 
@@ -108,7 +108,7 @@ def test_from_namespace_with_flags_still_leaves_new_fields_at_defaults() -> None
         (SegmentConfig, {"threshold": 0.0}),
         (SegmentConfig, {"threshold": 1.0}),
         (SegmentConfig, {"dilate_px": -1}),
-        (SegmentConfig, {"min_area_share": 0.0}),
+        (SegmentConfig, {"min_area_share": -0.01}),
         (SegmentConfig, {"min_area_share": 1.01}),
         (SegmentConfig, {"model_path": ""}),
         (TrackerConfig, {"iou_threshold": 0.0}),
@@ -132,6 +132,8 @@ def test_section_rejects_out_of_bounds(cls: type, kwargs: dict[str, Any]) -> Non
         (PersonDnnConfig, {"score_threshold": 0.99, "model_path": "person.onnx"}),
         (SegmentConfig, {"threshold": 0.01, "dilate_px": 0, "min_area_share": 1.0}),
         (SegmentConfig, {"threshold": 0.99, "dilate_px": 12, "model_path": "seg.onnx"}),
+        (SegmentConfig, {"min_area_share": 0.0}),
+        (SegmentConfig, {"min_area_share": 0}),
         (TrackerConfig, {"iou_threshold": 1.0, "hold_frames": 0, "max_tracks": 1}),
         (ModelConfig, {"dir": "/models"}),
     ],
@@ -317,7 +319,7 @@ def test_config_to_dict_renders_mode_options_as_object() -> None:
     }
     assert data["person_dnn"] == {"score_threshold": 0.4, "nms_threshold": 0.5, "model_path": None}
     assert data["segment"] == {
-        "threshold": 0.5, "dilate_px": 4, "min_area_share": 0.002, "model_path": None,
+        "threshold": 0.5, "dilate_px": 4, "min_area_share": 0.0, "model_path": None,
     }
     assert data["tracker"] == {"iou_threshold": 0.3, "hold_frames": 15, "max_tracks": 256}
     assert data["models"] == {"dir": "/models"}
