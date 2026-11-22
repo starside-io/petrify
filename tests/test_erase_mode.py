@@ -29,9 +29,15 @@ from petrify.core import (
     Detections,
     Frame,
     Mode,
+    ModeContext,
+    ModeFactory,
+    PetrifyConfig,
     SourceInfo,
+    build_mode,
+    load_mode,
 )
-from petrify.modes import EraseMode
+from petrify.modes import ERASE, EraseMode
+from petrify.pipeline import _background_differ, _requires_differ
 
 W, H = 160, 120
 
@@ -210,3 +216,110 @@ def test_require_background_diff(
 
 def test_require_background_diff_defaults_off() -> None:
     assert EraseMode(_bg()).require_background_diff is False
+
+
+# ----------------------------------------------------------------------
+# The ERASE factory
+# ----------------------------------------------------------------------
+
+_INFO = SourceInfo(fps=25.0, width=W, height=H, frame_count=None, seekable=False, live=True)
+
+
+def _ctx(
+    background: np.ndarray | BackgroundModel, differ: bool = True
+) -> ModeContext:
+    config = PetrifyConfig() if differ else PetrifyConfig(background_diff=None)
+    return ModeContext(_INFO, config, {}, background)
+
+
+def test_erase_factory_attributes() -> None:
+    assert isinstance(ERASE, ModeFactory)
+    assert ERASE.name == "erase"
+    assert ERASE.summary and "\n" not in ERASE.summary
+    assert ERASE.options == ()
+    assert ERASE.needs_background is True
+    assert ERASE.roi_overlay is True
+    assert ERASE.requires({}) == EraseMode.requires
+    assert ERASE.mandatory({}) == frozenset()
+    assert ERASE.weakened({}) == ()
+
+
+def test_load_mode_erase_returns_factory() -> None:
+    assert load_mode("erase") is ERASE
+
+
+@pytest.mark.parametrize("model", [False, True])
+@pytest.mark.parametrize("differ", [False, True])
+def test_erase_factory_matches_pipeline_rule(model: bool, differ: bool) -> None:
+    background: np.ndarray | BackgroundModel = (
+        RunningBackground(window=3, interval=1, min_samples=1) if model else _bg()
+    )
+    ctx = _ctx(background, differ)
+    mode = build_mode(ERASE, ctx)
+    assert isinstance(mode, EraseMode)
+    assert mode.require_background_diff is (model and differ)
+    # The same decision as the pipeline, from the same background and config.
+    pipeline_differ = _background_differ(background, ctx.config, live=False)
+    assert mode.require_background_diff is _requires_differ(background, pipeline_differ)
+    if model:
+        assert mode.model is background
+    else:
+        assert mode.background is background
+
+
+@pytest.mark.parametrize("model", [False, True])
+def test_erase_factory_keeps_previous_when_nothing_changed(model: bool) -> None:
+    background: np.ndarray | BackgroundModel = (
+        RunningBackground(window=3, interval=1, min_samples=1) if model else _bg()
+    )
+    first = build_mode(ERASE, _ctx(background))
+    assert build_mode(ERASE, _ctx(background), first) is first
+
+
+def test_erase_factory_replaces_previous_when_background_changes() -> None:
+    first = build_mode(ERASE, _ctx(_bg()))
+    other = _bg()
+    second = build_mode(ERASE, _ctx(other), first)
+    assert second is not first
+    assert isinstance(second, EraseMode) and second.background is other
+    model = RunningBackground(window=3, interval=1, min_samples=1)
+    third = build_mode(ERASE, _ctx(model), second)
+    assert third is not second
+    assert isinstance(third, EraseMode) and third.model is model
+
+
+def test_erase_factory_replaces_previous_when_differ_requirement_changes() -> None:
+    model = RunningBackground(window=3, interval=1, min_samples=1)
+    with_differ = build_mode(ERASE, _ctx(model, differ=True))
+    without = build_mode(ERASE, _ctx(model, differ=False), with_differ)
+    assert without is not with_differ
+    assert isinstance(without, EraseMode)
+    assert without.model is model and without.require_background_diff is False
+    again = build_mode(ERASE, _ctx(model, differ=True), without)
+    assert again is not without
+    assert isinstance(again, EraseMode) and again.require_background_diff is True
+
+
+def test_erase_factory_keeps_previous_for_array_when_differ_toggles() -> None:
+    # With a locked image the differ never makes the flag True, so nothing changes.
+    bg = _bg()
+    first = build_mode(ERASE, _ctx(bg, differ=True))
+    assert build_mode(ERASE, _ctx(bg, differ=False), first) is first
+
+
+def test_erase_factory_replaces_previous_of_another_type() -> None:
+    class Other:
+        name = "erase"
+        requires = EraseMode.requires
+
+        def render(self, frame: Frame, detections: Detections, subject_present: bool) -> np.ndarray:
+            return frame.image.copy()
+
+    bg = _bg()
+    mode = build_mode(ERASE, _ctx(bg), Other())  # type: ignore[arg-type]
+    assert isinstance(mode, EraseMode)
+
+
+def test_erase_factory_needs_background() -> None:
+    with pytest.raises(ValueError, match="needs a background"):
+        ERASE.create(ModeContext(_INFO, PetrifyConfig(), {}))

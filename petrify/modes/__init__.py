@@ -18,6 +18,6 @@
 
 from __future__ import annotations
 
-from petrify.modes.erase import EraseMode
+from petrify.modes.erase import ERASE, EraseMode
 
-__all__ = ["EraseMode"]
+__all__ = ["ERASE", "EraseMode"]

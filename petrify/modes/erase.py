@@ -18,14 +18,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import ClassVar
 
 import numpy as np
 
 from petrify.background.locked import LockedBackground
+from petrify.core.config import OptionValue
 from petrify.core.detections import DetectionKind, Detections
 from petrify.core.frame import Frame
-from petrify.core.plugin import BackgroundModel, BackgroundNotReady, DetectPolicy
+from petrify.core.plugin import (
+    BackgroundModel,
+    BackgroundNotReady,
+    DetectPolicy,
+    Mode,
+    ModeContext,
+    OptionSpec,
+)
 
 
 class EraseMode:
@@ -101,6 +110,64 @@ class EraseMode:
         out = bg.copy() if subject_present else frame.image
         model.update(frame, subject_present)
         return out
+
+
+class _EraseFactory:
+    """The :class:`ModeFactory` of the built-in erase mode (see :data:`ERASE`)."""
+
+    name = "erase"
+    summary = "Show the clean background while a subject is present, the live frame otherwise."
+    options: tuple[OptionSpec, ...] = ()
+    needs_background = True
+    # The ROI stage pastes the live timestamp over the frozen background, as wanted.
+    roi_overlay = True
+
+    def requires(self, options: Mapping[str, OptionValue]) -> frozenset[DetectionKind]:
+        """Return :attr:`EraseMode.requires`."""
+        return EraseMode.requires
+
+    def mandatory(self, options: Mapping[str, OptionValue]) -> frozenset[DetectionKind]:
+        """Return the empty set: erase has no mandatory kind."""
+        return frozenset()
+
+    def weakened(self, options: Mapping[str, OptionValue]) -> tuple[str, ...]:
+        """Return nothing: erase has no option that reduces protection."""
+        return ()
+
+    def create(self, ctx: ModeContext, previous: Mode | None = None) -> Mode:
+        """Return an :class:`EraseMode` around ``ctx.background``, or ``previous``.
+
+        ``require_background_diff`` is True exactly when a background differ is
+        configured and the background is an online model (the differ is then
+        model-backed), as the pipeline decides it. ``previous`` is returned when it
+        is an :class:`EraseMode` over the same background object with the same
+        ``require_background_diff``. Raises ``ValueError`` without a background.
+        """
+        background = ctx.background
+        if background is None:
+            raise ValueError("the erase mode needs a background image or model")
+        require = ctx.config.background_diff is not None and not isinstance(
+            background, np.ndarray
+        )
+        if (
+            isinstance(previous, EraseMode)
+            and previous.require_background_diff == require
+            and _same_background(previous, background)
+        ):
+            return previous
+        return EraseMode(background, require_background_diff=require)
+
+
+def _same_background(mode: EraseMode, background: np.ndarray | BackgroundModel) -> bool:
+    """True when ``mode`` renders from ``background`` itself."""
+    if isinstance(background, np.ndarray):
+        # EraseMode wraps an image in a LockedBackground of its own.
+        return isinstance(mode.model, LockedBackground) and mode.model.current() is background
+    return mode.model is background
+
+
+ERASE = _EraseFactory()
+"""The built-in erase mode factory, registered as ``erase``."""
 
 
 def _check_three_channel(image: np.ndarray) -> None:
