@@ -19,7 +19,9 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import dataclasses
+import functools
 import logging
 import os
 import signal
@@ -750,6 +752,7 @@ def _build_sinks(source: Source, config: PetrifyConfig, outputs: OutputConfig) -
                 config.encode,
                 audio_source=audio,
                 wallclock_timestamps=live,
+                stop_requested=_stop_requested,
             )
         )
     if outputs.virtualcam:
@@ -917,84 +920,74 @@ def _sigterm() -> int | None:
     return getattr(signal, "SIGTERM", None)
 
 
-def _terminate_as_interrupt(signum: int, frame: FrameType | None) -> None:
-    """SIGTERM handler: raise ``KeyboardInterrupt``, as Python's default SIGINT handler does."""
-    raise KeyboardInterrupt
+class OutputsKeptInterrupt(KeyboardInterrupt):
+    """A stop signal that ended the run after its outputs were finalized.
+
+    Raised by :func:`run_stream` for a second stop signal once the outputs were
+    finalized, and for an interrupt that lands after the run returned (while the
+    handlers are restored): nothing is aborted, the recording is complete, and the
+    caller can say so instead of reporting an aborted run.
+    """
 
 
-class _TerminateAsInterrupt:
-    """For the duration of a run, make SIGTERM raise ``KeyboardInterrupt`` like Ctrl-C.
+class _StopSignals:
+    """Handle SIGINT and SIGTERM for one :func:`run_stream` call, both the same way.
 
-    By default SIGTERM ends the process at once, so ``systemctl stop`` or
-    ``docker stop`` would leave a live recording unfinalized and skip the abort
-    that cleans up a file run. With this handler in place SIGTERM takes the same
-    paths as Ctrl-C everywhere in the run: :class:`_InterruptGuard` handles it
-    inside the loop, and outside the loop (on a non-live source, or while the
-    outputs are being closed) it raises ``KeyboardInterrupt`` as Python's default
-    SIGINT handler does. The previous handler is restored on exit.
+    One handler is installed for both signals when the run starts and the previous
+    handlers are restored when it ends; between those two points the run swaps
+    nothing (``FfmpegPipeSink`` only holds the signals briefly while FFmpeg starts
+    or stops, then hands them to this handler), so a signal landing at any moment
+    meets one handler whose behavior depends only on plain attributes set by the
+    run:
+
+    - Before the outputs are finalized, a first signal on a live source sets
+      :attr:`pending` and, while :attr:`deferring` is set (during a step, the
+      engine's open and its close), returns: the frame or the close finishes and
+      the run stops cleanly, so the recording is finalized. Elsewhere (waiting for
+      the next frame, building components) it raises ``KeyboardInterrupt``. On a
+      non-live source every signal raises ``KeyboardInterrupt``, which aborts the
+      run as Ctrl-C does. A second signal of either kind always raises.
+    - Once the outputs are finalized (:attr:`done`), a first signal only sets
+      :attr:`pending`, and a second one raises :class:`OutputsKeptInterrupt`.
+
+    By default SIGTERM ends the process at once, so ``systemctl stop`` or ``docker
+    stop`` would leave a live recording unfinalized; with this handler it takes
+    the same paths as Ctrl-C.
 
     Nothing is installed on a thread other than the main thread (``signal.signal``
-    would raise there), on a platform without SIGTERM, or when a handler other
-    than the default (``SIG_DFL``) is already installed: the embedding program
-    then owns SIGTERM, as the guard leaves a custom SIGINT handler alone.
+    would raise there), for SIGTERM on a platform without it, or for a signal whose
+    handler is not the default one (``default_int_handler`` for SIGINT,
+    ``SIG_DFL`` for SIGTERM): the embedding program then owns that signal.
     """
 
-    def __init__(self) -> None:
-        self._previous: Any = None
-        self._installed = False
-
-    def __enter__(self) -> _TerminateAsInterrupt:
-        sigterm = _sigterm()
-        if (
-            sigterm is not None
-            and threading.current_thread() is threading.main_thread()
-            and signal.getsignal(sigterm) == signal.SIG_DFL
-        ):
-            self._previous = signal.signal(sigterm, _terminate_as_interrupt)
-            self._installed = True
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        if self._installed:
-            signal.signal(_sigterm(), self._previous)  # type: ignore[arg-type]
-            self._installed = False
-
-
-class _InterruptGuard:
-    """Defer a Ctrl-C or SIGTERM that arrives inside ``Engine.step`` until the step returns.
-
-    An interrupt inside a step would abort the engine and discard the recording, so
-    the first one received there (SIGINT or SIGTERM) only sets :attr:`pending`; the
-    loop then stops and closes cleanly. An interrupt anywhere else (for example
-    while waiting for the next frame), or a second one of either kind, raises
-    ``KeyboardInterrupt`` as usual. With ``enabled=False`` (non-live runs), on a
-    thread other than the main thread, or when a handler other than Python's
-    default is installed, the guard does nothing for that signal. For SIGTERM the
-    default is ``SIG_DFL`` or the handler of :class:`_TerminateAsInterrupt`, which
-    the guard restores on exit.
-    """
-
-    def __init__(self, enabled: bool) -> None:
-        self.enabled = enabled
-        self.in_step = False
+    def __init__(self, live: bool) -> None:
+        self.live = live
+        self.deferring = False
         self.pending = False
+        self.done = False
+        self._restoring = False
+        self._held: list[int] = []
         self._previous: dict[int, Any] = {}
 
-    def __enter__(self) -> _InterruptGuard:
-        if not self.enabled or threading.current_thread() is not threading.main_thread():
+    def __enter__(self) -> _StopSignals:
+        if threading.current_thread() is not threading.main_thread():
             return self
+        wanted = []
         if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
-            self._previous[signal.SIGINT] = signal.signal(signal.SIGINT, self._handle)
+            wanted.append(signal.SIGINT)
         sigterm = _sigterm()
-        if sigterm is not None:
-            current = signal.getsignal(sigterm)
-            if current == signal.SIG_DFL or current is _terminate_as_interrupt:
-                self._previous[sigterm] = signal.signal(sigterm, self._handle)
+        if sigterm is not None and signal.getsignal(sigterm) == signal.SIG_DFL:
+            wanted.append(sigterm)
+        try:
+            for signum in wanted:
+                # Saved before the install: a KeyboardInterrupt right after the
+                # install would otherwise lose the value signal.signal returns.
+                self._previous[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._handle)
+        except BaseException:
+            # A signal between the two installs: put back what was installed.
+            self._restore()
+            raise
         return self
 
     def __exit__(
@@ -1003,19 +996,96 @@ class _InterruptGuard:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        while self._previous:
-            signum, previous = self._previous.popitem()
-            signal.signal(signum, previous)
+        self._restore()
+
+    def _restore(self) -> None:
+        """Restore every saved handler, then deliver a signal that came in meanwhile.
+
+        While restoring, this handler only records signals, so it cannot raise
+        between two restores and leave one of them undone. SIGINT is restored last:
+        its restored default handler is the only one that raises, and once it is
+        back nothing is left to restore. Each restore is attempted even if another
+        fails; the first failure is raised at the end. A recorded signal is raised
+        again afterwards, so it reaches the restored handler as if it had arrived
+        just after the run.
+        """
+        self._restoring = True
+        error: BaseException | None = None
+        order = sorted(self._previous, key=lambda signum: signum == signal.SIGINT)
+        for signum in order:
+            try:
+                signal.signal(signum, self._previous.pop(signum))
+            except BaseException as exc:  # noqa: BLE001 (raised below, after the others)
+                if error is None:
+                    error = exc
+        self._restoring = False
+        held, self._held = self._held, []
+        if error is not None:
+            raise error
+        for signum in held:
+            signal.raise_signal(signum)
 
     def _handle(self, signum: int, frame: FrameType | None) -> None:
         # No logging here: the handler can run in the middle of a write to stderr
         # (a log line or the progress bar), and a second write from the handler then
         # raises RuntimeError ("reentrant call") inside the step, which aborts the
-        # engine and loses the recording. The loop logs once the step has returned.
-        if self.in_step and not self.pending:
+        # engine and loses the recording. The run logs once the step has returned.
+        if self._restoring:
+            self._held.append(signum)
+            return
+        if self.done:
+            if self.pending:
+                raise OutputsKeptInterrupt
             self.pending = True
             return
-        raise KeyboardInterrupt
+        if self.pending or not (self.live and self.deferring):
+            self.pending = True
+            raise KeyboardInterrupt
+        self.pending = True
+
+
+# The stop signal handling of the run_stream call in progress on this thread.
+_ACTIVE_SIGNALS: contextvars.ContextVar[_StopSignals | None] = contextvars.ContextVar(
+    "_ACTIVE_SIGNALS", default=None
+)
+
+
+def _stop_requested() -> bool:
+    """True once a stop signal was received by the run in progress (see ``FfmpegPipeSink``)."""
+    signals = _ACTIVE_SIGNALS.get()
+    return signals is not None and signals.pending
+
+
+_RunT = TypeVar("_RunT")
+
+
+def _handles_stop_signals(run: Callable[..., _RunT]) -> Callable[..., _RunT]:
+    """Run ``run(source, ...)`` with :class:`_StopSignals` installed for the whole call.
+
+    The handler covers the whole call, not only the frame loop, so a signal after
+    the outputs were finalized (while the source closes, for example) is not
+    reported as an aborted run. A ``KeyboardInterrupt`` raised once ``run``
+    returned (while the handlers are restored) becomes :class:`OutputsKeptInterrupt`.
+    """
+
+    @functools.wraps(run)
+    def wrapper(source: Source, *args: Any, **kwargs: Any) -> _RunT:
+        signals = _StopSignals(live=source.info.live)
+        token = _ACTIVE_SIGNALS.set(signals)
+        returned = False
+        try:
+            with signals:
+                result = run(source, *args, **kwargs)
+                returned = True
+            return result
+        except KeyboardInterrupt as exc:
+            if returned and not isinstance(exc, OutputsKeptInterrupt):
+                raise OutputsKeptInterrupt from exc
+            raise
+        finally:
+            _ACTIVE_SIGNALS.reset(token)
+
+    return wrapper
 
 
 def _drive(
@@ -1029,15 +1099,16 @@ def _drive(
 
     ``before_step`` is called with each frame before :meth:`Engine.step` and
     ``after_step`` right after it (both on this thread; ``after_step`` counts as
-    part of the step for the Ctrl-C guard, so it may reconfigure the engine).
+    part of the step for the stop signals, so it may reconfigure the engine).
 
+    Stop signals (SIGINT and SIGTERM alike) follow :class:`_StopSignals`, which
+    :func:`run_stream` installs; called on its own, this function installs it.
     On a live source a ``KeyboardInterrupt`` ends the run: reading stops and the
-    engine is closed normally, so the outputs are finalized. If the interrupt
-    landed inside a step that already aborted the engine, or on a non-live source,
-    it propagates. The interrupt guard is removed before the close, so a second
-    Ctrl-C there aborts. SIGTERM is handled exactly like Ctrl-C for the whole call
-    (see :class:`_TerminateAsInterrupt`), so a service manager stopping a live run
-    gets the recording finalized.
+    engine is closed normally, so the outputs are finalized. A first signal during
+    a step or during the close is deferred until it returns; a second one aborts.
+    If the interrupt landed inside a step that already aborted the engine, or on a
+    non-live source, it propagates. A live run stopped before its first frame has
+    nothing to finalize: ``KeyboardInterrupt`` propagates.
 
     Any other exception (not ``SystemExit``) that ends a live run while the engine
     is still open finalizes the outputs too: everything written so far is processed
@@ -1047,11 +1118,11 @@ def _drive(
     left to finalize); on a non-live source any error aborts the engine. When the
     source delivered no frame and closing fails, :class:`NoFramesError` is raised.
     """
-    # Installed around the whole body, its final abort included, so a SIGTERM
-    # during that abort raises KeyboardInterrupt as a Ctrl-C there does, rather
-    # than killing the process.
-    with _TerminateAsInterrupt():
-        return _drive_steps(engine, source, should_stop, before_step, after_step)
+    signals = _ACTIVE_SIGNALS.get()
+    if signals is not None:
+        return _drive_steps(engine, source, should_stop, before_step, after_step, signals)
+    with _StopSignals(live=source.info.live) as own:
+        return _drive_steps(engine, source, should_stop, before_step, after_step, own)
 
 
 def _drive_steps(
@@ -1060,40 +1131,49 @@ def _drive_steps(
     should_stop: Callable[[], bool],
     before_step: Callable[[Frame], None] | None,
     after_step: Callable[[], None] | None,
+    signals: _StopSignals,
 ) -> tuple[EngineStats, bool]:
-    """The body of :func:`_drive`, run with SIGTERM already mapped to ``KeyboardInterrupt``."""
+    """The body of :func:`_drive`, with the stop signals already handled by ``signals``."""
     live = source.info.live
     interrupted = False
     failure: Exception | None = None
     delivered = 0
     try:
+        # On a live source everything but the wait for the next frame defers a
+        # first stop signal: the open (FFmpeg is starting), each step and the close.
+        signals.deferring = live
         engine.open(source.info)
-        with _InterruptGuard(enabled=live) as guard:
-            try:
-                for frame in source:
-                    delivered += 1
-                    if before_step is not None:
-                        before_step(frame)
-                    guard.in_step = True
-                    engine.step(frame)
-                    if after_step is not None:
-                        after_step()
-                    guard.in_step = False
-                    if guard.pending:
-                        logger.info("Interrupt received during a frame; the frame was finished")
-                        interrupted = True
-                        break
-                    if should_stop():
-                        logger.info("Stop requested; finishing the run")
-                        break
-            except KeyboardInterrupt:
-                if not live or not engine.is_open:
-                    raise
-                interrupted = True
-            except Exception as exc:
-                if not live or not engine.is_open:
-                    raise
-                failure = exc
+        try:
+            frames = iter(source)
+            while not signals.pending:
+                signals.deferring = False
+                try:
+                    frame = next(frames)
+                except StopIteration:
+                    break
+                finally:
+                    signals.deferring = live
+                delivered += 1
+                if before_step is not None:
+                    before_step(frame)
+                engine.step(frame)
+                if after_step is not None:
+                    after_step()
+                if signals.pending:
+                    break
+                if should_stop():
+                    logger.info("Stop requested; finishing the run")
+                    break
+        except KeyboardInterrupt:
+            if not live or not engine.is_open:
+                raise
+            interrupted = True
+        except Exception as exc:
+            if not live or not engine.is_open:
+                raise
+            failure = exc
+        signals.deferring = live
+        interrupted = interrupted or signals.pending
         if failure is not None:
             _finalize_after_error(engine, failure)
         if interrupted:
@@ -1102,11 +1182,18 @@ def _drive_steps(
             stats = engine.close()
         except Exception as exc:
             if delivered == 0:
+                if interrupted:
+                    # Stopped before the first frame: nothing to keep, as for a run
+                    # aborted by Ctrl-C, rather than a fatal error.
+                    raise KeyboardInterrupt from exc
                 raise NoFramesError(
                     "The source delivered no frames; no output was written"
                 ) from exc
             raise
-        return stats, interrupted
+        signals.done = True
+        if signals.pending and not interrupted:
+            logger.info("Stop signal received while finishing the outputs; they were finalized")
+        return stats, interrupted or signals.pending
     except BaseException:
         engine.abort()
         raise
@@ -2079,6 +2166,7 @@ class _Pacer:
             self._sleep(min(remaining, self._SLICE))
 
 
+@_handles_stop_signals
 def run_stream(
     source: Source,
     config: PetrifyConfig,

@@ -736,8 +736,25 @@ SIGTERM_HELPER = Path(__file__).with_name("_helper_sigterm.py")
 HELPER_READY_AFTER = 30
 
 
-def _stop_helper_run(output: Path, signum: int) -> int:
-    """Run the helper, send ``signum`` once it is ready, and return its exit code."""
+def _descendants(pid: int) -> list[int]:
+    """The child processes of ``pid``, recursively (FFmpeg for the helper)."""
+    found: list[int] = []
+    todo = [pid]
+    while todo:
+        result = subprocess.run(["pgrep", "-P", str(todo.pop())], capture_output=True,
+                                text=True, check=False)
+        children = [int(p) for p in result.stdout.split()]
+        found += children
+        todo += children
+    return found
+
+
+def _stop_helper_run(output: Path, signum: int, *, whole_service: bool = False) -> int:
+    """Run the helper, send ``signum`` once it is ready, and return its exit code.
+
+    ``whole_service`` sends it to the helper and to every process it started, as
+    systemd does by default (KillMode=control-group).
+    """
     root = Path(__file__).resolve().parents[1]
     # The log and the progress bar go to a file: a full stderr pipe could block the helper.
     with output.with_suffix(".log").open("w") as log:
@@ -753,7 +770,11 @@ def _stop_helper_run(output: Path, signum: int) -> int:
             assert proc.stdout is not None
             line = proc.stdout.readline()
             assert line.strip() == "ready", line
-            proc.send_signal(signum)
+            targets = [proc.pid] + (_descendants(proc.pid) if whole_service else [])
+            if whole_service:
+                assert len(targets) > 1, "FFmpeg was not found among the helper's children"
+            for pid in targets:
+                os.kill(pid, signum)
             out, _ = proc.communicate(timeout=60)
         finally:
             if proc.poll() is None:
@@ -789,6 +810,254 @@ def test_sigterm_on_a_live_run_finalizes_the_recording_like_sigint(tmp_path: Pat
     for path in (by_term, by_int):
         assert path.exists()
         assert _frame_count(path) >= HELPER_READY_AFTER  # Every frame up to the stop.
+
+
+@NEEDS_FFMPEG
+@pytest.mark.skipif(not hasattr(signal, "SIGTERM") or sys.platform == "win32",
+                    reason="needs POSIX SIGTERM delivery")
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT], ids=["term", "int"])
+def test_stop_signal_to_the_whole_service_keeps_a_playable_recording(
+    tmp_path: Path, signum: int
+) -> None:
+    # FFmpeg gets the signal too: it finalizes its file itself and exits 255. The
+    # run keeps that file (read back first) instead of failing and deleting it.
+    output = tmp_path / "service.mp4"
+    assert _stop_helper_run(output, signum, whole_service=True) == 0
+    assert output.exists()
+    assert not output.with_name("service.partial.mp4").exists()
+    frames = _frame_count(output)
+    assert frames >= 1
+    log_text = output.with_suffix(".log").read_text()
+    assert "so it ends early" in log_text or "Done. Output written" in log_text, log_text[-2000:]
+
+
+class _ReentryProbe(logging.Handler):
+    """Log handler that raises a SIGTERM inside its own emit and notes re-entry."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.depth = 0
+        self.reentered = False
+        self.fired = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.depth += 1
+        try:
+            if self.depth > 1:
+                self.reentered = True
+            if not self.fired and record.name == "probe":
+                self.fired = True
+                signal.raise_signal(signal.SIGTERM)  # Handled while this emit runs.
+        finally:
+            self.depth -= 1
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_the_stop_handler_does_not_log_inside_a_log_write() -> None:
+    # A handler that logs would write to stderr while a write to it is in progress,
+    # which raises RuntimeError ("reentrant call") and loses the recording.
+    probe = _ReentryProbe()
+    root = logging.getLogger()
+    previous_level = root.level
+    root.addHandler(probe)
+    root.setLevel(logging.INFO)
+    try:
+        sink = ListSink(on_write=lambda n: n == 10 and logging.getLogger("probe").info("x"))
+        report = run_stream(FakeSource(Scene(total=40)), _live_config("calibrate"),
+                            OutputConfig(), sinks=[sink])
+    finally:
+        root.removeHandler(probe)
+        root.setLevel(previous_level)
+    assert probe.fired and report.interrupted
+    assert not probe.reentered
+    assert (sink.closed, sink.aborted) == (1, 0)
+
+
+_REAL_SIGNAL = signal.signal
+_REAL_RAISE = signal.raise_signal
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+@pytest.mark.parametrize("live", [True, False], ids=["live", "file"])
+@pytest.mark.parametrize("when", ["before", "after"])
+@pytest.mark.parametrize("nth", [1, 2, 3, 4])
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["int", "term"])
+def test_a_signal_at_any_handler_install_or_restore_leaves_no_handler_behind(
+    signum: int, nth: int, when: str, live: bool
+) -> None:
+    # A run installs two handlers and restores two (four signal.signal calls). A
+    # signal landing just before or just after any of them must not leave a
+    # handler of the run installed afterwards, nor be lost.
+    calls = 0
+    injected: list[int] = []
+    redelivered: list[int] = []
+
+    def inject() -> None:
+        # A SIGTERM meeting the default handler would end pytest: skip that moment.
+        if signum == signal.SIGTERM and signal.getsignal(signal.SIGTERM) == signal.SIG_DFL:
+            return
+        injected.append(signum)
+        _REAL_RAISE(signum)
+
+    def fake_signal(sig: int, handler: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if when == "before" and calls == nth:
+            inject()
+        previous = _REAL_SIGNAL(sig, handler)
+        if when == "after" and calls == nth:
+            inject()
+        return previous
+
+    sink = ListSink()
+    with (
+        mock.patch.object(pipeline.signal, "signal", side_effect=fake_signal),
+        mock.patch.object(pipeline.signal, "raise_signal", side_effect=redelivered.append),
+    ):
+        outcome = "returned"
+        try:
+            run_stream(FakeSource(Scene(total=20), live=live), _live_config("calibrate"),
+                       OutputConfig(), sinks=[sink])
+        except pipeline.OutputsKeptInterrupt:
+            outcome = "kept"
+        except KeyboardInterrupt:
+            outcome = "aborted"
+    assert calls == (4 if outcome != "aborted" or nth == 2 else 2)
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+    if outcome == "aborted":
+        # Stopped while the handlers were being installed: nothing was opened.
+        assert nth <= 2
+        assert (sink.closed, sink.aborted) == (0, 0)
+    else:
+        # After the outputs were final: the run reports that they were kept, or the
+        # signal was held while restoring and delivered again afterwards.
+        assert (sink.closed, sink.aborted) == (1, 0)
+        assert nth >= 3 or not injected
+        assert outcome == "kept" or redelivered == injected
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT], ids=["term", "int"])
+def test_signal_while_closing_a_live_run_that_ended_on_its_own_is_deferred(
+    signum: int,
+) -> None:
+    # The run ended (the stream ended, or a stop from the page): the close is
+    # finishing the recording, which can take seconds, and must not be discarded.
+    src = FakeSource(Scene(total=30))
+    sink = ListSink()
+    real_close = sink.close
+
+    def close() -> None:
+        signal.raise_signal(signum)
+        real_close()
+
+    sink.close = close  # type: ignore[method-assign]
+    report = _no_interrupt(
+        lambda: run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    )
+    assert (sink.closed, sink.aborted) == (1, 0)
+    assert len(sink.images) == 30
+    assert report.interrupted is True
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_second_signal_while_closing_a_live_run_that_ended_on_its_own_aborts() -> None:
+    src = FakeSource(Scene(total=30))
+    sink = ListSink()
+    real_close = sink.close
+
+    def close() -> None:
+        signal.raise_signal(signal.SIGTERM)
+        signal.raise_signal(signal.SIGINT)
+        real_close()
+
+    sink.close = close  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert sink.closed == 0
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+
+
+class _NoFramesSink(ListSink):
+    """Like FfmpegPipeSink: closing after no frame raises OSError."""
+
+    def close(self) -> None:
+        if not self.images:
+            raise OSError("No frames were written")
+        super().close()
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_stop_before_the_first_live_frame_is_an_interrupt_not_a_no_frames_error() -> None:
+    src = _SignalSource(signal.SIGTERM, signal_at=0)
+    sink = _NoFramesSink()
+    with pytest.raises(KeyboardInterrupt) as excinfo:
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert not isinstance(excinfo.value, pipeline.OutputsKeptInterrupt)
+    assert sink.images == []
+    assert src.closed == 1
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_stop_while_the_live_outputs_open_is_deferred_then_ends_the_run() -> None:
+    class _SignalOnOpen(_NoFramesSink):
+        def open(self, info: SourceInfo) -> None:
+            signal.raise_signal(signal.SIGTERM)  # While FFmpeg would be starting.
+
+    src = FakeSource()
+    sink = _SignalOnOpen()
+    with pytest.raises(KeyboardInterrupt):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert src.yielded == []  # No frame was read after the stop.
+    assert sink.aborted == 1
+
+
+class _SignalOnCloseSource(FakeSource):
+    """A source that receives ``count`` SIGTERMs while it is closed (after the outputs)."""
+
+    def __init__(self, count: int, **kwargs: Any) -> None:
+        super().__init__(Scene(total=20), **kwargs)
+        self.count = count
+
+    def close(self) -> None:
+        super().close()
+        for _ in range(self.count):
+            signal.raise_signal(signal.SIGTERM)
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+@pytest.mark.parametrize("live", [True, False], ids=["live", "file"])
+def test_signal_after_the_outputs_were_finalized_aborts_nothing(live: bool) -> None:
+    src = _SignalOnCloseSource(1, live=live)
+    sink = ListSink()
+    report = _no_interrupt(
+        lambda: run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    )
+    assert (sink.closed, sink.aborted) == (1, 0)
+    assert len(sink.images) == report.stats.frames == 20
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+@pytest.mark.parametrize("live", [True, False], ids=["live", "file"])
+def test_second_signal_after_the_outputs_were_finalized_says_they_were_kept(
+    live: bool,
+) -> None:
+    src = _SignalOnCloseSource(2, live=live)
+    sink = ListSink()
+    with pytest.raises(pipeline.OutputsKeptInterrupt):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert (sink.closed, sink.aborted) == (1, 0)
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
 
 
 def test_failing_non_critical_sink_is_dropped() -> None:
@@ -831,7 +1100,8 @@ def test_d2_sinks_for_live_source_are_not_threaded(tmp_path: Path) -> None:
                          preview=True),
         )
     pipe.assert_called_once_with(tmp_path / "o.mp4", ENCODE, audio_source=None,
-                                 wallclock_timestamps=True)
+                                 wallclock_timestamps=True,
+                                 stop_requested=pipeline._stop_requested)
     cam.assert_called_once_with(device="dev")
     assert [type(s) for s in sinks] == [FfmpegPipeSink, VirtualCamSink, PreviewSink]
     assert not any(isinstance(s, ThreadedSink) for s in sinks)
@@ -865,7 +1135,8 @@ def test_sinks_for_file_source(clip: Path, tmp_path: Path) -> None:
     finally:
         src.close()
     pipe.assert_called_once_with(tmp_path / "o.mp4", ENCODE, audio_source=clip,
-                                 wallclock_timestamps=False)
+                                 wallclock_timestamps=False,
+                                 stop_requested=pipeline._stop_requested)
     assert [type(s) for s in sinks] == [FfmpegPipeSink, VirtualCamSink]
 
 

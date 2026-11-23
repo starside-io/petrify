@@ -823,7 +823,10 @@ def _build_run_parser(modes: _ModeCatalog | None = None) -> argparse.ArgumentPar
             "Limit OpenCV's worker threads in this process to N (1 to "
             f"{_MAX_THREADS}). When several petrify processes share a machine (one per "
             "camera), 2 is enough for one camera and keeps the processes from competing "
-            "for the cores. Default: OpenCV's own thread count."
+            "for the cores. Some OpenCV builds (the macOS ones) honor only 1 and keep "
+            "their own count for other values; the count in use is logged. FFmpeg's "
+            "encoder threads are not limited by this flag. Default: OpenCV's own "
+            "thread count."
         ),
     )
     # Rejected with a pointer to --lookahead; hidden from the help.
@@ -1489,7 +1492,18 @@ def _set_opencv_threads(count: int) -> None:
     import cv2  # noqa: PLC0415
 
     cv2.setNumThreads(count)
-    logging.getLogger(__name__).info("OpenCV worker threads: %d", count)
+    # Some OpenCV builds ignore the request (the macOS wheels honor only 1), so the
+    # log shows the count OpenCV reports, not the one asked for.
+    actual = cv2.getNumThreads()
+    log = logging.getLogger(__name__)
+    log.info("OpenCV worker threads: %d", actual)
+    if actual != count:
+        log.warning(
+            "--threads %d was requested, but this OpenCV build uses %d worker threads; "
+            "some builds honor only 1",
+            count,
+            actual,
+        )
 
 
 def _run_main(argv: list[str]) -> int:
@@ -1510,10 +1524,15 @@ def _run_main(argv: list[str]) -> int:
 
     from petrify.core.registry import ModeLoadError  # noqa: PLC0415
     from petrify.models import ModelError  # noqa: PLC0415
-    from petrify.pipeline import output_overwrites_input, run_stream  # noqa: PLC0415
+    from petrify.pipeline import (  # noqa: PLC0415
+        OutputsKeptInterrupt,
+        output_overwrites_input,
+        run_stream,
+    )
     from petrify.sources import display_spec, open_source  # noqa: PLC0415
 
     log = logging.getLogger(__name__)
+    finished = False  # The run returned: its outputs are final.
     mode_name = settings.config.mode
     # The mode is loaded before the source is opened, to validate its options.
     try:
@@ -1578,6 +1597,7 @@ def _run_main(argv: list[str]) -> int:
             )
         else:
             run_stream(source, settings.config, settings.outputs, factory=factory)
+        finished = True
     except ModelError as exc:
         # Before FileNotFoundError: a missing model is a ModelNotFoundError, which is
         # also a FileNotFoundError, but it is a fatal error (exit 1), not a missing input.
@@ -1586,7 +1606,11 @@ def _run_main(argv: list[str]) -> int:
     except FileNotFoundError as exc:
         log.error("%s", exc)
         return 2
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
+        if finished or isinstance(exc, OutputsKeptInterrupt):
+            # The stop came after the outputs were finalized: nothing was aborted.
+            log.info("Stopped by user; the outputs were kept.")
+            return 0
         log.info("Interrupted by user; the run was aborted.")
         return 130
     except ModeLoadError as exc:
@@ -1616,7 +1640,7 @@ def _run_with_web(
     The link printed here is the only place the token is shown. ``factory`` is
     the loaded mode and ``modes`` the listed ones (metadata only), for the page.
     """
-    from petrify.pipeline import run_stream  # noqa: PLC0415
+    from petrify.pipeline import OutputsKeptInterrupt, run_stream  # noqa: PLC0415
     from petrify.server.app import create_app, serve_in_thread  # noqa: PLC0415
     from petrify.server.control import RunControl  # noqa: PLC0415
     from petrify.sinks.mjpeg import MjpegSink  # noqa: PLC0415
@@ -1653,8 +1677,14 @@ def _run_with_web(
             realtime=args.realtime,
             factory=factory,
         )
-    finally:
+    except BaseException:
         handle.stop()
+        raise
+    try:
+        handle.stop()
+    except KeyboardInterrupt as exc:
+        # The run already returned, so its outputs are final.
+        raise OutputsKeptInterrupt from exc
 
 
 def _run_form_argv(argv: list[str]) -> list[str] | None:

@@ -485,6 +485,7 @@ def test_run_threads_is_set_before_any_component_is_built(
     with (
         caplog.at_level(logging.INFO, logger="petrify.cli"),
         mock.patch("cv2.setNumThreads", side_effect=lambda n: order.append(f"threads={n}")),
+        mock.patch("cv2.getNumThreads", return_value=2),
         mock.patch.object(registry, "load_mode", side_effect=load_mode),
         mock.patch.object(petrify.sources, "open_source", side_effect=open_source),
         mock.patch.object(petrify.pipeline, "run_stream", side_effect=run_stream),
@@ -493,6 +494,25 @@ def test_run_threads_is_set_before_any_component_is_built(
     assert order == ["threads=2", "load_mode", "open_source", "run_stream"]
     assert [r.getMessage() for r in caplog.records if "OpenCV worker threads" in r.getMessage()] == [
         "OpenCV worker threads: 2"
+    ]
+
+
+def test_run_threads_logs_the_count_opencv_reports_and_warns_when_ignored(
+    run_stream: mock.MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Some builds (the macOS wheels) keep their own count for any value but 1.
+    with (
+        caplog.at_level(logging.INFO, logger="petrify.cli"),
+        mock.patch("cv2.setNumThreads") as set_threads,
+        mock.patch("cv2.getNumThreads", return_value=12),
+    ):
+        assert main(["run", "--source", IN, "--output", OUT, "--threads", "2"]) == 0
+    set_threads.assert_called_once_with(2)
+    records = [r for r in caplog.records if r.name == "petrify.cli" and "thread" in r.getMessage()]
+    assert [(r.levelno, r.getMessage()) for r in records] == [
+        (logging.INFO, "OpenCV worker threads: 12"),
+        (logging.WARNING, "--threads 2 was requested, but this OpenCV build uses 12 worker "
+                          "threads; some builds honor only 1"),
     ]
 
 
@@ -536,6 +556,46 @@ def test_run_exit_codes(run_stream: mock.MagicMock, result: object, code: int) -
     else:
         run_stream.return_value = result
     assert main(["run", "--source", IN, "--output", OUT]) == code
+
+
+def test_run_interrupt_before_the_outputs_are_final_says_aborted(
+    run_stream: mock.MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    run_stream.side_effect = KeyboardInterrupt()
+    with caplog.at_level(logging.INFO, logger="petrify.cli"):
+        assert main(["run", "--source", IN, "--output", OUT]) == 130
+    messages = [r.getMessage() for r in caplog.records]
+    assert "Interrupted by user; the run was aborted." in messages
+    assert "Stopped by user; the outputs were kept." not in messages
+
+
+def test_run_interrupt_after_the_outputs_are_final_says_they_were_kept(
+    run_stream: mock.MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    run_stream.side_effect = petrify.pipeline.OutputsKeptInterrupt()
+    with caplog.at_level(logging.INFO, logger="petrify.cli"):
+        assert main(["run", "--source", IN, "--output", OUT]) == 0
+    messages = [r.getMessage() for r in caplog.records]
+    assert "Stopped by user; the outputs were kept." in messages
+    assert "Interrupted by user; the run was aborted." not in messages
+
+
+def test_web_run_interrupt_while_the_server_stops_says_the_outputs_were_kept(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The run returned; the Ctrl-C lands while the web server is being stopped.
+    handle = mock.Mock(port=1234)
+    handle.stop.side_effect = KeyboardInterrupt()
+    with (
+        caplog.at_level(logging.INFO, logger="petrify.cli"),
+        mock.patch.object(petrify.pipeline, "run_stream", return_value=_report()),
+        mock.patch.object(petrify.sources, "open_source", return_value=_StubSource(live=True)),
+        mock.patch("petrify.server.app.require_web"),
+        mock.patch("petrify.server.app.create_app"),
+        mock.patch("petrify.server.app.serve_in_thread", return_value=handle),
+    ):
+        assert main(["run", "--source", "camera:0", "--web", "--output", OUT]) == 0
+    assert "Stopped by user; the outputs were kept." in [r.getMessage() for r in caplog.records]
 
 
 def test_run_missing_input_file_exits_2(tmp_path: Path) -> None:

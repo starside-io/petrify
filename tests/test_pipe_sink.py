@@ -893,3 +893,297 @@ def test_real_ffmpeg_f5_wallclock_keeps_every_frame_of_a_burst(
         within = stamps[b * size + size - 1] - stamps[b * size]
         gap = stamps[(b + 1) * size] - stamps[b * size + size - 1]
         assert within < gap, (b, within, gap, stamps)
+
+
+# ---------------------------------------------------------------------------
+# T7b: FFmpeg stopped by the same signal as the run (systemctl or docker stop)
+# ---------------------------------------------------------------------------
+
+SIGNAL_EXIT = "frame=  3\nExiting normally, received signal 15.\n"
+
+
+@pytest.fixture
+def short_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("petrify.sinks.file._STOP_SIGNAL_GRACE_S", 0.05)
+
+
+def _readable(monkeypatch: pytest.MonkeyPatch, frames: int | None) -> list[Path]:
+    """Replace the read-back of a signal-finalized file; return the paths it was asked about."""
+    asked: list[Path] = []
+
+    def count(ffmpeg_bin: str, path: Path) -> int | None:
+        asked.append(path)
+        return frames
+
+    monkeypatch.setattr("petrify.sinks.file._count_readable_frames", count)
+    return asked
+
+
+def _stopped_ffmpeg(**kwargs: Any) -> FakePopen:
+    """FFmpeg that stops reading after 3 frames and reports a stop signal (exit 255)."""
+    return FakePopen(exit_code=255, stderr_text=SIGNAL_EXIT, break_after=3,
+                     exit_on_break=True, **kwargs)
+
+
+def test_ffmpeg_stopped_with_the_run_keeps_its_checked_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    asked = _readable(monkeypatch, 3)
+    popen = _stopped_ffmpeg()
+    sink = _sink(tmp_path, popen, stop_requested=lambda: True)
+    sink.open(INFO)
+    with caplog.at_level("WARNING", logger="petrify.sinks.file"):
+        for i in range(6):
+            sink.write(_image(i), _meta(i))  # Frames 3 to 5 are dropped, not an error.
+        sink.close()
+    output = tmp_path / "out.mp4"
+    assert output.exists()  # FFmpeg's own file, moved in place.
+    assert not sink.partial_path.exists()
+    assert asked == [sink.partial_path]
+    assert popen.proc.terminated == popen.proc.killed == 0
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("frames processed from now on are not recorded" in m for m in messages)
+    assert any(f"{output} holds 3 frames, petrify produced 6" in m for m in messages)
+
+
+def test_ffmpeg_stopped_by_a_signal_at_close_keeps_its_checked_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The signal reached FFmpeg while it was finishing: it exits 255 at close.
+    _readable(monkeypatch, 4)
+    popen = FakePopen(exit_code=255, stderr_text=SIGNAL_EXIT)
+    sink = _sink(tmp_path, popen, stop_requested=lambda: True)
+    sink.open(INFO)
+    for i in range(4):
+        sink.write(_image(i), _meta(i))
+    with caplog.at_level("WARNING", logger="petrify.sinks.file"):
+        sink.close()
+    assert (tmp_path / "out.mp4").exists()
+    assert any("holds 4 frames, petrify produced 4" in r.getMessage() for r in caplog.records)
+
+
+def test_ffmpeg_stopped_with_the_run_but_unreadable_file_fails_and_discards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _readable(monkeypatch, None)
+    sink = _sink(tmp_path, _stopped_ffmpeg(), stop_requested=lambda: True)
+    sink.open(INFO)
+    for i in range(6):
+        sink.write(_image(i), _meta(i))
+    with pytest.raises(OSError, match="could not be read back"):
+        sink.close()
+    assert not (tmp_path / "out.mp4").exists()
+    assert not sink.partial_path.exists()
+
+
+def test_ffmpeg_stopped_with_the_run_and_no_frame_in_its_file_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _readable(monkeypatch, 0)
+    sink = _sink(tmp_path, _stopped_ffmpeg(), stop_requested=lambda: True)
+    sink.open(INFO)
+    for i in range(4):
+        sink.write(_image(i), _meta(i))
+    with pytest.raises(OSError, match="could not be read back"):
+        sink.close()
+    assert not (tmp_path / "out.mp4").exists()
+
+
+@pytest.mark.usefixtures("short_grace")
+def test_ffmpeg_stopped_by_a_signal_without_a_run_stop_still_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FFmpeg alone was signalled: the run goes on, so this is a failure as before.
+    asked = _readable(monkeypatch, 3)
+    sink = _sink(tmp_path, _stopped_ffmpeg(), stop_requested=lambda: False)
+    sink.open(INFO)
+    for i in range(3):
+        sink.write(_image(i), _meta(i))
+    with pytest.raises(OSError, match="FFmpeg exited while frames"):
+        sink.write(_image(3), _meta(3))
+    sink.abort()
+    assert asked == []
+    assert not (tmp_path / "out.mp4").exists()
+    assert not sink.partial_path.exists()
+
+
+@pytest.mark.usefixtures("short_grace")
+def test_ffmpeg_stopped_by_a_signal_at_close_without_a_run_stop_still_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked = _readable(monkeypatch, 3)
+    sink = _sink(tmp_path, FakePopen(exit_code=255, stderr_text=SIGNAL_EXIT),
+                 stop_requested=lambda: False)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    with pytest.raises(OSError, match="FFmpeg failed"):
+        sink.close()
+    assert asked == []
+    assert not (tmp_path / "out.mp4").exists()
+    assert not sink.partial_path.exists()
+
+
+def test_run_stop_arriving_within_the_grace_keeps_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FFmpeg may get the signal a moment before the run does.
+    _readable(monkeypatch, 3)
+    asked_at: list[float] = []
+    start = time.monotonic()
+
+    def stop_requested() -> bool:
+        asked_at.append(time.monotonic())
+        return time.monotonic() - start > 0.1
+
+    sink = _sink(tmp_path, _stopped_ffmpeg(), stop_requested=stop_requested)
+    sink.open(INFO)
+    for i in range(5):
+        sink.write(_image(i), _meta(i))
+    sink.close()
+    assert (tmp_path / "out.mp4").exists()
+    assert len(asked_at) > 1
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "stderr_text"),
+    [
+        (1, "Conversion failed!\n"),  # FFmpeg failing on its own.
+        (255, "Error while encoding\n"),  # 255 without the signal message.
+        (0, ""),  # Exit 0 while frames were still being written.
+    ],
+)
+@pytest.mark.usefixtures("short_grace")
+def test_ffmpeg_failing_on_its_own_still_fails_with_a_stop_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int, stderr_text: str
+) -> None:
+    asked = _readable(monkeypatch, 3)
+    popen = FakePopen(exit_code=exit_code, stderr_text=stderr_text, break_after=3,
+                      exit_on_break=True)
+    sink = _sink(tmp_path, popen, stop_requested=lambda: True)
+    sink.open(INFO)
+    for i in range(3):
+        sink.write(_image(i), _meta(i))
+    with pytest.raises(OSError):
+        sink.write(_image(3), _meta(3))
+    sink.abort()
+    assert asked == []
+    assert not (tmp_path / "out.mp4").exists()
+    assert not sink.partial_path.exists()
+
+
+def test_ffmpeg_stopped_by_a_signal_without_stop_requested_fails_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked = _readable(monkeypatch, 3)
+    sink = _sink(tmp_path, _stopped_ffmpeg())  # No stop_requested: the default.
+    sink.open(INFO)
+    for i in range(3):
+        sink.write(_image(i), _meta(i))
+    with pytest.raises(OSError, match="FFmpeg exited while frames"):
+        sink.write(_image(3), _meta(3))
+    sink.abort()
+    assert asked == []
+    assert not (tmp_path / "out.mp4").exists()
+
+
+def _default_sigint() -> bool:
+    return signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+@pytest.fixture
+def sigint_restored() -> Iterator[None]:
+    previous = signal.getsignal(signal.SIGINT)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+@pytest.mark.usefixtures("sigint_restored")
+@pytest.mark.skipif(not _default_sigint(), reason="needs the default SIGINT handler")
+def test_sigint_while_ffmpeg_starts_leaves_no_untracked_ffmpeg(tmp_path: Path) -> None:
+    class InterruptedPopen(FakePopen):
+        def __call__(self, cmd: list[str], **kwargs: Any) -> FakeProc:
+            proc = super().__call__(cmd, **kwargs)
+            signal.raise_signal(signal.SIGINT)  # Lands as Popen returns.
+            return proc
+
+    popen = InterruptedPopen()
+    sink = _sink(tmp_path, popen)
+    with pytest.raises(KeyboardInterrupt):
+        sink.open(INFO)
+    sink.abort()  # Possible only because the handle was stored before the interrupt.
+    assert popen.proc.terminated == 1
+    assert not sink.partial_path.exists()
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+@pytest.mark.usefixtures("sigint_restored")
+@pytest.mark.skipif(not _default_sigint(), reason="needs the default SIGINT handler")
+def test_sigint_while_ffmpeg_is_stopped_still_stops_it_and_removes_the_partial(
+    tmp_path: Path,
+) -> None:
+    popen = FakePopen(hang=True)
+    sink = _sink(tmp_path, popen)
+    sink.open(INFO)
+    sink.write(_image(0), _meta(0))
+    proc = popen.proc
+    real_terminate = proc.terminate
+
+    def terminate() -> None:
+        real_terminate()
+        signal.raise_signal(signal.SIGINT)  # A second Ctrl-C during the abort.
+
+    proc.terminate = terminate  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        sink.abort()
+    assert proc.terminated == 1
+    assert proc.returncode is not None  # It was waited for, not left running.
+    assert not sink.partial_path.exists()
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+@real_ffmpeg
+def test_real_ffmpeg_reads_back_a_complete_file_and_rejects_a_truncated_one(
+    tmp_path: Path,
+) -> None:
+    from petrify.sinks.file import _count_readable_frames  # noqa: PLC0415
+
+    output = tmp_path / "whole.mp4"
+    sink = FfmpegPipeSink(output, EncodeConfig(preset="ultrafast"))
+    sink.open(REAL_INFO)
+    for i in range(20):
+        sink.write(_solid(i), _meta(i, REAL_INFO))
+    sink.close()
+    ffmpeg = find_ffmpeg()
+    assert _count_readable_frames(ffmpeg, output) == 20
+    cut = tmp_path / "cut.mp4"
+    data = output.read_bytes()
+    cut.write_bytes(data[: len(data) * 2 // 3])
+    assert _count_readable_frames(ffmpeg, cut) is None
+
+
+@real_ffmpeg
+@pytest.mark.skipif(os.name != "posix", reason="SIGTERM delivery to FFmpeg is POSIX")
+def test_real_ffmpeg_sigterm_to_ffmpeg_during_a_stopped_run_keeps_a_playable_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    live = SourceInfo(fps=30.0, width=RW, height=RH, frame_count=None, seekable=False, live=True)
+    output = tmp_path / "group.mp4"
+    sink = FfmpegPipeSink(output, EncodeConfig(preset="ultrafast"), wallclock_timestamps=True,
+                          stop_requested=lambda: True)
+    sink.open(live)
+    for i in range(15):
+        sink.write(_solid(i), _meta(i, live))
+        time.sleep(0.01)
+    os.kill(sink._proc.pid, signal.SIGTERM)  # As systemd signals every process of the unit.
+    with caplog.at_level("WARNING", logger="petrify.sinks.file"):
+        for i in range(15, 40):
+            sink.write(_solid(i), _meta(i, live))
+            time.sleep(0.01)
+        sink.close()
+    assert output.is_file()
+    assert not sink.partial_path.exists()
+    frames = _read_frames(output)
+    assert 1 <= len(frames) < 40
+    assert any("ends early" in r.getMessage() for r in caplog.records)
