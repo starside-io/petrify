@@ -27,7 +27,8 @@ and prints three tables:
 2. The segmenter head band: 12 percent of the box height starting at the top
    row of the mask inside the box, for boxes whose mask share is at least 30
    percent and whose height over width is at least 1.4, split by box height.
-3. The proposed head rule: the head rect is the width of the padded person box
+3. The head rule of ``orphan=head``, the plugin's own
+   :func:`petrify_shadow.regions.head_rect`: the width of the padded person box
    (:func:`petrify_shadow.regions.pad_person`), from its top edge down to
    ``y + ceil(h / 2)``. It applies only to boxes at least 150 px tall with
    height over width at least 1.4; any other box keeps the whole-box fill. The
@@ -64,7 +65,15 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from petrify_shadow.options import DEFAULT_PADDING  # noqa: E402
-from petrify_shadow.regions import Rect, orphan_indices, pad_face, pad_person  # noqa: E402
+from petrify_shadow.regions import (  # noqa: E402
+    HEAD_MIN_ASPECT,
+    HEAD_MIN_HEIGHT_PX,
+    Rect,
+    _top_share,
+    head_rect,
+    orphan_indices,
+    pad_face,
+)
 
 from petrify.core.config import FaceYuNetConfig, PersonDnnConfig, SegmentConfig  # noqa: E402
 from petrify.core.detections import Box, Face  # noqa: E402
@@ -72,10 +81,6 @@ from petrify.detectors.face_yunet import FaceYuNetDetector  # noqa: E402
 from petrify.detectors.person_dnn import PersonDnnDetector  # noqa: E402
 from petrify.detectors.segment import PersonSegmenter  # noqa: E402
 from petrify.sources import FileSource  # noqa: E402
-
-# The rule under test, as proposed in the phase 6 design.
-HEAD_MIN_HEIGHT_PX = 150
-HEAD_MIN_ASPECT_NUM, HEAD_MIN_ASPECT_DEN = 7, 5  # height / width at least 1.4
 
 # The segmenter head proxy.
 BAND_SHARE = 0.12
@@ -117,27 +122,6 @@ class Seen:
         if r is None or top is None:
             return False
         return r.x0 >= top.x0 and r.y0 >= top.y0 and r.x1 <= top.x1 and r.y1 <= top.y1
-
-
-def eligible(box: Box) -> bool:
-    """True when the proposed rule accepts ``box``; integer arithmetic, so 1.4 is exact."""
-    return box.h >= HEAD_MIN_HEIGHT_PX and box.h * HEAD_MIN_ASPECT_DEN >= box.w * HEAD_MIN_ASPECT_NUM
-
-
-def top_half(box: Box, h: int, w: int) -> Rect | None:
-    """Return the top-half rect of ``box`` in an ``h`` by ``w`` frame.
-
-    The left, right and top edges are those of the padded person box. The
-    bottom edge is ``y + ceil(h / 2)``, rounded outward and clipped after
-    rounding like every edge in the plugin's regions.
-    """
-    padded = pad_person(box, h, w)
-    if padded is None:
-        return None
-    bottom = min(max(box.y + -(-box.h // 2), 0), h)
-    if bottom <= padded.y0:
-        return None
-    return Rect(padded.x0, padded.y0, padded.x1, bottom)
 
 
 def _touches_edge(box: Box, h: int, w: int) -> bool:
@@ -290,20 +274,25 @@ def main(argv: list[str] | None = None) -> int:
             orphan_set = set(orphan_indices(persons, faces, None, "face", h, w))
             for i, box in enumerate(persons):
                 face = taken.get(i)
+                head = head_rect(box, h, w)
+                # The refused-box line needs the same geometry without the
+                # eligibility test, so it comes from the plugin too.
+                top = _top_share(box, h, w)
                 seen = Seen(
                     frame=frame.index,
                     box=box,
                     face_rect=pad_face(face.box, args.padding, h, w) if face else None,
                     face_h=face.box.h if face else 0,
-                    top=top_half(box, h, w),
-                    eligible=eligible(box),
+                    top=top,
+                    eligible=head is not None,
                     edge=_touches_edge(box, h, w),
                 )
                 if i in orphan_set:
                     orphans.append(seen)
                 elif face is not None and seen.face_rect is not None:
                     cleared.append(seen)
-                if mask is not None and box.h * 5 >= box.w * 7:
+                aspect = HEAD_MIN_ASPECT
+                if mask is not None and box.h * aspect.denominator >= box.w * aspect.numerator:
                     bottom = _band_bottom(mask, box)
                     if bottom is not None:
                         key = "150 px or more" if box.h >= HEAD_MIN_HEIGHT_PX else "under 150 px"
@@ -332,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"   {'':15} inside the top half: {_share(inside, len(values))}")
         print()
         print("3. Proposed rule (padded box width, top edge to y + ceil(h / 2); "
-              f"h >= {HEAD_MIN_HEIGHT_PX} px and h/w >= 1.4)")
+              f"h >= {HEAD_MIN_HEIGHT_PX} px and h/w >= {float(HEAD_MIN_ASPECT):g})")
         accepted = [s for s in cleared if s.eligible]
         refused = [s for s in cleared if not s.eligible]
         held_in = [s for s in accepted if s.inside]
@@ -354,7 +343,8 @@ def main(argv: list[str] | None = None) -> int:
               f"whole-box fill {_share(len(orphans) - heads, len(orphans))}")
         short = sum(s.box.h < HEAD_MIN_HEIGHT_PX for s in orphans)
         wide = sum(s.box.h >= HEAD_MIN_HEIGHT_PX and not s.eligible for s in orphans)
-        print(f"     fallback reasons: under {HEAD_MIN_HEIGHT_PX} px {short}, h/w under 1.4 {wide}")
+        print(f"     fallback reasons: under {HEAD_MIN_HEIGHT_PX} px {short}, "
+              f"h/w under {float(HEAD_MIN_ASPECT):g} {wide}")
         print()
 
         args.out_dir.mkdir(parents=True, exist_ok=True)

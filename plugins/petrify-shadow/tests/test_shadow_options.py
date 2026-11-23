@@ -31,6 +31,8 @@ from petrify_shadow.factory import (
     WEAK_DILATE,
     WEAK_EYEBAR_ONLY,
     WEAK_NO_BODY,
+    WEAK_ORPHAN_HEAD,
+    WEAK_ORPHAN_HEAD_MASK,
     WEAK_PADDING,
     WEAK_REVERSIBLE,
     WEAK_SEGMENT_MISS,
@@ -123,7 +125,8 @@ def test_colors_are_bgr() -> None:
 
 def test_option_specs_pass_the_core_check() -> None:
     assert check_option_specs(OPTIONS) is OPTIONS
-    assert [s.name for s in OPTIONS] == ["styles", "padding", "strength", "color", "dilate"]
+    assert [s.name for s in OPTIONS] == [
+        "styles", "padding", "strength", "color", "dilate", "orphan"]
 
 
 def test_option_specs_match_the_design_table() -> None:
@@ -142,6 +145,11 @@ def test_option_specs_match_the_design_table() -> None:
     dilate = by_name["dilate"]
     assert (dilate.kind, dilate.default, dilate.minimum, dilate.maximum) == (
         "float", 0.01, 0.0, 0.1)
+    orphan = by_name["orphan"]
+    assert (orphan.kind, orphan.default, orphan.choices, orphan.runtime) == (
+        "choice", "box", ("box", "head"), True)
+    # The help states the trade-off, not only the choices.
+    assert "covers less" in orphan.help and "top half" in orphan.help
 
 
 def test_every_option_is_runtime_with_help_and_bounded_numbers() -> None:
@@ -155,7 +163,8 @@ def test_every_option_is_runtime_with_help_and_bounded_numbers() -> None:
 def test_no_text_holds_an_em_or_en_dash() -> None:
     texts = [spec.help for spec in OPTIONS] + [
         WEAK_NO_BODY, WEAK_REVERSIBLE, WEAK_STRENGTH, WEAK_EYEBAR_ONLY, WEAK_PADDING,
-        WEAK_DILATE, WEAK_SEGMENT_MISS, BODYBOX_NEEDS_PERSONS, SHADOW.summary,
+        WEAK_DILATE, WEAK_SEGMENT_MISS, WEAK_ORPHAN_HEAD, WEAK_ORPHAN_HEAD_MASK,
+        BODYBOX_NEEDS_PERSONS, SHADOW.summary,
     ]
     for text in texts:
         assert chr(0x2014) not in text and chr(0x2013) not in text, text
@@ -168,6 +177,8 @@ def test_no_text_holds_an_em_or_en_dash() -> None:
         (["styles= noise , eyebar "], {"styles": ("noise", "eyebar")}),
         (["padding=0.5", "strength=low"], {"padding": 0.5, "strength": "low"}),
         (["color=red", "dilate=0.02"], {"color": "red", "dilate": 0.02}),
+        (["orphan=head"], {"orphan": "head"}),
+        (["orphan= box "], {"orphan": "box"}),
     ],
 )
 def test_resolve_option_text_round_trips_cli_input(
@@ -185,6 +196,10 @@ def test_resolve_option_text_refuses_unknown_styles_and_out_of_range() -> None:
         resolve_option_text(OPTIONS, ["padding=1.5"])
     with pytest.raises(ValueError, match="at most"):
         resolve_option_text(OPTIONS, ["dilate=0.2"])
+    with pytest.raises(ValueError, match="must be one of"):
+        resolve_option_text(OPTIONS, ["orphan=face"])
+    with pytest.raises(ValueError):
+        parse_params({"orphan": "Head"})
 
 
 # ---------------------------------------------------------------------------
@@ -194,20 +209,23 @@ def test_resolve_option_text_refuses_unknown_styles_and_out_of_range() -> None:
 
 def test_parse_params_defaults() -> None:
     expected = ShadowParams(
-        styles=frozenset({"facebox"}), padding=0.3, strength="high", color=(0, 0, 0), dilate=0.01
+        styles=frozenset({"facebox"}), padding=0.3, strength="high", color=(0, 0, 0),
+        dilate=0.01, orphan="box",
     )
     assert parse_params({}) == expected
     assert parse_params(_opts()) == expected
+    # A hand-built instance without the field gets the default, which covers as before.
+    assert ShadowParams(frozenset({"facebox"}), 0.3, "high", (0, 0, 0), 0.01) == expected
 
 
 def test_parse_params_reads_each_option() -> None:
     params = parse_params(
         _opts(styles="noise,silhouette", padding=0.6, strength="medium", color="blue",
-              dilate=0.05)
+              dilate=0.05, orphan="head")
     )
     assert params == ShadowParams(
         styles=frozenset({"noise", "silhouette"}), padding=0.6, strength="medium",
-        color=(255, 0, 0), dilate=0.05,
+        color=(255, 0, 0), dilate=0.05, orphan="head",
     )
     assert type(params.padding) is float and type(params.dilate) is float
 
@@ -449,6 +467,36 @@ def test_weakened_combination_lists_all_in_order() -> None:
     )
 
 
+def test_weakened_orphan_head() -> None:
+    # Off with the default and with an explicit box.
+    for styles in ("facebox", "silhouette", "silhouette,facebox", "noise,eyebar"):
+        assert WEAK_ORPHAN_HEAD not in _weak(styles=styles)
+        assert WEAK_ORPHAN_HEAD not in _weak(styles=styles, orphan="box")
+        assert WEAK_ORPHAN_HEAD_MASK not in _weak(styles=styles, orphan="box")
+    # Face primary: the face sentence, listed last.
+    assert _weak(styles="facebox", orphan="head") == (WEAK_NO_BODY, WEAK_ORPHAN_HEAD)
+    assert _weak(styles="outline,noise", orphan="head")[-1] == WEAK_ORPHAN_HEAD
+    # Mask primary: the segmenter sentence.
+    assert _weak(styles="silhouette,noise", orphan="head") == (
+        WEAK_SEGMENT_MISS, WEAK_ORPHAN_HEAD_MASK)
+    assert _weak(styles="silhouette_color", orphan="head")[-1] == WEAK_ORPHAN_HEAD_MASK
+    # bodybox covers every person box: no orphan rule, no sentence.
+    for styles in ("bodybox", "bodybox,facebox", "silhouette,bodybox,noise"):
+        weak = _weak(styles=styles, orphan="head")
+        assert WEAK_ORPHAN_HEAD not in weak and WEAK_ORPHAN_HEAD_MASK not in weak
+    # An unreadable value counts as the default.
+    for bad in ("Head", 1, None):
+        assert SHADOW.weakened({"styles": ("facebox",), "orphan": bad}) == (WEAK_NO_BODY,)
+
+
+def test_weakened_orphan_head_sentence_wording() -> None:
+    assert WEAK_ORPHAN_HEAD == (
+        "orphan is head: a person box whose face is not found is covered only on its top "
+        "half; the body, and a head outside the top half as when bending, sitting low or "
+        "two people in one box, are shown."
+    )
+
+
 def test_weakened_strongest_settings_list_nothing() -> None:
     assert _weak(styles="silhouette,bodybox,noise") == ()
     assert _weak(styles="bodybox,facebox") == ()
@@ -529,7 +577,7 @@ def test_create_returns_previous_for_equal_params() -> None:
 @pytest.mark.parametrize(
     "change",
     [{"styles": "noise"}, {"padding": 0.4}, {"strength": "low"}, {"color": "white"},
-     {"dilate": 0.02}],
+     {"dilate": 0.02}, {"orphan": "head"}],
 )
 def test_create_returns_a_new_mode_when_params_differ(change: dict[str, Any]) -> None:
     first = SHADOW.create(_ctx())

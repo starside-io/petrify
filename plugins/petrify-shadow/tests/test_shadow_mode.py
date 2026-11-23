@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import itertools
 import logging
 import time
@@ -37,6 +38,7 @@ from petrify_shadow.regions import (
     HELD_REGION_FRAMES,
     Rect,
     dilate_px,
+    head_rect,
     held_growth,
     pad_face,
     pad_person,
@@ -1355,3 +1357,277 @@ def test_render_timing_is_printed() -> None:
         ms = (time.perf_counter() - start) / runs * 1000
         lines.append(f"{w}x{h} {name}: {ms:.2f} ms")
     print("\nshadow render timing:\n  " + "\n  ".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# orphan = box | head
+# ---------------------------------------------------------------------------
+
+SWEEP_DIGEST = "5d0bcadc7435d7e20b29b0ab0c32211fc55c6a7bdff842fd292983d44a57c6b0"
+"""SHA-256 over every render of the two decision-table sweeps above.
+
+Recorded on the code before the ``orphan`` option existed. It pins those outputs
+byte for byte, so a change that alters what the default draws fails here even
+when the plan still looks right. It changes only if the sweep fixtures change.
+"""
+
+
+def _sweep_digest(**options: object) -> tuple[int, str]:
+    """Render both decision-table sweeps with ``options`` and hash every output in order."""
+    cases = [(p, f, m, pe, g, 0, 0) for p, f, m, pe, g in itertools.product(
+        [False, True], FACES, MASKS, PERSONS, GROUPS)]
+    cases += [(True, f, m, pe, g, fh, ph) for fh, ph, f, m, pe, g in itertools.product(
+        [0, 1, CAP - 1, CAP, CAP + 3], [0, 1, CAP - 1, CAP, CAP + 3], ["empty", "one"],
+        MASKS, ["none", "empty", "with_face", "without_face", "both"], GROUPS)]
+    digest = hashlib.sha256()
+    for n, (present, faces, mask, persons, group, fh, ph) in enumerate(cases):
+        detections = _held_for(_detections(faces, mask, persons), fh, ph)
+        # Seeded, so the noise style is reproducible here.
+        mode = ShadowMode(_params(GROUPS[group], **options), rng=np.random.default_rng(0))
+        out = mode.render(_frame(_image(n % 7)), detections, present)
+        digest.update(np.ascontiguousarray(out).tobytes())
+    return len(cases), digest.hexdigest()
+
+
+@pytest.mark.parametrize("options", [{}, {"orphan": "box"}], ids=["default", "box"])
+def test_orphan_box_renders_the_decision_table_sweeps_byte_identical_to_before(
+    options: dict[str, object],
+) -> None:
+    assert _sweep_digest(**options) == (9536, SWEEP_DIGEST)
+
+
+HS = (480, 640, 3)
+"""A frame large enough for person boxes the head rule accepts."""
+HH, HW = HS[:2]
+TALL = Box(100, 60, 100, 300)
+"""Eligible: 300 px tall, height / width 3. Head zone rows 60 to 134."""
+TALL2 = Box(400, 60, 100, 300)
+SHORT = Box(250, 60, 100, 149)
+"""One row under the minimum height."""
+WIDE = Box(420, 60, 150, 209)
+"""Tall enough, height / width just under 7/5 (209 * 5 < 150 * 7)."""
+LOW_FACE = Face(Box(130, 165, 30, 30), landmarks=((138.0, 175.0), (152.0, 175.0)))
+"""Inside TALL's head rect, but its center (145, 180) is below the top third (row 160)."""
+TALL_FACE = Face(Box(130, 80, 30, 30), landmarks=((138.0, 90.0), (152.0, 90.0)))
+"""A face whose center lies in TALL's top third, so it clears TALL."""
+
+
+def _hs_mask(*rects: tuple[int, int, int, int]) -> np.ndarray:
+    """A mask of the HS frame, True on each (x0, y0, x1, y1)."""
+    mask = np.zeros((HH, HW), bool)
+    for x0, y0, x1, y1 in rects:
+        mask[y0:y1, x0:x1] = True
+    mask.setflags(write=False)
+    return mask
+
+
+BODY_ONLY = (100, 140, 200, 360)
+"""TALL's body without its head zone: 22000 of 30000 box pixels, 0 in the head zone."""
+
+
+def _hs_region(rect: Rect) -> np.ndarray:
+    inside = np.zeros((HH, HW), bool)
+    inside[rect.y0 : rect.y1, rect.x0 : rect.x1] = True
+    return inside
+
+
+def _head(box: Box) -> Rect:
+    rect = head_rect(box, HH, HW)
+    assert rect is not None
+    return rect
+
+
+def _whole(box: Box) -> Rect:
+    rect = pad_person(box, HH, HW, grow=held_growth(box.held))
+    assert rect is not None
+    return rect
+
+
+def _hs_plan(styles: Sequence[str], detections: Detections, orphan: str, **options: object) -> Plan:
+    return plan(_params(styles, orphan=orphan, **options), detections, True, HS)
+
+
+def test_head_rect_of_the_fixtures() -> None:
+    # Pad 5 px per side and 15 px on top; the bottom edge at 60 + 150.
+    assert _head(TALL) == Rect(95, 45, 205, 210)
+    for box in (SHORT, WIDE, _held_box(TALL, 1)):
+        assert head_rect(box, HH, HW) is None
+
+
+def test_face_primary_head_fills_only_the_head_rect_of_an_eligible_orphan() -> None:
+    detections = Detections(faces=(), persons=(TALL,))
+    assert _hs_plan(("facebox",), detections, "box").orphans == (_whole(TALL),)
+    p = _hs_plan(("facebox",), detections, "head")
+    assert p.action == "draw"
+    assert p.orphans == (_head(TALL),)
+
+
+@pytest.mark.parametrize(
+    "box", [SHORT, WIDE, _held_box(TALL, 1), _held_box(TALL, CAP - 1)],
+    ids=["short", "wide", "held-1", "held-below-cap"],
+)
+def test_face_primary_head_keeps_the_whole_box_fill_when_the_box_is_not_eligible(
+    box: Box,
+) -> None:
+    detections = Detections(faces=(), persons=(box,))
+    for orphan in ("box", "head"):
+        p = _hs_plan(("facebox",), detections, orphan)
+        assert p.action == "draw"
+        assert p.orphans == (_whole(box),), orphan
+
+
+def test_face_primary_head_on_mixed_boxes_keeps_input_order() -> None:
+    detections = Detections(faces=(TALL_FACE,), persons=(TALL, SHORT, TALL2, WIDE))
+    p = _hs_plan(("facebox",), detections, "head")
+    # TALL is cleared by its face; the others are orphans, each with its own fill.
+    assert p.orphans == (_whole(SHORT), _head(TALL2), _whole(WIDE))
+
+
+def test_a_held_face_does_not_clear_and_its_box_gets_the_head_fill() -> None:
+    # The held face no longer proves where the head is, so TALL is an orphan; the
+    # fresh box itself is eligible.
+    detections = Detections(faces=(_held_face(TALL_FACE, 1),), persons=(TALL,))
+    p = _hs_plan(("facebox",), detections, "head")
+    assert p.orphans == (_head(TALL),)
+    assert len(p.face_rects) == 1
+
+
+def test_face_primary_head_draws_the_head_black_and_the_face_style_on_top() -> None:
+    image = _image(3, HS)
+    detections = Detections(faces=(LOW_FACE,), persons=(TALL,))
+    params = _params(("facebox",), orphan="head", color="red")
+    out = ShadowMode(params).render(Frame(image, 0, 0.0, INFO), detections, True)
+    p = plan(params, detections, True, HS)
+    (face_rect,) = p.face_rects
+    assert p.orphans == (_head(TALL),)
+    face = _hs_region(face_rect)
+    head = _hs_region(_head(TALL)) & ~face
+    assert face_rect.y1 <= _head(TALL).y1  # The face cover lies inside the head rect.
+    assert np.all(out[face] == RED)
+    assert not out[head].any()
+    rest = ~(face | head)
+    assert np.array_equal(out[rest], image[rest])
+    # The lower body of the box, rows 210 on, is shown.
+    assert np.array_equal(out[210:360, 100:200], image[210:360, 100:200])
+
+
+def test_mask_primary_head_fills_the_head_rect_when_only_the_head_zone_share_fails() -> None:
+    detections = Detections(mask=_hs_mask(BODY_ONLY), persons=(TALL,))
+    assert _hs_plan(("silhouette",), detections, "box").orphans == (_whole(TALL),)
+    p = _hs_plan(("silhouette",), detections, "head")
+    assert p.action == "draw"
+    assert p.orphans == (_head(TALL),)
+
+
+@pytest.mark.parametrize(
+    ("mask", "box"),
+    [
+        (None, TALL),  # no mask: the whole-box share fails
+        (_hs_mask(), TALL),  # an empty mask
+        (_hs_mask((100, 60, 200, 135)), TALL),  # the head zone only: 25 percent of the box
+        (_hs_mask((100, 300, 200, 360), (400, 60, 500, 360)), TALL),  # 20 percent, no head
+        (_hs_mask(BODY_ONLY), _held_box(TALL, 1)),  # head-zone failure, held box
+        (_hs_mask((250, 120, 350, 209)), SHORT),  # head-zone failure, short box
+    ],
+    ids=["none", "empty", "head-only", "box-share", "held", "short"],
+)
+def test_mask_primary_head_keeps_the_whole_box_fill(mask: np.ndarray | None, box: Box) -> None:
+    detections = Detections(mask=mask, persons=(box,))
+    for orphan in ("box", "head"):
+        assert _hs_plan(("silhouette",), detections, orphan).orphans == (_whole(box),), orphan
+
+
+def test_mask_primary_head_draws_the_head_black_and_the_silhouette_over_the_body() -> None:
+    image = _image(4, HS)
+    mask = _hs_mask(BODY_ONLY)
+    detections = Detections(mask=mask, persons=(TALL,))
+    params = _params(("silhouette",), orphan="head", dilate=0.0)
+    out = ShadowMode(params).render(Frame(image, 0, 0.0, INFO), detections, True)
+    covered = _hs_region(_head(TALL)) | mask
+    assert not out[covered].any()
+    assert np.array_equal(out[~covered], image[~covered])
+
+
+def test_bodybox_primary_has_no_orphans_with_either_value() -> None:
+    detections = Detections(faces=(), mask=_hs_mask(), persons=(TALL, SHORT))
+    for styles in (("bodybox",), ("bodybox", "silhouette", "facebox")):
+        box = _hs_plan(styles, detections, "box")
+        assert _hs_plan(styles, detections, "head") == box
+        assert box.orphans == ()
+
+
+def test_plan_rejects_an_unknown_orphan_value() -> None:
+    params = dataclasses.replace(_params(("facebox",)), orphan="Head")  # type: ignore[type-var]
+    with pytest.raises(ValueError, match="orphan"):
+        plan(params, Detections(), True, HS)
+
+
+def _random_box(rng: np.random.Generator) -> Box:
+    return Box(int(rng.integers(-60, HW)), int(rng.integers(-60, HH)),
+               int(rng.integers(0, 260)), int(rng.integers(0, 420)),
+               held=int(rng.choice([0, 0, 0, 1, CAP])))
+
+
+def test_head_changes_only_the_orphan_fills_and_never_whether_the_frame_has_regions() -> None:
+    rng = np.random.default_rng(6)
+    heads = 0
+    for _ in range(400):
+        persons = tuple(_random_box(rng) for _ in range(int(rng.integers(0, 4))))
+        faces = tuple(
+            Face(_random_box(rng), landmarks=None) for _ in range(int(rng.integers(0, 3)))
+        )
+        mask = rng.random((HH, HW)) < rng.random() * 0.6 if rng.random() < 0.7 else None
+        group = list(GROUPS)[int(rng.integers(0, len(GROUPS)))]
+        detections = Detections(faces=faces, mask=mask, persons=persons)
+        present = bool(rng.random() < 0.8)
+        box = plan(_params(GROUPS[group]), detections, present, HS)
+        head = plan(_params(GROUPS[group], orphan="head"), detections, present, HS)
+        assert head.action == box.action
+        assert (head.faces, head.face_rects, head.person_rects) == (
+            box.faces, box.face_rects, box.person_rects)
+        assert (head.mask is None) == (box.mask is None)
+        assert len(head.orphans) == len(box.orphans)
+        for a, b in zip(head.orphans, box.orphans, strict=True):
+            if a != b:
+                heads += 1
+                # The head rect shares the padded box's top, left and right edges.
+                assert (a.x0, a.y0, a.x1) == (b.x0, b.y0, b.x1) and a.y1 < b.y1
+    assert heads > 20
+
+
+def _head_engine(mode: ShadowMode, info: SourceInfo) -> Engine:
+    # A fresh person box on every frame and no face: always an eligible orphan.
+    persons = _FakePersons({i: TALL for i in range(20)})
+    engine = Engine([_FakeFaces({}), persons], mode, [], [_Sink()],
+                    EngineConfig(lookahead=0, cold_start_frames=0))
+    engine.open(info)
+    return engine
+
+
+def test_a_live_switch_of_orphan_takes_effect_on_the_next_frame() -> None:
+    info = dataclasses.replace(INFO, width=HW, height=HH)
+    image = _image(5, HS)
+    detections = Detections(faces=(), persons=(TALL,))
+    expected = {
+        value: ShadowMode(_params(("facebox",), orphan=value)).render(
+            Frame(image, 0, 0.0, info), detections, True)
+        for value in ("box", "head")
+    }
+    assert not np.array_equal(expected["box"], expected["head"])
+    mode = SHADOW.create(_ctx(("facebox",), info=info))
+    engine = _head_engine(mode, info)  # type: ignore[arg-type]
+    outs: list[Output] = []
+    switches = {3: "head", 6: "box"}
+    for i in range(9):
+        if i in switches:
+            new = SHADOW.create(_ctx(("facebox",), info=info, orphan=switches[i]), mode)
+            assert new is not mode
+            engine.reconfigure(mode=new)
+            mode = new
+        outs += engine.step(Frame(image, i, i / 10.0, info))
+    outs += engine.flush()
+    engine.close()
+    values = ["box"] * 3 + ["head"] * 3 + ["box"] * 3
+    assert len(outs) == 9
+    for i, (out, value) in enumerate(zip(outs, values, strict=True)):
+        assert np.array_equal(out.image, expected[value]), f"frame {i}"

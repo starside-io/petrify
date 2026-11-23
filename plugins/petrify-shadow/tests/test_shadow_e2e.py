@@ -48,8 +48,10 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import numpy as np
+import petrify_shadow.mode as shadow_mode
 import pytest
 from conftest import ShadowEntryPoint
+from petrify_shadow.regions import pad_face
 
 from petrify.cli import _build_run_parser, _mode_options_config, _resolve_run
 from petrify.core.config import FaceYuNetConfig, PersonDnnConfig, PetrifyConfig, SegmentConfig
@@ -269,6 +271,61 @@ def test_facebox_fills_every_found_face_on_camera(models: Path) -> None:
                      "--faces", "--track")
     _run("camera facebox", CAMERA, CAMERA_FACEBOX, config,
          _face_check(models, CAMERA, _fill_covered))
+
+
+@needs_models
+@pytest.mark.parametrize(
+    ("clip", "frames", "styles", "flags"),
+    [
+        (CAMERA2, CAMERA2_CLOSE, "facebox", ("--faces", "--track")),
+        (CAMERA, CAMERA_FACEBOX, "silhouette,facebox", ("--faces", "--segment", "--track")),
+    ],
+    ids=["camera2-facebox", "camera-silhouette-facebox"],
+)
+def test_orphan_head_covers_every_found_face(
+    models: Path, monkeypatch: pytest.MonkeyPatch, clip: Path, frames: range, styles: str,
+    flags: tuple[str, ...],
+) -> None:
+    if not clip.exists():
+        pytest.skip(f"demo clip not available: {clip}")
+    # Count, per orphan box, whether it got a head rect or kept the whole-box fill.
+    counts = {"orphans": 0, "head": 0}
+    real_reasons, real_head = shadow_mode.orphan_reasons, shadow_mode.head_rect
+
+    def reasons(*args: object) -> object:
+        out = real_reasons(*args)  # type: ignore[arg-type]
+        counts["orphans"] += len(out)
+        return out
+
+    def head(*args: object) -> object:
+        out = real_head(*args)  # type: ignore[arg-type]
+        counts["head"] += out is not None
+        return out
+
+    monkeypatch.setattr(shadow_mode, "orphan_reasons", reasons)
+    monkeypatch.setattr(shadow_mode, "head_rect", head)
+    detector = FaceYuNetDetector.from_config(FaceYuNetConfig(), [models])
+
+    def check(index: int, given: np.ndarray, out: np.ndarray) -> list[str]:
+        frame = Frame(image=given, index=0, timestamp=0.0, source=None)  # type: ignore[arg-type]
+        h, w = given.shape[:2]
+        problems = []
+        for face in detector.detect(frame).faces or ():
+            # Padded as the mode pads a fresh face; every cover here is black.
+            rect = pad_face(face.box, 0.3, h, w)
+            if rect is None:
+                continue
+            shown = int(np.count_nonzero(out[rect.y0 : rect.y1, rect.x0 : rect.x1].any(axis=2)))
+            if shown:
+                problems.append(f"face {face.box}: {shown} pixels of its padded rect shown")
+        return problems
+
+    config = _config(clip, styles, "--detector", "both", "--person-detector", "dnn",
+                     "--mode-option", "orphan=head", *flags)
+    assert config.mode_options_dict()["orphan"] == "head"
+    _run(f"{clip.name} {styles} orphan=head", clip, frames, config, check)
+    print(f"orphan boxes {counts['orphans']}: head rect {counts['head']}, "
+          f"whole-box fill {counts['orphans'] - counts['head']}")
 
 
 @needs_models

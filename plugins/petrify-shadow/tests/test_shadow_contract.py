@@ -38,6 +38,7 @@ from petrify_shadow.factory import (
     BODYBOX_NEEDS_PERSONS,
     WEAK_DILATE,
     WEAK_NO_BODY,
+    WEAK_ORPHAN_HEAD_MASK,
     WEAK_PADDING,
     WEAK_REVERSIBLE,
     WEAK_SEGMENT_MISS,
@@ -640,7 +641,7 @@ def _mode_options(snapshot: Any) -> dict[str, dict[str, Any]]:
     return {o["name"]: o for o in snapshot.to_dict()["mode"]["options"]}
 
 
-def test_the_snapshot_lists_the_five_options_and_the_mode_weakened_sentences_and_follows_changes(
+def test_the_snapshot_lists_the_six_options_and_the_mode_weakened_sentences_and_follows_changes(
     fakes: Fakes,
 ) -> None:
     config = _config(("facebox",), segment=True)
@@ -649,7 +650,7 @@ def test_the_snapshot_lists_the_five_options_and_the_mode_weakened_sentences_and
     builtin = RunControl(config, (W, H)).snapshot().weakened
     seen: list[Any] = []
     change = {"styles": ["silhouette", "gaussian"], "padding": 0.1, "strength": "medium",
-              "dilate": 0.0}
+              "dilate": 0.0, "orphan": "head"}
     hooks = {
         1: lambda: seen.append(control.snapshot()),
         3: lambda: control.submit({"mode_options": change}),
@@ -676,14 +677,18 @@ def test_the_snapshot_lists_the_five_options_and_the_mode_weakened_sentences_and
         "dilate": {**_mode_options(before)["dilate"], "kind": "float", "value": 0.01,
                    "default": 0.01, "choices": [], "minimum": 0.0, "maximum": 0.1,
                    "runtime": True},
+        "orphan": {**_mode_options(before)["orphan"], "kind": "choice", "value": "box",
+                   "default": "box", "choices": ["box", "head"], "minimum": None,
+                   "maximum": None, "runtime": True},
     }
     assert [o["name"] for o in before.to_dict()["mode"]["options"]] == [
-        "styles", "padding", "strength", "color", "dilate"]
+        "styles", "padding", "strength", "color", "dilate", "orphan"]
     assert before.weakened == (*builtin, WEAK_NO_BODY)
 
     values = {name: o["value"] for name, o in _mode_options(after).items()}
     assert values == {"styles": ["silhouette", "gaussian"], "padding": 0.1,
-                      "strength": "medium", "color": "black", "dilate": 0.0}
+                      "strength": "medium", "color": "black", "dilate": 0.0,
+                      "orphan": "head"}
     assert after.weakened == (
         *builtin,
         WEAK_REVERSIBLE,
@@ -691,8 +696,33 @@ def test_the_snapshot_lists_the_five_options_and_the_mode_weakened_sentences_and
         WEAK_PADDING.format(v="0.1"),
         WEAK_DILATE.format(v="0"),
         WEAK_SEGMENT_MISS,
+        WEAK_ORPHAN_HEAD_MASK,
     )
     assert after.last_error is None
+
+
+@pytest.mark.parametrize("value", ["box", "head"])
+def test_mode_option_orphan_fills_the_head_rect_or_the_whole_box_of_an_orphan(
+    fakes: Fakes, value: str
+) -> None:
+    # A person box no face clears, on every frame: the face style leaves it an orphan.
+    fakes.persons.every = lambda index: Detections(persons=(PERSON_BOX,))
+    options = resolve_option_text(OPTIONS, ["styles=facebox", f"orphan={value}"])
+    config = _config(**options)  # type: ignore[arg-type]
+    src = HookSource(_quiet(6), hooks={})
+    sink = ListSink()
+    report = run_stream(src, config, OutputConfig(), sinks=[sink])
+    assert report.stats.failed_closed == 0
+    # PERSON_BOX (100, 40, 80, 200) padded by 4 px per side and 10 px on top and
+    # bottom; its head rect ends at 40 + 100.
+    expected = {"box": Rect(96, 30, 184, 250), "head": Rect(96, 30, 184, 140)}[value]
+    assert len(sink.images) == 6
+    for i, (out, given) in enumerate(zip(sink.images, src.yielded, strict=True)):
+        _assert_only_covered(out, given, expected, f"frame {i}")
+    if value == "head":
+        # The lower half of the person box is shown.
+        lower = np.s_[140:240, 100:180]
+        assert np.array_equal(sink.images[-1][lower], src.yielded[-1][lower])
 
 
 def test_equal_style_sets_in_another_order_keep_the_running_mode(
@@ -751,7 +781,7 @@ def test_cli_list_modes_prints_shadow_with_its_plugin_origin(
     assert f"  shadow (plugin {ORIGIN})" in capsys.readouterr().out.splitlines()
 
 
-def test_cli_list_modes_with_mode_shadow_prints_the_five_options(
+def test_cli_list_modes_with_mode_shadow_prints_the_six_options(
     shadow_entry_point: ShadowEntryPoint, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert main(["run", "--list-modes", "--mode", "shadow"]) == 0
@@ -772,6 +802,8 @@ def test_cli_list_modes_with_mode_shadow_prints_the_five_options(
         f"    changeable while running: yes\n    help: {helps['color']}\n"
         "  dilate\n    kind: float\n    default: 0.01\n    range: 0.0 to 0.1\n"
         f"    changeable while running: yes\n    help: {helps['dilate']}\n"
+        "  orphan\n    kind: choice\n    default: box\n    choices: box, head\n"
+        f"    changeable while running: yes\n    help: {helps['orphan']}\n"
     )
 
 
@@ -785,8 +817,18 @@ def test_cli_mode_option_styles_reaches_the_config_as_a_tuple_in_typed_order(
     assert config.mode == "shadow"
     assert config.mode_options_dict() == {
         "styles": ("silhouette", "facebox"), "padding": 0.3, "strength": "high",
-        "color": "black", "dilate": 0.01,
+        "color": "black", "dilate": 0.01, "orphan": "box",
     }
+
+
+def test_cli_mode_option_orphan_head_reaches_the_config(
+    cli_run_stream: mock.MagicMock,
+) -> None:
+    argv = ["run", "--source", IN, "--output", OUT, "--mode", "shadow",
+            "--mode-option", "orphan=head"]
+    assert main(argv) == 0
+    _, config, _ = cli_run_stream.call_args.args
+    assert config.mode_options_dict()["orphan"] == "head"
 
 
 @pytest.mark.parametrize(

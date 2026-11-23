@@ -89,8 +89,42 @@ its cover stops growing while the subject may keep moving, so it no longer
 proves the subject is covered: it is still drawn, but it is not trusted.
 """
 
+HEAD_SHARE = Fraction(1, 2)
+"""The head rect of a person box reaches this top share of the box height, rounded up.
+
+Measured on both demo clips: for the boxes :func:`head_rect` accepts, the
+padded face cover of the face that cleared the box reached at most 0.44 of the
+box height (729 of 729 and 79 of 79 inside the head rect).
+"""
+
+HEAD_MIN_HEIGHT_PX = 150
+"""Smallest person box height, in pixels, that :func:`head_rect` accepts.
+
+On smaller boxes the head sits lower in the box (the segmenter head band
+reached 0.66 of the box height under 150 px on camera2.mp4), so they keep the
+whole-box fill.
+"""
+
+HEAD_MIN_ASPECT = Fraction(7, 5)
+"""Smallest height over width of a person box that :func:`head_rect` accepts.
+
+A wider box is more likely a seated or bending person, a person cut at the chest
+by the frame edge, or two people side by side, whose head need not lie in the
+top half.
+"""
+
 Primary = Literal["face", "mask", "bodybox"]
 PRIMARIES: frozenset[str] = frozenset({"face", "mask", "bodybox"})
+
+OrphanReason = Literal["face", "box", "head"]
+"""Why a person box is an orphan, as :func:`orphan_reasons` reports it.
+
+- ``"face"``: face primary, no face cleared the box.
+- ``"box"``: mask primary, the box's own area holds less than
+  :data:`ORPHAN_MASK_SHARE` mask pixels (the segmenter missed the person).
+- ``"head"``: mask primary, the box share is met but its head zone holds less
+  than :data:`ORPHAN_HEAD_MASK_SHARE`.
+"""
 
 
 @dataclass(frozen=True)
@@ -320,6 +354,55 @@ def pad_person(box: Box, h: int, w: int, *, grow: float | Fraction = 1) -> Rect 
     return _outward(*edges, frame_h, frame_w)
 
 
+def head_rect(box: Box, h: int, w: int) -> Rect | None:
+    """Return the head rect of a person box in an ``h`` by ``w`` frame, or None.
+
+    The rect has the left, right and top edges of :func:`pad_person` (ungrown)
+    and its bottom edge at ``y + ceil(h_box * HEAD_SHARE)``: the top half of the
+    box, rounded up to whole rows, then clipped to the frame.
+    Full padded width, because a face can sit anywhere across a box that touches
+    a frame edge or holds two people.
+
+    It applies only to a box that is fresh (``held`` 0), at least
+    :data:`HEAD_MIN_HEIGHT_PX` tall, and at least :data:`HEAD_MIN_ASPECT` times as
+    tall as wide (compared in integers, so 7/5 is exact). A held box no longer
+    proves where the person is, so it keeps its grown whole-box cover.
+
+    Returns None when the box is not eligible, has zero area, or when nothing of
+    the head rect lies in the frame; the caller then fills the whole padded box,
+    which covers more. Raises ValueError for a non-integral coordinate, a
+    negative box size or frame size, or a ``held`` that is not a non-negative
+    integer.
+    """
+    _, _, bw, bh = _box(box)
+    frame_h, frame_w = _count(h, "h"), _count(w, "w")
+    held = held_count(box)
+    if held != 0 or bh < HEAD_MIN_HEIGHT_PX:
+        return None
+    if bh * HEAD_MIN_ASPECT.denominator < bw * HEAD_MIN_ASPECT.numerator:
+        return None
+    return _top_share(box, frame_h, frame_w)
+
+
+def _top_share(box: Box, h: int, w: int) -> Rect | None:
+    """Return the rect of :func:`head_rect` without its eligibility test.
+
+    Kept apart so that the measurement tool ``tools/head_sheet.py`` can show what
+    the rect would hold on the boxes the rule refuses, with this same geometry.
+    """
+    _, y, _, bh = _box(box)
+    padded = pad_person(box, h, w)
+    if padded is None:
+        return None
+    n, d = HEAD_SHARE.numerator, HEAD_SHARE.denominator
+    # Rounded up, so the rect holds at least the top share of the box; then
+    # clipped, as every edge in this module is clipped only after rounding.
+    bottom = min(max(y + -(-bh * n // d), 0), h)
+    if bottom <= padded.y0:
+        return None
+    return Rect(padded.x0, padded.y0, padded.x1, bottom)
+
+
 def dilate_px(h: int, dilate: float) -> int:
     """Return the silhouette dilation radius in pixels, ``ceil(dilate * h)``.
 
@@ -425,13 +508,20 @@ def _below_share(mask: np.ndarray, x: int, y: int, bw: int, bh: int, share: Frac
     return count * share.denominator < share.numerator * bw * bh
 
 
-def _mask_orphan(mask: np.ndarray, box: Box) -> bool:
+def _mask_orphan(mask: np.ndarray, box: Box) -> OrphanReason | None:
+    """Return which mask share ``box`` fails, ``"box"`` first, or None when it meets both.
+
+    The whole-box share is tested first, so a box failing both is reported as
+    ``"box"``: the segmenter missed that person and the whole box must be filled.
+    """
     x, y, bw, bh = _box(box)
+    if _below_share(mask, x, y, bw, bh, ORPHAN_MASK_SHARE):
+        return "box"
     n, d = HEAD_ZONE.numerator, HEAD_ZONE.denominator
     head_rows = -(-bh * n // d)  # rounded up, so the zone holds at least the top share
-    return _below_share(mask, x, y, bw, bh, ORPHAN_MASK_SHARE) or _below_share(
-        mask, x, y, bw, head_rows, ORPHAN_HEAD_MASK_SHARE
-    )
+    if _below_share(mask, x, y, bw, head_rows, ORPHAN_HEAD_MASK_SHARE):
+        return "head"
+    return None
 
 
 def orphan_indices(
@@ -475,6 +565,26 @@ def orphan_indices(
     size. Raises ValueError for an unknown ``primary``, a mask whose shape is not
     ``(h, w)``, or a malformed box.
     """
+    return tuple(i for i, _ in orphan_reasons(persons, faces, mask, primary, h, w))
+
+
+def orphan_reasons(
+    persons: Sequence[Box] | None,
+    faces: Sequence[Face] | None,
+    mask: np.ndarray | None,
+    primary: Primary,
+    h: int,
+    w: int,
+) -> tuple[tuple[int, OrphanReason], ...]:
+    """Return ``(index, reason)`` for each orphan :func:`orphan_indices` names, in its order.
+
+    The indices are exactly those of :func:`orphan_indices`. The reason (see
+    :data:`OrphanReason`) is ``"face"`` for every face-primary orphan; for a
+    mask-primary orphan it is ``"box"`` when the whole-box share fails (whether
+    or not the head-zone share also fails) and ``"head"`` when only the head-zone
+    share fails. A None mask fails the whole-box share. Raises ValueError like
+    :func:`orphan_indices`.
+    """
     if primary not in PRIMARIES:
         raise ValueError(f"primary must be one of {sorted(PRIMARIES)}, got {primary!r}")
     frame_h, frame_w = _count(h, "h"), _count(w, "w")
@@ -496,12 +606,17 @@ def orphan_indices(
                     best = (i, box)
             if best is not None:
                 cleared.add(best[0])
-        return tuple(i for i, _ in boxes if i not in cleared)
+        return tuple((i, "face") for i, _ in boxes if i not in cleared)
     if mask is not None and mask.shape != (frame_h, frame_w):
         raise ValueError(
             f"mask shape {mask.shape} does not match the frame {(frame_h, frame_w)}"
         )
-    return tuple(i for i, box in boxes if mask is None or _mask_orphan(mask, box))
+    out: list[tuple[int, OrphanReason]] = []
+    for i, box in boxes:
+        reason: OrphanReason | None = "box" if mask is None else _mask_orphan(mask, box)
+        if reason is not None:
+            out.append((i, reason))
+    return tuple(out)
 
 
 def orphan_persons(

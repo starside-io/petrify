@@ -48,6 +48,7 @@ from petrify_shadow.options import (
     BODY_STYLES,
     FACE_STYLES,
     MASK_STYLES,
+    ORPHAN_CHOICES,
     STYLE_NAMES,
     ShadowParams,
 )
@@ -57,9 +58,10 @@ from petrify_shadow.regions import (
     Primary,
     Rect,
     dilate_px,
+    head_rect,
     held_count,
     held_growth,
-    orphan_indices,
+    orphan_reasons,
     pad_face,
     pad_person,
     prepare_mask,
@@ -164,8 +166,9 @@ class Plan:
     - ``mask``: the cropped and dilated mask when a mask style is selected and
       the mask has a True pixel, else None;
     - ``person_rects``: the padded person boxes when bodybox is selected;
-    - ``orphans``: padded person boxes the primary group does not cover, filled
-      black.
+    - ``orphans``: the rects filled black for the person boxes the primary
+      group does not cover: each padded person box, or with ``orphan`` ``"head"``
+      its head rect where :func:`plan` takes one.
     """
 
     action: Action
@@ -195,6 +198,17 @@ def _checked_styles(styles: object) -> frozenset[str]:
     if styles == {"outline"}:
         raise ValueError("the outline style does not hide anyone on its own")
     return styles
+
+
+def _checked_orphan(orphan: object) -> str:
+    """Return ``orphan`` if it is one of :data:`ORPHAN_CHOICES`, or raise ValueError.
+
+    Checked here too so that a hand-built :class:`ShadowParams` with a misspelled
+    value fails the frame closed instead of silently drawing one of the two fills.
+    """
+    if type(orphan) is not str or orphan not in ORPHAN_CHOICES:
+        raise ValueError(f"orphan must be one of {list(ORPHAN_CHOICES)}, got {orphan!r}")
+    return orphan
 
 
 def _frame_size(shape: Sequence[int]) -> tuple[int, int]:
@@ -238,6 +252,11 @@ def plan(
        with a held count of 0 may clear a person box: a held face no longer
        proves where the head is, so its person box is filled as an orphan while
        the held face still gets its own grown cover.
+       Each orphan is filled on its padded person box, grown by its held count.
+       With ``orphan`` ``"head"`` it is filled only on its
+       :func:`~petrify_shadow.regions.head_rect` when the box has one and the
+       reason is not a failed whole-box mask share; the rest of the box is
+       then left to the other styles, which covers less.
     4. A held box is trusted while its count is below
        :data:`~petrify_shadow.regions.HELD_REGION_FRAMES`, the count at which its
        growth reaches the cap. From then on it is drawn but is not a region.
@@ -263,11 +282,13 @@ def plan(
     unless a person box makes that person an orphan. The mask share minimum only
     stops a few stray pixels from doing this; it does not solve it.
 
-    Raises ValueError for a style set the mode cannot draw, a box whose ``held``
+    Raises ValueError for a style set the mode cannot draw, an ``orphan`` value
+    other than ``"box"`` or ``"head"``, a box whose ``held``
     is not a non-negative integer, a mask whose shape is not the frame's, or a
     malformed box.
     """
     styles = _checked_styles(params.styles)
+    orphan = _checked_orphan(params.orphan)
     h, w = _frame_size(shape)
     faces = detections.faces or ()
     persons = detections.persons
@@ -303,8 +324,16 @@ def plan(
     trusted_orphan = False
     if persons is not None:
         fresh = [face for face, count in zip(faces, face_counts, strict=True) if count == 0]
-        for i in orphan_indices(persons, fresh, mask, primary, h, w):
-            rect = pad_person(persons[i], h, w, grow=held_growth(person_counts[i]))
+        for i, reason in orphan_reasons(persons, fresh, mask, primary, h, w):
+            rect = None
+            # A box failing the whole-box mask share is a person the segmenter
+            # missed: nothing else covers its body, so it keeps the whole-box fill.
+            if orphan == "head" and reason != "box":
+                rect = head_rect(persons[i], h, w)
+            if rect is None:
+                rect = pad_person(persons[i], h, w, grow=held_growth(person_counts[i]))
+            # A head rect exists only where the padded box does, so an orphan
+            # counts as a region exactly as it does with orphan=box.
             if rect is not None:
                 orphans.append(rect)
                 trusted_orphan = trusted_orphan or _trusted(person_counts[i])

@@ -27,6 +27,9 @@ import numpy as np
 import pytest
 from petrify_shadow.regions import (
     FACE_ZONE,
+    HEAD_MIN_ASPECT,
+    HEAD_MIN_HEIGHT_PX,
+    HEAD_SHARE,
     HEAD_ZONE,
     HELD_GROWTH_CAP,
     HELD_GROWTH_PER_FRAME,
@@ -38,10 +41,12 @@ from petrify_shadow.regions import (
     PreparedMask,
     Rect,
     dilate_px,
+    head_rect,
     held_count,
     held_growth,
     orphan_indices,
     orphan_persons,
+    orphan_reasons,
     pad_face,
     pad_person,
     prepare_mask,
@@ -931,3 +936,196 @@ def test_held_count_reads_the_box() -> None:
     for bad in (-1, True, np.bool_(True), 1.0, None):
         with pytest.raises(ValueError, match="held"):
             held_count(Box(0, 0, 5, 5, held=bad))  # type: ignore[arg-type]
+
+
+# --- head_rect --------------------------------------------------------------
+
+
+def test_head_constants() -> None:
+    assert HEAD_SHARE == Fraction(1, 2)
+    assert HEAD_MIN_HEIGHT_PX == 150
+    assert HEAD_MIN_ASPECT == Fraction(7, 5)
+
+
+@pytest.mark.parametrize(
+    ("box", "expected"),
+    [
+        # Pad 5 px per side and 15 px on top; bottom at y + 150.
+        (Box(100, 200, 100, 300), Rect(95, 185, 205, 350)),
+        # Side pad 2 px (the floor), top pad 7.55 px rounded out to 8 (y0 12);
+        # bottom 20 + ceil(75.5) = 96.
+        (Box(10, 20, 40, 151), Rect(8, 12, 52, 96)),
+        # Odd heights round the bottom edge down the frame, never up it.
+        (Box(0, 100, 100, 151), Rect(0, 92, 105, 176)),
+        (Box(0, 101, 100, 153), Rect(0, 93, 105, 178)),
+    ],
+)
+def test_head_rect_literal(box: Box, expected: Rect) -> None:
+    assert head_rect(box, H, W) == expected
+
+
+@pytest.mark.parametrize(
+    ("box", "expected"),
+    [
+        (Box(-10, -20, 100, 300), Rect(0, 0, 95, 130)),  # left and top edges
+        (Box(1850, 100, 100, 300), Rect(1845, 85, 1920, 250)),  # right edge
+        (Box(500, 1000, 100, 300), Rect(495, 985, 605, 1080)),  # bottom edge
+        (Box(1850, 1000, 100, 300), Rect(1845, 985, 1920, 1080)),  # bottom right corner
+    ],
+)
+def test_head_rect_clips_at_each_edge_after_rounding(box: Box, expected: Rect) -> None:
+    assert head_rect(box, H, W) == expected
+
+
+def test_head_rect_zero_area_and_off_frame() -> None:
+    assert head_rect(Box(100, 100, 0, 300), H, W) is None
+    assert head_rect(Box(100, 100, 100, 0), H, W) is None
+    assert head_rect(Box(W + 10, 100, 100, 300), H, W) is None
+    assert head_rect(Box(100, H + 20, 100, 300), H, W) is None
+    # Below the frame, but the 15 px top padding reaches back into it: that strip
+    # is covered, as pad_person covers it.
+    assert head_rect(Box(100, H + 10, 100, 300), H, W) == Rect(95, H - 5, 205, H)
+    assert pad_person(Box(100, H + 10, 100, 300), H, W) == Rect(95, H - 5, 205, H)
+    assert head_rect(Box(-300, 100, 100, 300), H, W) is None
+    # The padded box reaches into the frame, but its top half lies above it.
+    box = Box(100, -400, 100, 500)
+    assert pad_person(box, H, W) == Rect(95, 0, 205, 125)
+    assert head_rect(box, H, W) is None
+
+
+@pytest.mark.parametrize(
+    ("box", "eligible"),
+    [
+        (Box(500, 100, 100, 150), True),
+        (Box(500, 100, 100, 149), False),
+        (Box(500, 100, 150, 210), True),  # height / width exactly 7/5
+        (Box(500, 100, 151, 210), False),  # just below 7/5
+        (Box(500, 100, 100, 300, held=0), True),
+        (Box(500, 100, 100, 300, held=1), False),
+        (Box(500, 100, 100, 300, held=HELD_REGION_FRAMES), False),
+    ],
+)
+def test_head_rect_eligibility_boundaries(box: Box, eligible: bool) -> None:
+    rect = head_rect(box, H, W)
+    assert (rect is not None) == eligible
+    if eligible:
+        padded = pad_person(box, H, W)
+        assert padded is not None and rect is not None
+        assert (rect.x0, rect.y0, rect.x1) == (padded.x0, padded.y0, padded.x1)
+        assert rect.y1 == box.y + -(-box.h // 2)
+
+
+@pytest.mark.parametrize(
+    "box",
+    [
+        Box(1.0, 0, 100, 300),  # type: ignore[arg-type]
+        Box(0, 0.5, 100, 300),  # type: ignore[arg-type]
+        Box(0, 0, 100.0, 300),  # type: ignore[arg-type]
+        Box(0, 0, 100, 300.0),  # type: ignore[arg-type]
+        Box(0, 0, True, 300),  # type: ignore[arg-type]
+        Box(0, 0, -100, 300),
+        Box(0, 0, 100, -300),
+        Box(0, 0, 100, 300, held=-1),
+        Box(0, 0, 100, 300, held=1.0),  # type: ignore[arg-type]
+        Box(0, 0, 100, 300, held=True),  # type: ignore[arg-type]
+    ],
+)
+def test_head_rect_rejects_malformed_boxes(box: Box) -> None:
+    with pytest.raises(ValueError):
+        head_rect(box, H, W)
+
+
+def test_head_rect_rejects_malformed_frames_even_for_ineligible_boxes() -> None:
+    for h, w in ((-1, W), (H, -1), (float(H), W), (H, None)):
+        for box in (Box(0, 0, 100, 300), Box(0, 0, 100, 10)):
+            with pytest.raises(ValueError):
+                head_rect(box, h, w)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        head_rect(Box(0, 0, 100, 10, held=-1), H, W)
+
+
+def test_head_rect_property() -> None:
+    """Inside the padded person rect, and holding the in-frame top half of the box."""
+    rng = random.Random(20261123)
+    accepted = 0
+    for _ in range(4000):
+        h, w = rng.randint(1, 700), rng.randint(1, 700)
+        bh = rng.randint(0, 900)
+        bw = rng.randint(0, 700)
+        box = Box(rng.randint(-400, w + 50), rng.randint(-600, h + 50), bw, bh,
+                  held=rng.choice((0, 0, 0, 1)))
+        rect = head_rect(box, h, w)
+        eligible = box.held == 0 and bh >= 150 and bh * 5 >= bw * 7
+        # The top half of the box, rows y to y + h_box / 2, intersected with the frame.
+        tx0, ty0 = min(max(box.x, 0), w), min(max(box.y, 0), h)
+        tx1 = min(max(box.x + bw, 0), w)
+        ty1 = min(max(box.y + -(-bh // 2), 0), h)
+        top_visible = bw > 0 and bh > 0 and tx1 > tx0 and ty1 > ty0
+        if not eligible:
+            assert rect is None, box
+            continue
+        if rect is None:
+            # Only when nothing of the top half is in the frame.
+            assert not top_visible, (box, h, w)
+            continue
+        accepted += 1
+        padded = pad_person(box, h, w)
+        assert padded is not None
+        assert _in_frame(rect, h, w)
+        assert _contains(padded, rect.x0, rect.y0, rect.x1, rect.y1), (box, rect, padded)
+        assert _contains(rect, tx0, ty0, tx1, ty1), (box, rect)
+    assert accepted > 500
+
+
+# --- orphan_reasons ---------------------------------------------------------
+
+
+def test_orphan_reasons_face_primary() -> None:
+    persons = (Box(100, 100, 200, 400), Box(500, 100, 200, 400))
+    faces = (_face(150, 120, 40, 50),)
+    assert orphan_reasons(persons, faces, None, "face", H, W) == ((1, "face"),)
+    assert orphan_reasons(persons, (), None, "face", H, W) == ((0, "face"), (1, "face"))
+    assert orphan_reasons(persons, (), None, "bodybox", H, W) == ()
+    assert orphan_reasons(None, (), None, "face", H, W) == ()
+
+
+def test_orphan_reasons_mask_primary_names_the_failed_share() -> None:
+    body_only = Box(0, 0, 10, 20)  # head zone rows 0 to 5
+    missed = Box(20, 0, 10, 20)
+    covered = Box(40, 0, 10, 20)
+    head_only = Box(60, 0, 10, 20)
+    mask = np.zeros((100, 100), bool)
+    mask[5:20, 0:10] = True  # the body, 75 percent of the box, nothing in the head zone
+    mask[0:20, 40:50] = True
+    mask[0:5, 60:70] = True  # the head zone only, 25 percent of the box
+    persons = (body_only, missed, covered, head_only)
+    assert orphan_reasons(persons, None, mask, "mask", 100, 100) == (
+        (0, "head"), (1, "box"), (3, "box"),
+    )
+    # A box failing both shares is reported as a whole-box failure.
+    assert orphan_reasons((missed,), None, mask, "mask", 100, 100) == ((0, "box"),)
+    assert orphan_reasons(persons, None, None, "mask", 100, 100) == tuple(
+        (i, "box") for i in range(4)
+    )
+
+
+def test_orphan_reasons_name_exactly_the_orphan_indices_property() -> None:
+    rng = np.random.default_rng(11)
+    for _ in range(300):
+        mask = rng.random((60, 80)) < rng.random()
+        persons = tuple(
+            Box(int(rng.integers(-10, 80)), int(rng.integers(-10, 60)),
+                int(rng.integers(0, 40)), int(rng.integers(0, 50)))
+            for _ in range(int(rng.integers(0, 5)))
+        )
+        faces = tuple(
+            _face(int(rng.integers(0, 80)), int(rng.integers(0, 60)), 6, 6)
+            for _ in range(int(rng.integers(0, 3)))
+        )
+        for primary in ("face", "mask", "bodybox"):
+            for m in (mask, None):
+                reasons = orphan_reasons(persons, faces, m, primary, 60, 80)  # type: ignore[arg-type]
+                indices = orphan_indices(persons, faces, m, primary, 60, 80)  # type: ignore[arg-type]
+                assert tuple(i for i, _ in reasons) == indices
+                expected = {"face": {"face"}, "mask": {"box", "head"}, "bodybox": set()}
+                assert {r for _, r in reasons} <= expected[primary]

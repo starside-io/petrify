@@ -29,10 +29,12 @@ from petrify_shadow.mode import ShadowMode, mandatory_for, requires_for
 from petrify_shadow.options import (
     BODY_STYLES,
     DEFAULT_DILATE,
+    DEFAULT_ORPHAN,
     DEFAULT_PADDING,
     FACE_STYLES,
     MASK_STYLES,
     OPTIONS,
+    ORPHAN_CHOICES,
     STYLE_NAMES,
     parse_params,
 )
@@ -76,6 +78,20 @@ WEAK_SEGMENT_MISS = (
     "The body of a person the segmenter misses is shown when another person is "
     "segmented on the same frame, unless the person detector finds that person; add "
     "bodybox to cover every person box."
+)
+
+WEAK_ORPHAN_HEAD = (
+    "orphan is head: a person box whose face is not found is covered only on its top "
+    "half; the body, and a head outside the top half as when bending, sitting low or "
+    "two people in one box, are shown."
+)
+# The mask-primary form: there the orphan rule catches a person box whose head zone
+# the segmenter misses, and the body stays covered where the mask marks it.
+WEAK_ORPHAN_HEAD_MASK = (
+    "orphan is head: a person box whose head the segmenter does not mark is covered "
+    "only on its top half; a head outside the top half, as when bending, sitting low "
+    "or two people in one box, is shown, and so is any part of the body the segmenter "
+    "misses."
 )
 
 WARN_MASK_WITHOUT_PERSONS = (
@@ -149,6 +165,9 @@ class ShadowFactory:
         # body cover and only the orphan rule catches a person the segmenter misses.
         if silhouette and "bodybox" not in styles:
             sentences.append(WEAK_SEGMENT_MISS)
+        # bodybox covers every person box, so it leaves no orphan to fill.
+        if _read_orphan(options) == "head" and "bodybox" not in styles:
+            sentences.append(WEAK_ORPHAN_HEAD_MASK if has_body else WEAK_ORPHAN_HEAD)
         return tuple(sentences)
 
     def create(self, ctx: ModeContext, previous: Mode | None = None) -> Mode:
@@ -226,6 +245,14 @@ def _read_strength(options: object) -> str:
     if type(value) is str and value in ("high", "medium", "low"):
         return value
     return "high"
+
+
+def _read_orphan(options: object) -> str:
+    """Return ``options["orphan"]`` when it is a known value, else the default ``"box"``."""
+    value = _get(options, "orphan")
+    if type(value) is str and value in ORPHAN_CHOICES:
+        return value
+    return DEFAULT_ORPHAN
 
 
 SHADOW = ShadowFactory()
