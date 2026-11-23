@@ -8,8 +8,9 @@
  * "patch_response": {"status": 422, "body": {...}}, "actions": [...]}. Each
  * action is {"input": N, "value": "7"} or {"input": N, "checked": true}, where N
  * indexes the mode option inputs in page order; the matching input or change
- * event is fired, then every pending timer runs (the debounce), then the
- * report is printed.
+ * event is fired, then every pending timer runs (the debounce). Then, for each
+ * entry of the optional "later_states" list, that state becomes the /api/state
+ * payload and the page's polling interval runs once. Then the report is printed.
  *
  * The stub records every element id set by the script, every attribute name
  * passed to setAttribute, every href and dataset key written, and every
@@ -109,6 +110,8 @@ const document = {
 };
 
 const timers = [];
+const intervals = [];
+let currentState = scenario.state;
 const sent = [];
 const location = {
   hash: "#token=harness-token-0123456789",
@@ -121,7 +124,7 @@ const window = {
   history: { replaceState() {} },
   setTimeout(fn) { timers.push(fn); return timers.length; },
   clearTimeout() {},
-  setInterval() { return 1; },
+  setInterval(fn) { intervals.push(fn); return intervals.length; },
   clearInterval() {},
   confirm() { return false; },
   open(url) { record.opened.push(String(url)); }
@@ -141,7 +144,7 @@ function fetch(url, options) {
     const reply = scenario.patch_response || { status: 200, body: {} };
     return respond(reply.status, reply.body);
   }
-  return respond(200, scenario.state);
+  return respond(200, currentState);
 }
 
 const context = vm.createContext({
@@ -182,6 +185,13 @@ function describe(el) {
   for (let i = 0; i < 5; i += 1) {
     await flush();
   }
+  for (const state of scenario.later_states || []) {
+    currentState = state;
+    intervals.forEach((fn) => fn());
+    for (let i = 0; i < 5; i += 1) {
+      await flush();
+    }
+  }
   const hidden = {};
   const text = {};
   const disabled = {};
@@ -196,6 +206,7 @@ function describe(el) {
     disabled: disabled,
     weakened: staticById["weakened-list"].children.map((li) => li.textContent),
     modeList: staticById["mode-list"].children.map(describe),
+    detectorTimes: staticById["st-detectors"].children.map(describe),
     inputs: inputs().map((el) => ({
       tag: el.tagName, type: el.type, id: el.id, disabled: el.disabled, checked: el.checked,
       value: el.value, min: el.min, max: el.max, step: el.step

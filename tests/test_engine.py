@@ -2818,3 +2818,244 @@ def test_duplicate_refiner_rejected() -> None:
     _stream(engine, range(2))
     engine.close()
     assert [i for i, _ in refiner.calls] == [0, 1]
+
+
+# ---------------------------------------------------------------------------
+# Per-detector and per-refiner timings (Phase 6 T5)
+# ---------------------------------------------------------------------------
+
+
+class CostDetector(FakeDetector):
+    """A :class:`FakeDetector` that advances ``clock`` by ``costs[index]`` before it answers.
+
+    The cost is added before a raise too, so a failing call has a known duration.
+    """
+
+    def __init__(
+        self,
+        clock: FakeClock,
+        costs: dict[int, float],
+        *,
+        kind: DetectionKind = M,
+        hits: Sequence[int] = (),
+        stateful: bool = False,
+        fail: Sequence[int] = (),
+    ) -> None:
+        super().__init__(hits, stateful=stateful, fail=fail, kind=kind)
+        self.clock = clock
+        self.costs = costs
+
+    def detect(self, frame: Frame) -> Detections:
+        self.clock.now += self.costs.get(frame.index, 0.0)
+        return super().detect(frame)
+
+
+class CostRefiner(FakeRefiner):
+    """A refiner that advances ``clock`` by ``costs[index]``; ``kind`` is set only when given."""
+
+    def __init__(
+        self,
+        clock: FakeClock,
+        costs: dict[int, float],
+        provides: Iterable[DetectionKind],
+        *,
+        kind: DetectionKind | None = None,
+        fail: Sequence[int] = (),
+    ) -> None:
+        super().__init__({M}, provides)
+        self.clock = clock
+        self.costs = costs
+        self.fail = set(fail)
+        if kind is not None:
+            self.kind = kind
+
+    def refine(self, frame: Frame, detections: Detections) -> Detections:
+        self.clock.now += self.costs.get(frame.index, 0.0)
+        if frame.index in self.fail:
+            raise RuntimeError(f"refiner broke on {frame.index}")
+        return super().refine(frame, detections)
+
+
+class CostRegionMode(RegionMode):
+    """A :class:`RegionMode` under "all" that advances ``clock`` by ``costs[index]`` to render."""
+
+    def __init__(self, clock: FakeClock, costs: dict[int, float]) -> None:
+        super().__init__({M, BD, P}, "all")
+        self.clock = clock
+        self.costs = costs
+
+    def render(self, frame: Frame, detections: Detections, subject_present: bool) -> np.ndarray:
+        self.clock.now += self.costs.get(frame.index, 0.0)
+        return super().render(frame, detections, subject_present)
+
+
+def _component_ms(engine: Engine) -> list[tuple[str, float | None, float | None]]:
+    return [(name, t.mean_ms, t.last_ms) for name, t in engine.timings.detectors]
+
+
+def test_component_timings_follow_the_clock_in_run_order_with_refiners_labelled() -> None:
+    clock = FakeClock()
+    detector = CostDetector(clock, {0: 0.004, 1: 0.006})
+    persons = CostRefiner(clock, {0: 0.001, 1: 0.003}, {P}, kind=P)
+    faces = CostRefiner(clock, {0: 0.002, 1: 0.002}, {FACES}, kind=FACES)
+    engine = Engine(
+        [detector],
+        RegionMode({M, P, FACES}, "all"),
+        [],
+        [FakeSink()],
+        EngineConfig(lookahead=0, cold_start_frames=0),
+        clock=clock,
+        refiners=[persons, faces],
+    )
+    names = ["CostDetector (motion)", "CostRefiner (persons)", "CostRefiner (faces)"]
+    assert _component_ms(engine) == [(name, None, None) for name in names]
+
+    engine.open(INFO)
+    engine.step(_frame(0))
+    assert _component_ms(engine) == [
+        (names[0], pytest.approx(4.0), pytest.approx(4.0)),
+        (names[1], pytest.approx(1.0), pytest.approx(1.0)),
+        (names[2], pytest.approx(2.0), pytest.approx(2.0)),
+    ]
+    engine.step(_frame(1))
+    assert _component_ms(engine) == [
+        (names[0], pytest.approx(4.0 + 0.1 * (6.0 - 4.0)), pytest.approx(6.0)),
+        (names[1], pytest.approx(1.0 + 0.1 * (3.0 - 1.0)), pytest.approx(3.0)),
+        (names[2], pytest.approx(2.0), pytest.approx(2.0)),
+    ]
+    # Validation and merging cost nothing on this clock, so the parts add up to the whole.
+    assert engine.timings.detect.last_ms == pytest.approx(6.0 + 3.0 + 2.0)
+    engine.close()
+    engine.open(INFO)  # A new run starts with empty statistics under the same names.
+    assert _component_ms(engine) == [(name, None, None) for name in names]
+    engine.close()
+
+
+def test_component_timings_skip_detectors_that_first_hit_skips() -> None:
+    clock = FakeClock()
+    motion = CostDetector(clock, {0: 0.001, 1: 0.001, 2: 0.001}, hits=[1])
+    skipped = CostDetector(clock, {0: 0.005, 1: 0.007, 2: 0.009}, kind=BD)
+    stateful = CostDetector(clock, {0: 0.002, 1: 0.004, 2: 0.002}, kind=BD, stateful=True)
+    engine = Engine(
+        [motion, skipped, stateful],
+        FakeMode(),  # The "first_hit" policy by default.
+        [],
+        [FakeSink()],
+        EngineConfig(lookahead=0, cold_start_frames=0),
+        clock=clock,
+    )
+    engine.open(INFO)
+    engine.step(_frame(0))
+    engine.step(_frame(1))  # Motion found: the stateless detector is skipped.
+    assert skipped.seen == [0]
+    timings = _component_ms(engine)
+    assert timings[1] == ("CostDetector (background_diff)", pytest.approx(5.0), pytest.approx(5.0))
+    assert timings[2][2] == pytest.approx(4.0)  # A stateful detector always runs.
+    engine.step(_frame(2))
+    timings = _component_ms(engine)
+    assert timings[1][1:] == (pytest.approx(5.0 + 0.1 * (9.0 - 5.0)), pytest.approx(9.0))
+    engine.close()
+
+
+def test_component_timings_of_a_raising_detector_or_refiner_run_up_to_the_raise() -> None:
+    clock = FakeClock()
+    failing = CostDetector(clock, {0: 0.003, 1: 0.007, 2: 0.003}, fail=[1])
+    stateless = CostDetector(clock, {0: 0.002, 1: 0.002, 2: 0.002}, kind=BD)
+    stateful = CostDetector(clock, {0: 0.001, 1: 0.005, 2: 0.001}, kind=BD, stateful=True)
+    refiner = CostRefiner(clock, {0: 0.004, 1: 0.004, 2: 0.009}, {P}, fail=[2])
+    traces: list[FrameTrace] = []
+    engine = Engine(
+        [failing, stateless, stateful],
+        RegionMode({M, BD, P}, "all"),
+        [],
+        [FakeSink()],
+        EngineConfig(lookahead=0, cold_start_frames=0),
+        traces.append,
+        clock,
+        refiners=[refiner],
+    )
+    engine.open(INFO)
+    engine.step(_frame(0))
+    engine.step(_frame(1))  # The first detector raises after 7 ms.
+    timings = _component_ms(engine)
+    assert timings[0][2] == pytest.approx(7.0)
+    assert timings[1][2] == pytest.approx(2.0) and stateless.seen == [0]  # Skipped.
+    assert timings[2][2] == pytest.approx(5.0)  # Still sees the frame, so it is sampled.
+    assert timings[3] == ("CostRefiner", pytest.approx(4.0), pytest.approx(4.0))  # Did not run.
+    engine.step(_frame(2))  # The refiner raises after 9 ms.
+    assert _component_ms(engine)[3][2] == pytest.approx(9.0)
+    engine.close()
+    assert [t.failed_closed for t in traces] == [False, True, True]
+
+
+def test_reconfigure_rekeys_component_timings() -> None:
+    clock = FakeClock()
+    kept = CostDetector(clock, {0: 0.002, 1: 0.002})
+    removed = CostDetector(clock, {0: 0.003, 1: 0.003}, kind=BD, stateful=True)
+    added = CostDetector(clock, {}, kind=BD)
+    engine = Engine(
+        [kept, removed],
+        FakeMode(),
+        [],
+        [FakeSink()],
+        EngineConfig(lookahead=0, cold_start_frames=0),
+        clock=clock,
+    )
+    engine.open(INFO)
+    _stream(engine, range(2))
+    engine.reconfigure(detectors=[kept, added])
+    assert _component_ms(engine) == [
+        ("CostDetector (motion)", pytest.approx(2.0), pytest.approx(2.0)),
+        ("CostDetector (background_diff)", None, None),  # The new one, not the removed one.
+    ]
+    refiner = CostRefiner(clock, {2: 0.001}, {P}, kind=P)
+    engine.reconfigure(mode=RegionMode({M, P}, "all"), refiners=[refiner])
+    # The mode needs no background difference: that detector is no longer listed.
+    assert [name for name, _, _ in _component_ms(engine)] == [
+        "CostDetector (motion)", "CostRefiner (persons)",
+    ]
+    engine.step(_frame(2))
+    assert _component_ms(engine)[1][2] == pytest.approx(1.0)
+    engine.close()
+
+
+def test_component_timings_leave_budget_outcomes_unchanged() -> None:
+    # Dyadic costs and budget keep the sums exact, so frame 1 lands exactly on the
+    # budget. The expected outcome is the rule as it stood before per-component
+    # timings: detection over the budget, or detection plus render over it.
+    budget = 1 / 64
+    detect_a = {0: 1 / 256, 1: 1 / 128, 2: 1 / 128, 3: 1 / 256, 4: 1 / 32}
+    detect_b = {0: 1 / 256, 1: 1 / 256, 2: 1 / 128, 3: 1 / 256, 4: 0.0}
+    refine = {0: 0.0, 1: 1 / 256, 2: 1 / 256, 3: 1 / 256, 4: 0.0}
+    render = {0: 1 / 256, 1: 0.0, 2: 0.0, 3: 1 / 128, 4: 0.0}
+    detect = {i: detect_a[i] + detect_b[i] + refine[i] for i in range(5)}
+    expected = [detect[i] > budget or detect[i] + render[i] > budget for i in range(5)]
+    assert expected == [False, False, True, True, True]
+
+    def run(read_timings: bool) -> tuple[EngineStats, list[FrameTrace]]:
+        clock = FakeClock()
+        traces: list[FrameTrace] = []
+        engine = Engine(
+            [CostDetector(clock, detect_a), CostDetector(clock, detect_b, kind=BD)],
+            CostRegionMode(clock, render),
+            [],
+            [SlowSink(clock, 0.050)],
+            EngineConfig(lookahead=0, cold_start_frames=0, frame_budget_ms=budget * 1000.0),
+            traces.append,
+            clock,
+            refiners=[CostRefiner(clock, refine, {P})],
+        )
+        engine.open(INFO)
+        for i in range(5):
+            engine.step(_frame(i))
+            if read_timings:
+                timing = engine.timings
+                parts = [t.last_ms or 0.0 for _, t in timing.detectors]
+                assert timing.detect.last_ms == pytest.approx(sum(parts))
+        return engine.close(), traces
+
+    with_reads, plain = run(True), run(False)
+    assert with_reads == plain
+    stats, traces = plain
+    assert [t.failed_closed for t in traces] == expected
+    assert stats.over_budget == 3

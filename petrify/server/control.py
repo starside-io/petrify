@@ -703,6 +703,28 @@ class RunTimings:
     write_mean_ms: float | None = None
     write_last_ms: float | None = None
     fps: float | None = None
+    detectors: tuple[tuple[str, float | None, float | None], ...] = ()
+    """``(name, mean_ms, last_ms)`` per detector and refiner, in run order.
+
+    The names come from class names of petrify's own components, but are cleaned
+    like any other text the page shows, so a component class cannot put markup or
+    control characters on the page.
+    """
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "detectors", tuple(
+            (untrusted_text(name, NAME_TEXT_LIMIT), mean, last)
+            for name, mean, last in self.detectors
+        ))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the timings as plain JSON values; ``detectors`` is a list of objects."""
+        data = {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+        data["detectors"] = [
+            {"name": name, "mean_ms": mean, "last_ms": last}
+            for name, mean, last in self.detectors
+        ]
+        return _plain(data)
 
 
 @dataclass(frozen=True)
@@ -788,7 +810,7 @@ class RunSnapshot:
         data = {
             "config": _plain(self.config),
             "stats": dataclasses.asdict(self.stats),
-            "timings": _plain(dataclasses.asdict(self.timings)),
+            "timings": self.timings.to_dict(),
             "source": _plain(dataclasses.asdict(self.source)),
             "background": self.background.to_dict(),
             "roi": None if self.roi is None else list(self.roi),

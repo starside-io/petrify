@@ -22,6 +22,7 @@ from petrify.core import (
 )
 from petrify.core.config import TrackerConfig, mode_options_from
 from petrify.core.detections import DetectionKind
+from petrify.core.engine import EngineStats, StageTiming
 from petrify.core.plugin import OptionSpec
 from petrify.core.registry import ModeEntry, list_modes, load_mode
 from petrify.modes.erase import ERASE
@@ -33,6 +34,7 @@ from petrify.server.control import (
     RunControl,
     RunSnapshot,
     RunStats,
+    RunTimings,
     SourceFacts,
     config_to_dict,
     metadata_text,
@@ -1533,3 +1535,68 @@ def test_a_tracked_kind_is_not_listed_and_a_failing_requires_lists_nothing() -> 
     motion = dataclasses.replace(config, detector="motion")
     weakened = RunControl(motion, SIZE, factory=FakeFactory()).snapshot().weakened
     assert not any("tracker" in sentence for sentence in weakened)  # No requires method.
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 T5: per-detector and per-refiner timings
+# ---------------------------------------------------------------------------
+
+
+def test_run_timings_list_each_component_as_cleaned_plain_data() -> None:
+    timings = RunTimings(detectors=(
+        ("DnnPersonDetector", 40.5, 41.0),
+        ("Tracker (persons)‮<b>\n", float("nan"), None),
+    ))
+    assert timings.detectors[1][0] == untrusted_text("Tracker (persons)‮<b>\n",
+                                                     control_module.NAME_TEXT_LIMIT)
+    data = RunSnapshot(config=config_to_dict(PetrifyConfig()), timings=timings).to_dict()
+    assert data["timings"]["detectors"] == [
+        {"name": "DnnPersonDetector", "mean_ms": 40.5, "last_ms": 41.0},
+        {"name": "Tracker (persons) <b>", "mean_ms": None, "last_ms": None},
+    ]
+    assert json.loads(json.dumps(data, allow_nan=False)) == data
+    assert _control().snapshot().to_dict()["timings"]["detectors"] == []
+
+
+def test_a_running_snapshot_lists_the_engine_components() -> None:
+    config = _live_config("running")
+    control = RunControl(config, (STREAM_W, STREAM_H))
+    seen: dict[str, Any] = {}
+
+    def check() -> None:
+        seen["timings"] = control.snapshot().to_dict()["timings"]
+
+    run_stream(HookSource(QUIET, hooks={20: check}), config, OutputConfig(),
+               sinks=[ListSink()], control=control)
+    entries = seen["timings"]["detectors"]
+    assert entries and all(set(e) == {"name", "mean_ms", "last_ms"} for e in entries)
+    assert all(isinstance(e["name"], str) and e["name"] for e in entries)
+    assert all(isinstance(e["mean_ms"], float) for e in entries)
+
+
+def test_the_end_log_lists_each_component_mean_after_the_summary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="petrify.pipeline"):
+        run_stream(HookSource(QUIET, hooks={}), _live_config("running"), OutputConfig(),
+                   sinks=[ListSink()])
+    messages = [r.getMessage() for r in caplog.records if r.name == "petrify.pipeline"]
+    done = next(i for i, m in enumerate(messages) if m.startswith("Run done: "))
+    line = messages[done + 1]
+    assert line.startswith("Detector and refiner times (mean): ")
+    assert line.endswith(" ms")
+    assert sum(m.startswith("Detector and refiner times") for m in messages) == 1
+
+
+def test_the_end_log_line_format(caplog: pytest.LogCaptureFixture) -> None:
+    import petrify.pipeline as pipeline_module
+
+    times = (("Motion", StageTiming(1.26, 2.0)), ("Tracker (faces)", StageTiming(None, None)))
+    with caplog.at_level(logging.INFO, logger="petrify.pipeline"):
+        pipeline_module._log_summary(EngineStats(frames=3, frozen=3), 0, times)
+        pipeline_module._log_summary(EngineStats(frames=3, frozen=3), 0, ())
+    messages = [r.getMessage() for r in caplog.records if r.name == "petrify.pipeline"]
+    assert messages[0].startswith("Run done: ")
+    assert messages[1] == "Detector and refiner times (mean): Motion 1.3 ms, Tracker (faces) n/a"
+    # Without any component, only the summary line is logged.
+    assert messages[2].startswith("Run done: ") and len(messages) == 3

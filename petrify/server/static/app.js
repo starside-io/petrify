@@ -479,6 +479,36 @@
     showModeList(modes);
   }
 
+  /* One line per detector and refiner, in run order. Lines are reused and only
+     their text changes, so a poll does not rebuild them. A line no longer needed
+     stays as a blank line, so a shorter list after a settings change does not
+     move the rows below it. */
+  function showDetectorTimes(entries) {
+    var ul = $("st-detectors");
+    if (!ul) {
+      return;
+    }
+    var lines = [];
+    if (Array.isArray(entries)) {
+      entries.forEach(function (entry) {
+        if (entry && typeof entry === "object") {
+          lines.push(String(entry.name) + ": " + ms(entry.mean_ms) + " mean, " +
+            ms(entry.last_ms) + " last");
+        }
+      });
+    }
+    if (!lines.length) {
+      lines.push("None");
+    }
+    while (ul.children.length < lines.length) {
+      ul.appendChild(element("li", "timing-line"));
+    }
+    for (var i = 0; i < ul.children.length; i += 1) {
+      /* A no-break space keeps an unused line one line tall and shows nothing. */
+      ul.children[i].textContent = i < lines.length ? lines[i] : "\u00a0";
+    }
+  }
+
   function render(state) {
     var stats = state.stats;
     var timings = state.timings;
@@ -504,6 +534,7 @@
     text("st-fps", timings.fps === null ? "n/a" : timings.fps.toFixed(1) + " fps");
     text("st-timings", ms(timings.detect_mean_ms) + " / " + ms(timings.render_mean_ms) +
       " / " + ms(timings.write_mean_ms) + " (mean)");
+    showDetectorTimes(timings.detectors);
     text("st-roi", state.roi ? state.roi.join(", ") + " (x, y, w, h)" : "none");
     text("st-reconfigurations", String(stats.reconfigurations));
     text("st-error", state.last_error ? "Error: " + state.last_error : "None");

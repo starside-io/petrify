@@ -49,7 +49,7 @@ from petrify.core.config import (
     mode_options_from,
 )
 from petrify.core.detections import DetectionKind
-from petrify.core.engine import Engine, EngineStats, FrameTrace
+from petrify.core.engine import Engine, EngineStats, FrameTrace, StageTiming
 from petrify.core.frame import Frame, SourceInfo
 from petrify.core.plugin import (
     BackgroundModel,
@@ -1940,6 +1940,9 @@ class _Publisher:
                 write_mean_ms=t.write.mean_ms,
                 write_last_ms=t.write.last_ms,
                 fps=t.frames_per_second,
+                detectors=tuple(
+                    (name, timing.mean_ms, timing.last_ms) for name, timing in t.detectors
+                ),
             )
         background = BackgroundState(strategy=config.background.strategy)
         roi = None
@@ -2237,7 +2240,7 @@ def run_stream(
             if publisher is not None:
                 publisher.publish(running=False, stats=final_stats)
 
-    _log_summary(stats, dropped)
+    _log_summary(stats, dropped, engine.timings.detectors)
     return RunReport(
         stats=stats,
         background_index=bg_idx,
@@ -2247,8 +2250,16 @@ def run_stream(
     )
 
 
-def _log_summary(stats: EngineStats, dropped: int) -> None:
-    """Log one summary line, and a warning when frames failed closed."""
+def _log_summary(
+    stats: EngineStats,
+    dropped: int,
+    detectors: Sequence[tuple[str, StageTiming]] = (),
+) -> None:
+    """Log one summary line, the mean time of each detector and refiner, and a
+    warning when frames failed closed.
+
+    The times line is left out when the run had no detector or refiner.
+    """
     logger.info(
         "Run done: frames=%d frozen=%d pass-through=%d failed-closed=%d (over budget %d) "
         "source-dropped=%d sink-failures=%d",
@@ -2260,6 +2271,15 @@ def _log_summary(stats: EngineStats, dropped: int) -> None:
         dropped,
         stats.sink_failures,
     )
+    if detectors:
+        logger.info(
+            "Detector and refiner times (mean): %s",
+            ", ".join(
+                f"{name} "
+                + ("n/a" if timing.mean_ms is None else f"{timing.mean_ms:.1f} ms")
+                for name, timing in detectors
+            ),
+        )
     if stats.failed_closed > 0:
         logger.warning(
             "%d frame(s) failed closed and were written as black frames (%d over budget)",

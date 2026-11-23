@@ -222,12 +222,25 @@ class EngineTimings:
     ``frames_per_second`` is the inverse of the moving average of the interval
     between two emitted frames; None until two frames were emitted, or while that
     average is zero.
+
+    ``detectors`` holds one ``(label, timing)`` pair per active detector and then
+    per active refiner, in run order. The label is the component's class name,
+    followed by ``" (persons)"``, ``" (faces)"`` or another kind's value when the
+    component has a ``kind`` attribute that is a :class:`DetectionKind` (two
+    tracker refiners are told apart by it). Each sample is the duration of one
+    ``detect`` or ``refine`` call on one detected frame; checking and merging the
+    result is counted only in ``detect``. A call that raises is sampled up to the
+    raise. A detector skipped on a frame (a stateless detector under the
+    ``"first_hit"`` policy once a subject was found, or after an earlier
+    failure) and refiners that do not run on a frame are not sampled on it.
+    These samples are taken when a frame is detected, not when it is emitted.
     """
 
     detect: StageTiming
     render: StageTiming
     write: StageTiming
     frames_per_second: float | None
+    detectors: tuple[tuple[str, StageTiming], ...] = ()
 
 
 class _Rolling:
@@ -250,6 +263,10 @@ class _Rolling:
             mean_ms=None if mean is None else mean * 1000.0,
             last_ms=None if last is None else last * 1000.0,
         )
+
+
+# A detector or refiner, its timing label, and its rolling call time.
+_Timed = tuple[object, str, _Rolling]
 
 
 @dataclass(frozen=True)
@@ -318,7 +335,8 @@ class Engine:
 
     Reconfiguration: :meth:`reconfigure` swaps detectors, refiners, mode, stages, or
     config between two :meth:`step` calls, that is at a frame boundary. :attr:`timings`
-    reports rolling detect, render and write times and the output frame rate.
+    reports rolling detect, render and write times, the time of each detector and
+    refiner, and the output frame rate.
 
     Threading: the engine is single-threaded and not thread-safe; drive it from one
     thread. Separately, it is not re-entrant: :meth:`open`, :meth:`step`,
@@ -360,6 +378,8 @@ class Engine:
         self._active: list[Sink] = []
         self._busy: str | None = None  # Name of the public call in progress.
         self._aborted_in_call = False  # abort() ran during that call.
+        self._detector_times: tuple[_Timed, ...]
+        self._refiner_times: tuple[_Timed, ...]
         self._reset_timings()
 
     @property
@@ -400,6 +420,10 @@ class Engine:
             render=self._render_time.snapshot(),
             write=self._write_time.snapshot(),
             frames_per_second=1.0 / interval if interval else None,
+            detectors=tuple(
+                (label, rolling.snapshot())
+                for _, label, rolling in self._detector_times + self._refiner_times
+            ),
         )
 
     @property
@@ -624,6 +648,11 @@ class Engine:
             self.abort()
             raise
 
+        # Re-key the per-component timings by object: a component that stays keeps
+        # its statistics, a new one starts empty, and a removed one is no longer listed.
+        kept = self._detector_times + self._refiner_times
+        self._detector_times = _component_times(new_detectors, kept)
+        self._refiner_times = _component_times(new_refiners, kept)
         self._all_detectors = new_all
         self._detectors = new_detectors
         self._all_refiners = new_all_refiners
@@ -748,6 +777,8 @@ class Engine:
         self._write_time = _Rolling()
         self._interval = _Rolling()
         self._last_emit: float | None = None
+        self._detector_times = _component_times(self._detectors, ())
+        self._refiner_times = _component_times(self._refiners, ())
 
     def _check_not_aborted(self) -> None:
         """Raise when :meth:`abort` was called from inside the current call."""
@@ -788,17 +819,26 @@ class Engine:
         step with the stream; their results are discarded, and refiners do not run.
         """
         budget = self._budget_s
-        start = self._clock()
+        clock = self._clock
+        start = clock()
         shape = frame.image.shape
         first_hit = self._first_hit
         detections = Detections()
         present = False
         failed = False
-        for detector in self._detectors:
+        for detector, (_, _, took) in zip(self._detectors, self._detector_times, strict=True):
             if not detector.stateful and (failed or (first_hit and present)):
                 continue
             try:
-                result = detector.detect(frame)
+                # The per-component samples only observe: ``elapsed`` below is still
+                # measured from ``start``, so the budget check does not depend on them.
+                began = clock()
+                try:
+                    result = detector.detect(frame)
+                except Exception:
+                    took.add(clock() - began)
+                    raise
+                took.add(clock() - began)
                 if not failed:
                     merged = detections.merged(check_detections(result, detector.provides, shape))
                     present = merged.subject_present
@@ -809,9 +849,15 @@ class Engine:
                 failed = True
 
         if not failed:
-            for refiner in self._refiners:
+            for refiner, (_, _, took) in zip(self._refiners, self._refiner_times, strict=True):
                 try:
-                    result = refiner.refine(frame, detections)
+                    began = clock()
+                    try:
+                        result = refiner.refine(frame, detections)
+                    except Exception:
+                        took.add(clock() - began)
+                        raise
+                    took.add(clock() - began)
                     merged = detections.merged(
                         check_detections(result, refiner.provides, shape, allow_held=True)
                     )
@@ -822,7 +868,7 @@ class Engine:
                     failed = True
                     break
 
-        elapsed = self._clock() - start
+        elapsed = clock() - start
         over = False
         if budget is not None and not failed and elapsed > budget:
             over = True
@@ -1070,6 +1116,33 @@ def _resolve(
             "active detector or refiner provides it"
         )
     return active, tuple(entry[0] for entry in active_refiners), first_hit
+
+
+def _component_label(component: object) -> str:
+    """Return the timing label of a detector or refiner; never raises.
+
+    The kind is appended so that two instances of one class (the person and the
+    face tracker refiners) get distinct labels.
+    """
+    name = type(component).__name__
+    try:
+        kind = getattr(component, "kind", None)
+    except Exception:  # noqa: BLE001 (a label must not fail the run)
+        kind = None
+    if isinstance(kind, DetectionKind):
+        return f"{name} ({kind.value})"
+    return name
+
+
+def _component_times(
+    components: Sequence[object], kept: Sequence[_Timed]
+) -> tuple[_Timed, ...]:
+    """Pair each component with its label and rolling time, reusing ``kept`` by identity."""
+    previous = {id(entry[0]): entry for entry in kept}
+    return tuple(
+        previous.get(id(component)) or (component, _component_label(component), _Rolling())
+        for component in components
+    )
 
 
 def _check_image(image: object, like: np.ndarray, subject_present: bool) -> None:

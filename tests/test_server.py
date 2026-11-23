@@ -43,6 +43,7 @@ from petrify.server.control import (  # noqa: E402
     RUNTIME_FIELDS,
     RunControl,
     RunSnapshot,
+    RunTimings,
     config_to_dict,
 )
 from petrify.sinks.mjpeg import MULTIPART_CONTENT_TYPE, MjpegFrame, MjpegSink  # noqa: E402
@@ -358,7 +359,9 @@ def test_state_shape(control: RunControl) -> None:
     assert set(data["stats"]) == {"frames", "frozen", "passed_through", "failed_closed",
                                   "over_budget", "sink_failures", "reconfigurations"}
     assert set(data["timings"]) == {"detect_mean_ms", "detect_last_ms", "render_mean_ms",
-                                    "render_last_ms", "write_mean_ms", "write_last_ms", "fps"}
+                                    "render_last_ms", "write_mean_ms", "write_last_ms", "fps",
+                                    "detectors"}
+    assert data["timings"]["detectors"] == []
     assert set(data["source"]) == {"uri", "width", "height", "fps", "live", "dropped"}
     assert set(data["background"]) == {"strategy", "ready", "rejected"}
     assert data["running"] is True and data["ended"] is False
@@ -1366,10 +1369,12 @@ WEAKENED = ["First weakened sentence.", "Second <i>weakened</i> sentence.", "Thi
 
 
 def _run_page(tmp_path: Path, state: dict, *, actions: list[dict] | None = None,
-              patch_response: dict | None = None) -> dict:
+              patch_response: dict | None = None,
+              later_states: list[dict] | None = None) -> dict:
     scenario = tmp_path / "scenario.json"
     scenario.write_text(json.dumps({"state": state, "actions": actions or [],
-                                    "patch_response": patch_response}), encoding="utf-8")
+                                    "patch_response": patch_response,
+                                    "later_states": later_states or []}), encoding="utf-8")
     result = subprocess.run([NODE, str(HARNESS), str(STATIC_DIR), str(scenario)],
                             capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stderr
@@ -1557,3 +1562,63 @@ def test_t8b_patch_of_a_hog_setting_under_the_dnn_is_rejected() -> None:
     assert "DNN person detector" in json.dumps(response.json())
     assert state["person_detector"] == "dnn"
     assert control.take_pending() is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 T5: per-detector and per-refiner timings
+# ---------------------------------------------------------------------------
+
+COMPONENT_TIMINGS = (
+    ("DnnPersonDetector", 40.25, 41.5),
+    ("TrackerRefiner (persons)", 0.5, None),
+    ("TrackerRefiner (faces)", None, None),
+)
+
+
+def test_state_lists_each_component_timing(control: RunControl) -> None:
+    control.publish(RunSnapshot(config=config_to_dict(control.applied), running=True,
+                                timings=RunTimings(detectors=COMPONENT_TIMINGS)))
+    app = create_app(control, ScriptedFeed([]), token=TOKEN, port=PORT)  # type: ignore[arg-type]
+    with _client(app) as c:
+        data = c.get("/api/state", headers=AUTH).json()
+    assert data["timings"]["detectors"] == [
+        {"name": name, "mean_ms": mean, "last_ms": last} for name, mean, last in COMPONENT_TIMINGS
+    ]
+
+
+def _timed_state(entries: tuple[tuple[str, float | None, float | None], ...]) -> dict:
+    timings = RunTimings(detectors=entries).to_dict()
+    return _state(None, None, timings=timings)
+
+
+@needs_node
+def test_page_shows_one_line_per_component_and_follows_the_list(tmp_path: Path) -> None:
+    hostile = (("<img src=x onerror=alert(1)>", 1.0, 2.0),)
+    report = _run_page(
+        tmp_path,
+        _timed_state(COMPONENT_TIMINGS),
+        later_states=[_timed_state(COMPONENT_TIMINGS[:1]), _timed_state(hostile)],
+    )
+    # The last state is the one shown. The longer list before it left its lines in
+    # place as blank lines, so the rows below did not move.
+    lines = report["detectorTimes"]
+    assert [line["className"] for line in lines] == ["timing-line"] * 3
+    assert lines[0]["text"] == "<img src=x onerror=alert(1)>: 1.0 ms mean, 2.0 ms last"
+    assert lines[0]["children"] == []  # Markup in a name stays text.
+    assert lines[1]["text"] == lines[2]["text"] == " "
+
+
+@needs_node
+def test_page_lists_every_component_in_run_order(tmp_path: Path) -> None:
+    report = _run_page(tmp_path, _timed_state(COMPONENT_TIMINGS))
+    assert [line["text"] for line in report["detectorTimes"]] == [
+        "DnnPersonDetector: 40.3 ms mean, 41.5 ms last",
+        "TrackerRefiner (persons): 0.5 ms mean, n/a last",
+        "TrackerRefiner (faces): n/a mean, n/a last",
+    ]
+    grown = _run_page(tmp_path, _timed_state(COMPONENT_TIMINGS[:1]),
+                      later_states=[_timed_state(COMPONENT_TIMINGS)])
+    assert [line["className"] for line in grown["detectorTimes"]] == ["timing-line"] * 3
+    assert grown["detectorTimes"][2]["text"] == "TrackerRefiner (faces): n/a mean, n/a last"
+    empty = _run_page(tmp_path, _timed_state(()))
+    assert [line["text"] for line in empty["detectorTimes"]] == ["None"]
