@@ -796,7 +796,13 @@ def test_app_js_uses_the_fragment_token_and_bearer_header() -> None:
     assert "window.location.hash" in js
     assert '"Authorization": "Bearer " + token' in js
     assert "/stream.mjpg?token=" in js and "/raw.mjpg?token=" in js
-    assert "localStorage" not in js and "sessionStorage" not in js and "eval(" not in js
+    assert "localStorage" not in js and "eval(" not in js
+    # sessionStorage holds only the selected tab, under one fixed key.
+    code = _js_code()
+    assert re.findall(r"sessionStorage\.(\w+)\(([^,)]*)", code) == [
+        ("getItem", "TAB_STORAGE_KEY"), ("setItem", "TAB_STORAGE_KEY")]
+    assert 'var TAB_STORAGE_KEY = "petrify-tab";' in code
+    assert "window.sessionStorage.setItem(TAB_STORAGE_KEY, TABS[index].key);" in code
 
 
 def test_server_modules_have_no_em_or_en_dashes() -> None:
@@ -1370,11 +1376,15 @@ WEAKENED = ["First weakened sentence.", "Second <i>weakened</i> sentence.", "Thi
 
 def _run_page(tmp_path: Path, state: dict, *, actions: list[dict] | None = None,
               patch_response: dict | None = None,
-              later_states: list[dict] | None = None) -> dict:
+              later_states: list[dict] | None = None,
+              tab_actions: list[dict] | None = None,
+              session_storage: str | dict | None = None) -> dict:
     scenario = tmp_path / "scenario.json"
     scenario.write_text(json.dumps({"state": state, "actions": actions or [],
                                     "patch_response": patch_response,
-                                    "later_states": later_states or []}), encoding="utf-8")
+                                    "later_states": later_states or [],
+                                    "tab_actions": tab_actions or [],
+                                    "session_storage": session_storage}), encoding="utf-8")
     result = subprocess.run([NODE, str(HARNESS), str(STATIC_DIR), str(scenario)],
                             capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stderr
@@ -1447,7 +1457,8 @@ def test_t13b_page_builds_one_control_per_option_and_disables_fixed_ones(tmp_pat
     assert record["ids"] and all(re.fullmatch(r"mode-opt-\d+(-\d+|-help|-error)?", i)
                                  for i in record["ids"])
     assert not any("choice" in i or "count" in i for i in record["ids"])
-    assert set(record["attributes"]) <= {"data-mode-option", "aria-describedby", "aria-live"}
+    assert set(record["attributes"]) <= {"data-mode-option", "aria-describedby", "aria-live",
+                                         "aria-selected"}
     assert record["hrefs"] == [] and record["dataset"] == []
     assert record["opened"] == [] and record["locations"] == []
 
@@ -1622,3 +1633,255 @@ def test_page_lists_every_component_in_run_order(tmp_path: Path) -> None:
     assert grown["detectorTimes"][2]["text"] == "TrackerRefiner (faces): n/a mean, n/a last"
     empty = _run_page(tmp_path, _timed_state(()))
     assert [line["text"] for line in empty["detectorTimes"]] == ["None"]
+
+
+# ---------------------------------------------------------------------------
+# W2: two-column layout and the tabs of the side panel
+# ---------------------------------------------------------------------------
+
+TABS = (("tab-mode", "tabpanel-mode", "Mode", "mode"),
+        ("tab-detection", "tabpanel-detection", "Detection", "detection"),
+        ("tab-stats", "tabpanel-stats", "Stats", "stats"))
+TAB_IDS = [tab for tab, _, _, _ in TABS]
+PANEL_IDS = [panel for _, panel, _, _ in TABS]
+
+# Where each existing element belongs. "panel-top" is the always visible part of
+# the panel, above the tabs; "feed" is the video column, outside the panel.
+PLACES = {
+    "tabpanel-mode": ["mode-waiting", "mode-section", "mode-name", "mode-origin", "mode-summary",
+                      "mode-plugin-notice", "mode-no-options", "mode-fixed-note",
+                      "mode-options", "mode-list", "mode-list-omitted"],
+    "tabpanel-detection": [
+        "settings", "ctl-detector", "opt-detector-person", "ctl-motion-threshold",
+        "ctl-motion-var-threshold", "ctl-motion-detect-shadows", "person-legend",
+        "person-dnn-note", "ctl-person-min-confidence", "ctl-person-min-box-area",
+        "ctl-person-scale", "ctl-background-diff-enabled", "ctl-background-diff-pixel-threshold",
+        "ctl-background-diff-area-threshold", "ctl-engine-lookahead",
+        "ctl-engine-frame-budget-ms", "ctl-roi", "roi-x", "roi-y", "roi-w", "roi-h",
+    ],
+    "tabpanel-stats": ["st-running", "st-source", "st-background", "st-frames", "st-frozen",
+                       "st-passed", "st-failed", "st-over-budget", "st-dropped", "st-fps",
+                       "st-timings", "st-detectors", "st-roi", "st-reconfigurations"],
+    "panel-top": ["run-state", "token-missing", "ended-banner", "weakened", "weakened-list",
+                  "stop-button", "err-stop", "st-error", "last-rejection"],
+    "feed": ["stream-processed", "raw-figure", "stream-raw"],
+}
+# Every form control and button of the page, so a lost one is noticed.
+CONTROLS = {
+    "stop-button", *TAB_IDS, "ctl-detector", "ctl-motion-threshold", "ctl-motion-var-threshold",
+    "ctl-motion-detect-shadows", "ctl-person-min-confidence", "ctl-person-min-box-area",
+    "ctl-person-scale", "ctl-background-diff-enabled", "ctl-background-diff-pixel-threshold",
+    "ctl-background-diff-area-threshold", "ctl-engine-lookahead", "ctl-engine-frame-budget-ms",
+    "ctl-roi", "roi-x", "roi-y", "roi-w", "roi-h",
+}
+
+
+def _assert_selected(report: dict, index: int) -> None:
+    assert [report["attrs"][tab]["aria-selected"] for tab in TAB_IDS] == [
+        "true" if i == index else "false" for i in range(3)]
+    # Only the selected tab is in the tab order.
+    assert [report["tabIndex"][tab] for tab in TAB_IDS] == [
+        0 if i == index else -1 for i in range(3)]
+    assert [report["hidden"][panel] for panel in PANEL_IDS] == [i != index for i in range(3)]
+
+
+def test_w2_page_has_three_tabs_with_their_aria_roles() -> None:
+    tags = {attrs.get("id"): (tag, attrs) for tag, attrs in _page().tags if attrs.get("id")}
+    tablists = [attrs for _, attrs in _page().tags if attrs.get("role") == "tablist"]
+    assert len(tablists) == 1 and tablists[0].get("aria-label")
+    assert [attrs.get("id") for _, attrs in _page().tags if attrs.get("role") == "tab"] == TAB_IDS
+    text = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    for i, (tab, panel, label, _) in enumerate(TABS):
+        tag, attrs = tags[tab]
+        assert tag == "button" and attrs.get("type") == "button"
+        assert attrs.get("aria-controls") == panel
+        assert attrs.get("aria-selected") == ("true" if i == 0 else "false")
+        assert attrs.get("tabindex") == (None if i == 0 else "-1")
+        assert re.search(rf'id="{tab}"[^>]*>{label}</button>', text)
+        panel_attrs = tags[panel][1]
+        assert panel_attrs.get("role") == "tabpanel"
+        assert panel_attrs.get("aria-labelledby") == tab
+        assert ("hidden" in panel_attrs) == (i != 0)
+    controls = {attrs["id"] for tag, attrs in _page().tags
+                if tag in ("input", "select", "button") and attrs.get("id")}
+    assert controls == CONTROLS
+
+
+def test_w2_css_has_the_two_column_layout_and_its_breakpoint() -> None:
+    css = (STATIC_DIR / "app.css").read_text(encoding="utf-8")
+    narrow, wide = css.split("@media (min-width: 900px)", 1)
+    assert 'grid-template-areas: "top" "feed" "tabs";' in narrow
+    assert "grid-template-columns: minmax(0, 1fr) clamp(360px, 30vw, 420px);" in wide
+    assert 'grid-template-areas: "feed top" "feed tabs";' in wide
+    assert "object-fit: contain;" in wide
+    panels = wide[wide.index(".tab-panels {"):]
+    assert "overflow-y: auto;" in panels[: panels.index("}")]
+
+
+@needs_node
+def test_w2_mode_tab_is_selected_first_and_every_element_is_in_its_place(
+    tmp_path: Path,
+) -> None:
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES, weakened=WEAKENED,
+                                        raw_preview=True))
+    _assert_selected(report, 0)
+    within = report["within"]
+    for place, ids in PLACES.items():
+        for element_id in ids:
+            panels = [p for p in within[element_id] if p in PANEL_IDS]
+            if place in PANEL_IDS:
+                assert panels == [place], (element_id, within[element_id])
+            elif place == "panel-top":
+                assert panels == [] and "panel-top" in within[element_id], element_id
+            else:
+                assert panels == [] and "panel-top" not in within[element_id], element_id
+    for tab in TAB_IDS:
+        assert "panel-tabs" in within[tab] and "panel-top" not in within[tab]
+        assert not set(within[tab]) & set(PANEL_IDS)
+    # The options the script builds for the mode go inside the Mode tab.
+    assert len(report["builtWithin"]) == 8
+    assert all("mode-options" in ids and "tabpanel-mode" in ids
+               for ids in report["builtWithin"].values())
+    # The always visible part shows what it must.
+    assert report["hidden"]["weakened"] is False and report["weakened"] == WEAKENED
+    assert report["hidden"]["raw-figure"] is False
+    assert report["hidden"]["mode-waiting"] is True
+    assert report["text"]["run-state"] == "Run: Running"
+    # Nothing was rejected: the script leaves the markup's "None" in place.
+    assert report["text"]["last-rejection"] == ""
+    assert '<dd id="last-rejection">None</dd>' in (STATIC_DIR / "index.html").read_text(
+        encoding="utf-8")
+
+
+@needs_node
+def test_w2_mode_tab_says_when_the_run_reports_no_mode(tmp_path: Path) -> None:
+    report = _run_page(tmp_path, _state(None, None))
+    _assert_selected(report, 0)
+    assert report["hidden"]["mode-section"] is True
+    assert report["hidden"]["mode-waiting"] is False
+
+
+@needs_node
+def test_w2_clicking_a_tab_selects_it_and_remembers_it(tmp_path: Path) -> None:
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES, weakened=WEAKENED),
+                       tab_actions=[{"click": "tab-stats"}])
+    _assert_selected(report, 2)
+    assert report["record"]["storage"] == [["petrify-tab", "stats"]]
+    # The notice stays shown while the Mode tab is hidden.
+    assert report["hidden"]["weakened"] is False
+    assert report["hidden"]["mode-section"] is False
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES),
+                       tab_actions=[{"click": "tab-detection"}, {"click": "tab-mode"}])
+    _assert_selected(report, 0)
+    assert report["record"]["storage"] == [["petrify-tab", "detection"], ["petrify-tab", "mode"]]
+
+
+@needs_node
+@pytest.mark.parametrize(
+    ("keys", "index"),
+    [
+        ([("ArrowRight", "tab-mode")], 1),
+        ([("ArrowRight", "tab-mode"), ("ArrowRight", "tab-detection")], 2),
+        ([("ArrowRight", "tab-stats")], 0),  # Wraps to the first.
+        ([("ArrowLeft", "tab-mode")], 2),  # Wraps to the last.
+        ([("ArrowLeft", "tab-detection")], 0),
+        ([("End", "tab-mode")], 2),
+        ([("End", "tab-mode"), ("Home", "tab-stats")], 0),
+    ],
+)
+def test_w2_arrow_home_and_end_keys_move_between_tabs(
+    tmp_path: Path, keys: list[tuple[str, str]], index: int
+) -> None:
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES),
+                       tab_actions=[{"key": key, "on": on} for key, on in keys])
+    _assert_selected(report, index)
+    assert report["focused"] == TAB_IDS[index]
+    assert [event["prevented"] for event in report["keyEvents"]] == [True] * len(keys)
+    assert report["record"]["storage"][-1] == ["petrify-tab", TABS[index][3]]
+
+
+@needs_node
+@pytest.mark.parametrize("key", ["a", "Tab", "Enter", "ArrowDown"])
+def test_w2_other_keys_leave_the_tabs_alone(tmp_path: Path, key: str) -> None:
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES),
+                       tab_actions=[{"key": key, "on": "tab-mode"}])
+    _assert_selected(report, 0)
+    assert report["keyEvents"] == [{"key": key, "on": "tab-mode", "prevented": False}]
+    assert report["focused"] is None and report["record"]["storage"] == []
+
+
+@needs_node
+@pytest.mark.parametrize(("stored", "index"),
+                         [("detection", 1), ("stats", 2), ("mode", 0),
+                          ("<b>stats</b>", 0), ("tab-stats", 0), ("Stats", 0), ("", 0)])
+def test_w2_the_remembered_tab_is_restored(tmp_path: Path, stored: str, index: int) -> None:
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES),
+                       session_storage={"items": {"petrify-tab": stored}})
+    _assert_selected(report, index)
+    assert report["record"]["storage"] == []  # Restoring writes nothing.
+
+
+@needs_node
+@pytest.mark.parametrize("storage", ["missing", "throws", "methods_throw"])
+def test_w2_a_broken_session_storage_does_not_break_the_page(
+    tmp_path: Path, storage: str
+) -> None:
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES, weakened=WEAKENED),
+                       session_storage=storage,
+                       tab_actions=[{"click": "tab-stats"}, {"key": "ArrowLeft", "on": "tab-stats"}])
+    _assert_selected(report, 1)
+    assert report["focused"] == "tab-detection"
+    assert report["record"]["storage"] == []
+    assert report["text"]["run-state"] == "Run: Running"
+    assert report["text"]["st-frames"] == "0"
+    assert report["weakened"] == WEAKENED and len(report["inputs"]) == 8
+    report = _run_page(tmp_path, _state(PLUGIN_MODE, PLUGIN_MODES), session_storage=storage)
+    _assert_selected(report, 0)
+
+
+def _counted(frames: int, reconfigurations: int) -> dict:
+    state = _state(PLUGIN_MODE, PLUGIN_MODES)
+    state["stats"] = {**state["stats"], "frames": frames, "reconfigurations": reconfigurations}
+    return state
+
+
+@needs_node
+def test_w2_a_change_from_the_mode_tab_updates_the_hidden_stats_tab(tmp_path: Path) -> None:
+    report = _run_page(tmp_path, _counted(5, 0), actions=[{"input": 0, "value": "7"}],
+                       later_states=[_counted(42, 1)])
+    _assert_selected(report, 0)
+    assert report["sent"] == [{"mode_options": {"count": 7}}]
+    assert report["hidden"]["tabpanel-stats"] is True
+    assert report["text"]["st-frames"] == "42"
+    assert report["text"]["st-reconfigurations"] == "1"
+    assert report["text"]["last-rejection"] == "None"
+
+
+@needs_node
+def test_w2_a_rejection_shows_above_the_tabs_as_text(tmp_path: Path) -> None:
+    error = "mode_options.count must be <b>at most 10</b>"
+    report = _run_page(tmp_path, _counted(5, 0), actions=[{"input": 0, "value": "70"}],
+                       patch_response={"status": 422, "body": {"error": error}},
+                       tab_actions=[{"click": "tab-stats"}])
+    _assert_selected(report, 2)
+    assert report["hidden"]["tabpanel-mode"] is True
+    assert report["text"]["last-rejection"] == "Rejected: " + error  # Markup stays text.
+    assert report["errors"].count("Rejected: " + error) == 1  # The option still shows it too.
+    # A value that cannot be sent is reported the same way.
+    report = _run_page(tmp_path, _counted(5, 0), actions=[{"input": 0, "value": "1.5"}])
+    assert report["sent"] == []
+    assert report["text"]["last-rejection"] == "Not sent: Enter a whole number."
+
+
+@needs_node
+def test_w2_plugin_and_server_text_in_the_panel_stays_text(tmp_path: Path) -> None:
+    hostile_mode = {**PLUGIN_MODE, "name": "<img src=x onerror=alert(1)>",
+                    "summary": "<script>alert(1)</script>"}
+    report = _run_page(tmp_path, _state(hostile_mode, PLUGIN_MODES, weakened=WEAKENED,
+                                        last_error="<b>camera</b> lost"))
+    assert report["text"]["mode-name"] == "<img src=x onerror=alert(1)>"
+    assert report["text"]["mode-summary"] == "<script>alert(1)</script>"
+    assert report["text"]["st-error"] == "Error: <b>camera</b> lost"
+    assert report["weakened"][1] == "Second <i>weakened</i> sentence."
+    assert all(child["children"] == [] for row in report["modeList"] for child in row["children"])
+    assert not [i for i in report["record"]["ids"] if "<" in i]

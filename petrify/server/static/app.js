@@ -361,6 +361,7 @@
     var read = readOption(entry);
     if (!read.ok) {
       entry.error.textContent = "Not sent: " + read.message;
+      showRejection(entry.error.textContent);
       entry.editing = false;
       return;
     }
@@ -376,12 +377,15 @@
       entry.editing = false;
       if (result.status === 200) {
         entry.error.textContent = "";
+        showRejection(null);
       } else {
         entry.error.textContent = "Rejected: " + String(result.data.error || "the change was not accepted.");
+        showRejection(entry.error.textContent);
       }
     }).catch(function () {
       entry.editing = false;
       entry.error.textContent = "Not sent: petrify could not be reached.";
+      showRejection(entry.error.textContent);
     });
   }
 
@@ -470,6 +474,7 @@
       return;
     }
     $("mode-section").hidden = false;
+    $("mode-waiting").hidden = true;
     var builtin = mode.builtin === true;
     text("mode-name", String(mode.name));
     text("mode-origin", builtin ? "Built in" : "Plugin " + String(mode.origin));
@@ -669,6 +674,7 @@
     var built = patchFor(el);
     if (!built.ok) {
       text(errorId, "Not sent: " + built.message);
+      showRejection("Not sent: " + built.message);
       editing[el.id] = false;
       return;
     }
@@ -677,12 +683,16 @@
       editing[el.id] = false;
       if (result.status === 200) {
         text(errorId, "");
+        showRejection(null);
       } else {
-        text(errorId, "Rejected: " + (result.data.error || "the change was not accepted."));
+        var message = "Rejected: " + String(result.data.error || "the change was not accepted.");
+        text(errorId, message);
+        showRejection(message);
       }
     }).catch(function () {
       editing[el.id] = false;
       text(errorId, "Not sent: petrify could not be reached.");
+      showRejection("Not sent: petrify could not be reached.");
     });
   }
 
@@ -723,13 +733,98 @@
       }
       api("POST", "/api/stop").then(function (result) {
         text("err-stop", result.status === 200 ? "Stopping..." : "Rejected: " + (result.data.error || "stop failed."));
+        if (result.status !== 200) {
+          showRejection("Stop rejected: " + String(result.data.error || "stop failed."));
+        }
       }).catch(function () {
         text("err-stop", "Not sent: petrify could not be reached.");
+        showRejection("Stop not sent: petrify could not be reached.");
       });
     });
   }
 
+  /* The last change that was rejected or not sent, shown above the tabs so it is
+     seen whatever tab is open. An accepted change clears it. */
+  function showRejection(message) {
+    text("last-rejection", message === null ? "None" : String(message));
+  }
+
+  /* The tabs of the side panel. The remembered tab is only compared with these
+     fixed keys: it never becomes an id, a selector or page text. */
+  var TABS = [
+    { key: "mode", tab: "tab-mode", panel: "tabpanel-mode" },
+    { key: "detection", tab: "tab-detection", panel: "tabpanel-detection" },
+    { key: "stats", tab: "tab-stats", panel: "tabpanel-stats" }
+  ];
+  var TAB_STORAGE_KEY = "petrify-tab";
+
+  function rememberedTab() {
+    try {
+      var stored = window.sessionStorage.getItem(TAB_STORAGE_KEY);
+      for (var i = 0; i < TABS.length; i += 1) {
+        if (TABS[i].key === stored) {
+          return i;
+        }
+      }
+    } catch (error) {
+      /* Storage blocked or missing: the first tab is shown. */
+    }
+    return 0;
+  }
+
+  function rememberTab(index) {
+    try {
+      window.sessionStorage.setItem(TAB_STORAGE_KEY, TABS[index].key);
+    } catch (error) {
+      /* Storage blocked or missing: the tab is not remembered. */
+    }
+  }
+
+  function selectTab(index, moveFocus) {
+    TABS.forEach(function (entry, i) {
+      var selected = i === index;
+      var tab = $(entry.tab);
+      tab.setAttribute("aria-selected", selected ? "true" : "false");
+      tab.tabIndex = selected ? 0 : -1;
+      $(entry.panel).hidden = !selected;
+    });
+    if (moveFocus) {
+      $(TABS[index].tab).focus();
+    }
+  }
+
+  function wireTabs() {
+    var last = TABS.length - 1;
+    TABS.forEach(function (entry, i) {
+      var tab = $(entry.tab);
+      tab.addEventListener("click", function () {
+        selectTab(i, false);
+        rememberTab(i);
+      });
+      tab.addEventListener("keydown", function (event) {
+        var next = null;
+        if (event.key === "ArrowRight") {
+          next = i === last ? 0 : i + 1;
+        } else if (event.key === "ArrowLeft") {
+          next = i === 0 ? last : i - 1;
+        } else if (event.key === "Home") {
+          next = 0;
+        } else if (event.key === "End") {
+          next = last;
+        }
+        if (next === null) {
+          return;
+        }
+        event.preventDefault();
+        selectTab(next, true);
+        rememberTab(next);
+      });
+    });
+    selectTab(rememberedTab(), false);
+  }
+
   function start() {
+    wireTabs();
     if (!token) {
       $("token-missing").hidden = false;
       text("run-state", "No access token");

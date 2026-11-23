@@ -12,11 +12,21 @@
  * entry of the optional "later_states" list, that state becomes the /api/state
  * payload and the page's polling interval runs once. Then the report is printed.
  *
+ * Optional keys: "tab_actions", run after the first state is shown and before
+ * "actions": each is {"click": TAB_ID} or {"key": "ArrowRight", "on": TAB_ID}.
+ * "session_storage" picks the storage the page sees: absent or null for a
+ * working empty store, {"items": {...}} for a working store holding those
+ * items, "missing" for no sessionStorage at all, "throws" when reading
+ * window.sessionStorage throws, "methods_throw" when getItem and setItem throw.
+ *
  * The stub records every element id set by the script, every attribute name
  * passed to setAttribute, every href and dataset key written, and every
  * window.open call or location assignment, so a test can check that none of
  * them is built from data. For every static element (one with an id in
- * index.html) it reports whether it is hidden or disabled, and its text.
+ * index.html) it reports whether it is hidden or disabled, its text, its
+ * attributes (from the markup, then as the script set them), the ids of the
+ * static elements that contain it, and the same containment for every input
+ * the script built. It also reports the focused element and the storage writes.
  */
 "use strict";
 
@@ -27,7 +37,9 @@ const vm = require("vm");
 const staticDir = process.argv[2];
 const scenario = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
 
-const record = { ids: [], attributes: [], hrefs: [], dataset: [], opened: [], locations: [] };
+const record = {
+  ids: [], attributes: [], hrefs: [], dataset: [], opened: [], locations: [], storage: []
+};
 
 class Element {
   constructor(tag, id) {
@@ -48,6 +60,8 @@ class Element {
     this.step = "";
     this.inputMode = "";
     this.elementId = id || "";
+    this.parent = null;
+    this.tabIndex = 0;
     const datasetRecord = record.dataset;
     this.dataset = new Proxy({}, {
       set(target, key, value) {
@@ -66,24 +80,54 @@ class Element {
   get textContent() { return this.ownText + this.children.map((c) => c.textContent).join(""); }
   set textContent(value) { this.ownText = String(value); this.children = []; }
 
-  appendChild(child) { this.children.push(child); return child; }
-  removeChild(child) { this.children = this.children.filter((c) => c !== child); return child; }
+  appendChild(child) { this.children.push(child); child.parent = this; return child; }
+  removeChild(child) {
+    this.children = this.children.filter((c) => c !== child);
+    child.parent = null;
+    return child;
+  }
+  focus() { document.activeElement = this; }
   setAttribute(name, value) { record.attributes.push(String(name)); this.attrs[name] = String(value); }
   getAttribute(name) { return name in this.attrs ? this.attrs[name] : null; }
   removeAttribute(name) { delete this.attrs[name]; }
   addEventListener(name, fn) { (this.listeners[name] = this.listeners[name] || []).push(fn); }
-  fire(name) { (this.listeners[name] || []).forEach((fn) => fn({ preventDefault() {} })); }
+  fire(name, extra) {
+    const event = Object.assign({ defaultPrevented: false }, extra || {});
+    event.preventDefault = () => { event.defaultPrevented = true; };
+    (this.listeners[name] || []).forEach((fn) => fn(event));
+    return event;
+  }
 }
 
-/* Static elements: every element with an id in index.html. */
+/* Static elements: every element with an id in index.html, with the
+   attributes of its markup and, as its parent, the nearest enclosing element
+   that has an id. The markup's own children are not kept: text and children
+   are only what the script sets. */
 const staticById = {};
 const html = fs.readFileSync(path.join(staticDir, "index.html"), "utf8");
-for (const match of html.matchAll(/<(\w+)\b([^>]*)>/g)) {
-  const idMatch = /\sid="([^"]+)"/.exec(match[2]);
+const VOID = new Set(["meta", "link", "input", "img", "br", "hr", "source", "wbr"]);
+const open = [];
+for (const match of html.matchAll(/<(\/?)(\w+)\b([^>]*)>/g)) {
+  const tag = match[2].toLowerCase();
+  if (match[1]) {
+    while (open.length && open.pop().tag !== tag) { /* Unclosed inner element. */ }
+    continue;
+  }
+  const idMatch = /\sid="([^"]+)"/.exec(match[3]);
+  let el = null;
   if (idMatch) {
-    const el = new Element(match[1], idMatch[1]);
-    el.hidden = /\shidden(\s|$|=)/.test(match[2]);
+    el = new Element(tag, idMatch[1]);
+    for (const attr of match[3].matchAll(/([\w-]+)(?:="([^"]*)")?/g)) {
+      el.attrs[attr[1]] = attr[2] === undefined ? "" : attr[2];
+    }
+    el.hidden = "hidden" in el.attrs;
+    el.tabIndex = "tabindex" in el.attrs ? Number(el.attrs.tabindex) : 0;
+    const holder = [...open].reverse().find((entry) => entry.el);
+    el.parent = holder ? holder.el : null;
     staticById[idMatch[1]] = el;
+  }
+  if (!VOID.has(tag)) {
+    open.push({ tag: tag, el: el });
   }
 }
 const created = [];
@@ -109,6 +153,27 @@ const document = {
   addEventListener() {}
 };
 
+function storage() {
+  const choice = scenario.session_storage;
+  if (choice === "missing") {
+    return undefined;
+  }
+  const items = Object.assign({}, choice && choice.items ? choice.items : {});
+  const broken = choice === "methods_throw";
+  return {
+    getItem(key) {
+      if (broken) { throw new Error("SecurityError"); }
+      return key in items ? items[key] : null;
+    },
+    setItem(key, value) {
+      if (broken) { throw new Error("QuotaExceededError"); }
+      record.storage.push([String(key), String(value)]);
+      items[key] = String(value);
+    }
+  };
+}
+const sessionStore = storage();
+
 const timers = [];
 const intervals = [];
 let currentState = scenario.state;
@@ -129,6 +194,14 @@ const window = {
   confirm() { return false; },
   open(url) { record.opened.push(String(url)); }
 };
+Object.defineProperty(window, "sessionStorage", {
+  get() {
+    if (scenario.session_storage === "throws") {
+      throw new Error("SecurityError: storage is blocked");
+    }
+    return sessionStore;
+  }
+});
 Object.defineProperty(window, "location", {
   get() { return location; },
   set(value) { record.locations.push(String(value)); }
@@ -171,6 +244,15 @@ function describe(el) {
     await flush();
   }
   const inputs = () => created.filter((el) => "data-mode-option" in el.attrs);
+  const keyEvents = [];
+  for (const action of scenario.tab_actions || []) {
+    if ("click" in action) {
+      staticById[action.click].fire("click");
+    } else {
+      const event = staticById[action.on].fire("keydown", { key: action.key });
+      keyEvents.push({ key: action.key, on: action.on, prevented: event.defaultPrevented });
+    }
+  }
   for (const action of scenario.actions || []) {
     const input = inputs()[action.input];
     if ("checked" in action) {
@@ -195,15 +277,40 @@ function describe(el) {
   const hidden = {};
   const text = {};
   const disabled = {};
+  const attrs = {};
+  const tabIndex = {};
+  const within = {};
+  const containers = (el) => {
+    const ids = [];
+    for (let up = el.parent; up; up = up.parent) {
+      if (up.id) {
+        ids.push(up.id);
+      }
+    }
+    return ids;
+  };
   for (const id of Object.keys(staticById)) {
     hidden[id] = staticById[id].hidden;
     text[id] = staticById[id].textContent;
     disabled[id] = staticById[id].disabled;
+    attrs[id] = Object.assign({}, staticById[id].attrs);
+    tabIndex[id] = staticById[id].tabIndex;
+    within[id] = containers(staticById[id]);
+  }
+  const builtWithin = {};
+  for (const el of inputs()) {
+    builtWithin[el.id] = containers(el);
   }
   const report = {
     hidden: hidden,
     text: text,
     disabled: disabled,
+    attrs: attrs,
+    tabIndex: tabIndex,
+    within: within,
+    builtWithin: builtWithin,
+    focused: document.activeElement ? document.activeElement.id : null,
+    keyEvents: keyEvents,
     weakened: staticById["weakened-list"].children.map((li) => li.textContent),
     modeList: staticById["mode-list"].children.map(describe),
     detectorTimes: staticById["st-detectors"].children.map(describe),
