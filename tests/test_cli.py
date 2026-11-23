@@ -427,6 +427,82 @@ def test_run_calls_run_stream(run_stream: mock.MagicMock) -> None:
     petrify.sources.open_source.assert_called_once_with(IN, fps=None)  # type: ignore[attr-defined]
 
 
+def test_run_threads_is_parsed() -> None:
+    parser = _build_run_parser()
+    assert parser.parse_args(["--source", IN, "--output", OUT]).threads is None
+    for value in (1, 2, 64):
+        args = parser.parse_args(["--source", IN, "--output", OUT, "--threads", str(value)])
+        assert args.threads == value
+        _resolve_run(parser, args)  # In range: no usage error.
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("0", "--threads must be in 1..64, got 0"),
+        ("65", "--threads must be in 1..64, got 65"),
+        ("-2", "--threads must be in 1..64, got -2"),
+        ("two", "invalid int value"),
+        ("2.5", "invalid int value"),
+    ],
+)
+def test_run_threads_out_of_range_or_not_an_integer_is_a_usage_error(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str], value: str, message: str
+) -> None:
+    with (
+        mock.patch("cv2.setNumThreads") as set_threads,
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        main(["run", "--source", IN, "--output", OUT, "--threads", value])
+    assert excinfo.value.code == 2
+    assert message in capsys.readouterr().err
+    set_threads.assert_not_called()
+    run_stream.assert_not_called()
+
+
+def test_run_threads_is_set_before_any_component_is_built(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Everything that loads code or builds components records its turn: the
+    # thread count must come first.
+    order: list[str] = []
+    import petrify.core.registry as registry  # noqa: PLC0415
+
+    real_load_mode = registry.load_mode
+
+    def load_mode(*args: Any, **kwargs: Any) -> Any:
+        order.append("load_mode")
+        return real_load_mode(*args, **kwargs)
+
+    def open_source(*args: Any, **kwargs: Any) -> _StubSource:
+        order.append("open_source")
+        return _StubSource()
+
+    def run_stream(*args: Any, **kwargs: Any) -> RunReport:
+        order.append("run_stream")
+        return _report()
+
+    with (
+        caplog.at_level(logging.INFO, logger="petrify.cli"),
+        mock.patch("cv2.setNumThreads", side_effect=lambda n: order.append(f"threads={n}")),
+        mock.patch.object(registry, "load_mode", side_effect=load_mode),
+        mock.patch.object(petrify.sources, "open_source", side_effect=open_source),
+        mock.patch.object(petrify.pipeline, "run_stream", side_effect=run_stream),
+    ):
+        assert main(["run", "--source", IN, "--output", OUT, "--threads", "2"]) == 0
+    assert order == ["threads=2", "load_mode", "open_source", "run_stream"]
+    assert [r.getMessage() for r in caplog.records if "OpenCV worker threads" in r.getMessage()] == [
+        "OpenCV worker threads: 2"
+    ]
+
+
+def test_run_without_threads_leaves_opencv_threads_alone(run_stream: mock.MagicMock) -> None:
+    with mock.patch("cv2.setNumThreads") as set_threads:
+        assert main(["run", "--source", IN, "--output", OUT]) == 0
+    set_threads.assert_not_called()
+    run_stream.assert_called_once()
+
+
 def test_run_prints_banner_but_not_for_help(
     run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str]
 ) -> None:

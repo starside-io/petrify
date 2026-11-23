@@ -487,6 +487,9 @@ _STREAM_LOOKAHEAD = 10
 _CAMERA_LOOKAHEAD = 3
 _MAX_LOOKAHEAD = 600
 
+# Bounds of --threads (OpenCV worker threads per process).
+_MAX_THREADS = 64
+
 _RUN_HWACCEL_HELP = (
     "FFmpeg -hwaccel value, passed to the FFmpeg process that encodes --output. In this "
     "form petrify decodes the source itself and sends FFmpeg raw frames, so there is "
@@ -764,6 +767,18 @@ def _build_run_parser(modes: _ModeCatalog | None = None) -> argparse.ArgumentPar
             "live sources (camera:N and stream URLs), which are already real time."
         ),
     )
+    engine_group.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Limit OpenCV's worker threads in this process to N (1 to "
+            f"{_MAX_THREADS}). When several petrify processes share a machine (one per "
+            "camera), 2 is enough for one camera and keeps the processes from competing "
+            "for the cores. Default: OpenCV's own thread count."
+        ),
+    )
     # Rejected with a pointer to --lookahead; hidden from the help.
     engine_group.add_argument(
         "--gap-fill", type=int, default=None, dest="run_gap_fill", help=argparse.SUPPRESS
@@ -1035,6 +1050,8 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
         parser.error(f"--downsample must be in (0, 1], got {args.downsample}")
     if args.lookahead is not None and args.lookahead < 0:
         parser.error(f"--lookahead must be >= 0, got {args.lookahead}")
+    if args.threads is not None and not 1 <= args.threads <= _MAX_THREADS:
+        parser.error(f"--threads must be in 1..{_MAX_THREADS}, got {args.threads}")
     if args.lookahead is not None and args.lookahead > _MAX_LOOKAHEAD:
         parser.error(
             f"--lookahead must be <= {_MAX_LOOKAHEAD} (frames are buffered uncompressed), "
@@ -1329,6 +1346,19 @@ def _list_modes(catalog: _ModeCatalog, name: str | None) -> int:
     return 0
 
 
+def _set_opencv_threads(count: int) -> None:
+    """Set OpenCV's worker thread count for this process (``--threads``).
+
+    Called before the mode is loaded and before the source, any detector or any
+    model is built, so all OpenCV work of the run, model loading included, uses
+    the requested count from the start.
+    """
+    import cv2  # noqa: PLC0415
+
+    cv2.setNumThreads(count)
+    logging.getLogger(__name__).info("OpenCV worker threads: %d", count)
+
+
 def _run_main(argv: list[str]) -> int:
     """``petrify run``: open the source, run the streaming engine, return an exit code."""
     catalog = _ModeCatalog()
@@ -1338,6 +1368,8 @@ def _run_main(argv: list[str]) -> int:
     if args.list_modes:
         return _list_modes(catalog, args.mode)
     settings = _resolve_run(parser, args)
+    if args.threads is not None:
+        _set_opencv_threads(args.threads)
 
     from petrify.core.registry import ModeLoadError  # noqa: PLC0415
     from petrify.models import ModelError  # noqa: PLC0415

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import shutil
 import signal
 import subprocess
+import sys
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, TypeVar
@@ -503,6 +506,289 @@ def test_sigint_inside_a_non_live_step_aborts() -> None:
         run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
     assert (sink.closed, sink.aborted) == (0, 1)
     assert src.closed == 1
+
+
+# SIGTERM is handled like SIGINT. Each test raises a real SIGTERM in this process,
+# so it runs only when the handler is still the default one: with the code under
+# test broken, the signal would end pytest rather than pass silently.
+
+
+@pytest.fixture
+def sigterm_restored() -> Iterator[None]:
+    """Restore the SIGINT and SIGTERM handlers after the test, even if the code does not."""
+    previous_int = signal.getsignal(signal.SIGINT)
+    previous_term = signal.getsignal(signal.SIGTERM)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+
+
+def _default_sigterm() -> bool:
+    return _default_sigint() and signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+
+
+NEEDS_DEFAULT_SIGTERM = pytest.mark.skipif(
+    not hasattr(signal, "SIGTERM") or not _default_sigterm(),
+    reason="needs SIGTERM and the default SIGINT and SIGTERM handlers",
+)
+
+
+class _SignalSource(FakeSource):
+    """A FakeSource that raises a real signal while the next frame is awaited."""
+
+    def __init__(self, signum: int, signal_at: int, *, live: bool = True) -> None:
+        super().__init__(live=live)
+        self.signum = signum
+        self.signal_at = signal_at
+
+    def __iter__(self) -> Iterator[Frame]:
+        for frame in super().__iter__():
+            if frame.index == self.signal_at:
+                signal.raise_signal(self.signum)
+            yield frame
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_sigterm_from_live_source_finishes_cleanly() -> None:
+    src = _SignalSource(signal.SIGTERM, signal_at=100)
+    sink = ListSink()
+    report = _no_interrupt(
+        lambda: run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    )
+    assert report.interrupted is True
+    assert len(sink.images) == report.stats.frames == 100
+    assert (sink.closed, sink.aborted) == (1, 0)
+    assert src.closed == 1
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL  # Restored.
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_sigterm_on_non_live_source_aborts() -> None:
+    src = _SignalSource(signal.SIGTERM, signal_at=100, live=False)
+    sink = ListSink()
+    with pytest.raises(KeyboardInterrupt):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert (sink.closed, sink.aborted) == (0, 1)
+    assert src.closed == 1
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_sigterm_inside_a_live_step_is_deferred() -> None:
+    def terminate(n: int) -> None:
+        if n == 40:
+            signal.raise_signal(signal.SIGTERM)
+
+    src = FakeSource()
+    sink = ListSink(on_write=terminate)
+    report = _no_interrupt(
+        lambda: run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    )
+    assert report.interrupted is True
+    assert len(sink.images) == report.stats.frames == len(src.yielded)
+    assert len(src.yielded) < src.scene.total
+    assert (sink.closed, sink.aborted) == (1, 0)
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (signal.SIGTERM, signal.SIGTERM),
+        (signal.SIGINT, signal.SIGTERM),
+        (signal.SIGTERM, signal.SIGINT),
+    ],
+    ids=["term-term", "int-term", "term-int"],
+)
+def test_second_signal_inside_a_live_step_aborts(first: int, second: int) -> None:
+    def interrupt(n: int) -> None:
+        if n == 40:
+            signal.raise_signal(first)
+            signal.raise_signal(second)
+
+    src = FakeSource()
+    sink = ListSink(on_write=interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert (sink.closed, sink.aborted) == (0, 1)
+    assert src.closed == 1
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_second_sigterm_while_closing_a_live_run_aborts() -> None:
+    # The guard is removed before the close, so a SIGTERM there aborts, as a
+    # second Ctrl-C does.
+    src = _SignalSource(signal.SIGTERM, signal_at=50)
+    sink = ListSink()
+    real_close = sink.close
+
+    def close() -> None:
+        signal.raise_signal(signal.SIGTERM)
+        real_close()
+
+    sink.close = close  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    # The close was cut short by the interrupt (the engine then owns the sink's
+    # cleanup, as for a second Ctrl-C), and the process was not killed.
+    assert sink.closed == 0
+    assert src.closed == 1
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_sigterm_inside_a_non_live_step_aborts() -> None:
+    def terminate(n: int) -> None:
+        if n == 40:
+            signal.raise_signal(signal.SIGTERM)
+
+    src = FakeSource(live=False)
+    sink = ListSink(on_write=terminate)
+    with pytest.raises(KeyboardInterrupt):
+        run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert (sink.closed, sink.aborted) == (0, 1)
+    assert src.closed == 1
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_sigterm_handler_is_installed_only_during_the_run() -> None:
+    seen: list[Any] = []
+    src = FakeSource(Scene(total=30))
+    sink = ListSink(on_write=lambda n: seen.append(signal.getsignal(signal.SIGTERM)))
+    run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert seen and all(h != signal.SIG_DFL for h in seen)
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_custom_sigterm_handler_is_left_alone() -> None:
+    received: list[int] = []
+
+    def custom(signum: int, frame: object) -> None:
+        received.append(signum)
+
+    signal.signal(signal.SIGTERM, custom)
+
+    def terminate(n: int) -> None:
+        if n == 10:
+            signal.raise_signal(signal.SIGTERM)
+
+    src = FakeSource(Scene(total=30))
+    sink = ListSink(on_write=terminate)
+    report = run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert received == [signal.SIGTERM]
+    assert report.interrupted is False
+    assert len(sink.images) == 30
+    assert signal.getsignal(signal.SIGTERM) is custom
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+@NEEDS_DEFAULT_SIGTERM
+def test_run_off_the_main_thread_installs_no_signal_handler() -> None:
+    seen: list[Any] = []
+    errors: list[BaseException] = []
+    src = FakeSource(Scene(total=30))
+    sink = ListSink(on_write=lambda n: seen.append(
+        (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT))
+    ))
+
+    def work() -> None:
+        try:
+            run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+        except BaseException as exc:  # noqa: BLE001 (reported by the assertion below)
+            errors.append(exc)
+
+    thread = threading.Thread(target=work)
+    thread.start()
+    thread.join(timeout=60)
+    assert not thread.is_alive()
+    assert errors == []
+    assert len(sink.images) == 30
+    assert set(seen) == {(signal.SIG_DFL, signal.default_int_handler)}
+
+
+@pytest.mark.usefixtures("sigterm_restored")
+def test_run_on_a_platform_without_sigterm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(signal, "SIGTERM")
+    src = FakeSource(Scene(total=30))
+    sink = ListSink()
+    report = run_stream(src, _live_config("calibrate"), OutputConfig(), sinks=[sink])
+    assert len(sink.images) == report.stats.frames == 30
+    assert (sink.closed, sink.aborted) == (1, 0)
+
+
+SIGTERM_HELPER = Path(__file__).with_name("_helper_sigterm.py")
+HELPER_READY_AFTER = 30
+
+
+def _stop_helper_run(output: Path, signum: int) -> int:
+    """Run the helper, send ``signum`` once it is ready, and return its exit code."""
+    root = Path(__file__).resolve().parents[1]
+    # The log and the progress bar go to a file: a full stderr pipe could block the helper.
+    with output.with_suffix(".log").open("w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, str(SIGTERM_HELPER), str(output), str(HELPER_READY_AFTER)],
+            cwd=root,
+            env={**os.environ, "PYTHONPATH": str(root)},
+            stdout=subprocess.PIPE,
+            stderr=log,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            line = proc.stdout.readline()
+            assert line.strip() == "ready", line
+            proc.send_signal(signum)
+            out, _ = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=60)
+    log_text = output.with_suffix(".log").read_text()
+    assert "no signal" not in out, log_text[-2000:]
+    assert proc.returncode == 0, log_text[-2000:]
+    return proc.returncode
+
+
+def _frame_count(path: Path) -> int:
+    cap = cv2.VideoCapture(str(path))
+    try:
+        assert cap.isOpened()
+        count = 0
+        while cap.read()[0]:
+            count += 1
+    finally:
+        cap.release()
+    return count
+
+
+@NEEDS_FFMPEG
+@pytest.mark.skipif(not hasattr(signal, "SIGTERM") or sys.platform == "win32",
+                    reason="needs POSIX SIGTERM delivery")
+def test_sigterm_on_a_live_run_finalizes_the_recording_like_sigint(tmp_path: Path) -> None:
+    by_term = tmp_path / "term.mp4"
+    by_int = tmp_path / "int.mp4"
+    term_code = _stop_helper_run(by_term, signal.SIGTERM)
+    int_code = _stop_helper_run(by_int, signal.SIGINT)
+    assert term_code == int_code == 0
+    for path in (by_term, by_int):
+        assert path.exists()
+        assert _frame_count(path) >= HELPER_READY_AFTER  # Every frame up to the stop.
 
 
 def test_failing_non_critical_sink_is_dropped() -> None:
