@@ -18,6 +18,8 @@
  * working empty store, {"items": {...}} for a working store holding those
  * items, "missing" for no sessionStorage at all, "throws" when reading
  * window.sessionStorage throws, "methods_throw" when getItem and setItem throw.
+ * "hash" is the URL fragment the page sees (default: a fragment with a token;
+ * "" for none). "state_status" is the status /api/state answers (default 200).
  *
  * The stub records every element id set by the script, every attribute name
  * passed to setAttribute, every href and dataset key written, and every
@@ -26,7 +28,9 @@
  * index.html) it reports whether it is hidden or disabled, its text, its
  * attributes (from the markup, then as the script set them), the ids of the
  * static elements that contain it, and the same containment for every input
- * the script built. It also reports the focused element and the storage writes.
+ * the script built. It also reports the focused element and the storage writes,
+ * every fetch call (its URL, method, headers and credentials mode), and the
+ * src set on the two stream images.
  */
 "use strict";
 
@@ -38,7 +42,8 @@ const staticDir = process.argv[2];
 const scenario = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
 
 const record = {
-  ids: [], attributes: [], hrefs: [], dataset: [], opened: [], locations: [], storage: []
+  ids: [], attributes: [], hrefs: [], dataset: [], opened: [], locations: [], storage: [],
+  fetches: []
 };
 
 class Element {
@@ -179,7 +184,7 @@ const intervals = [];
 let currentState = scenario.state;
 const sent = [];
 const location = {
-  hash: "#token=harness-token-0123456789",
+  hash: "hash" in scenario ? scenario.hash : "#token=harness-token-0123456789",
   pathname: "/",
   search: "",
   assign(url) { record.locations.push(String(url)); },
@@ -212,12 +217,20 @@ function respond(status, body) {
 }
 
 function fetch(url, options) {
+  record.fetches.push({
+    url: String(url),
+    method: options && options.method,
+    headers: Object.assign({}, options && options.headers),
+    credentials: options && options.credentials
+  });
   if (options && options.method === "PATCH") {
     sent.push(JSON.parse(options.body));
     const reply = scenario.patch_response || { status: 200, body: {} };
     return respond(reply.status, reply.body);
   }
-  return respond(200, currentState);
+  return respond("state_status" in scenario ? scenario.state_status : 200,
+    "state_status" in scenario && scenario.state_status !== 200 ? { error: "Unauthorized" }
+      : currentState);
 }
 
 const context = vm.createContext({
@@ -322,6 +335,11 @@ function describe(el) {
       .map((el) => ({ tag: el.tagName, text: el.textContent, htmlFor: el.htmlFor })),
     errors: created.filter((el) => el.className === "error").map((el) => el.textContent),
     sent: sent,
+    streams: {
+      processed: staticById["stream-processed"].src === undefined ? null
+        : staticById["stream-processed"].src,
+      raw: staticById["stream-raw"].src === undefined ? null : staticById["stream-raw"].src
+    },
     record: record
   };
   process.stdout.write(JSON.stringify(report));

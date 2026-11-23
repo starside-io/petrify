@@ -398,6 +398,17 @@ A frame that cannot be processed safely is written black and counted: a detector
 Web page (this link gives control of this run to whoever has it): http://127.0.0.1:PORT/#token=...
 ```
 
+To log in with a password instead, set `PETRIFY_WEB_PASSWORD` in the environment before the run (there is no flag, so the password does not show in the process list, and there is no default password):
+
+```
+read -rs PETRIFY_WEB_PASSWORD && export PETRIFY_WEB_PASSWORD
+petrify run --source camera:0 --web
+```
+
+`read -rs` asks for the password without echoing it, so it stays out of the shell history.
+
+petrify then makes no token and prints `Web page (protected by PETRIFY_WEB_PASSWORD): http://127.0.0.1:PORT/`. The browser asks for the password on its own login prompt (any user name is accepted) and remembers it until the browser is quit, so reloading the page works. The page is still served on `127.0.0.1` only. When the variable is unset or empty, the token link is used as before; a value of only spaces is refused.
+
 The page shows the processed feed (what the outputs receive), the run's status (source, background state, frame counters, frames failed closed and dropped, output frame rate, detect, render, and write timings, the mean and last call time of each detector and refiner, the ROI in use, the last error), a settings form, and a button that stops the run and finalizes the outputs. While the run is in progress the page can change:
 
 - the detector (`motion`, `person`, `both`)
@@ -420,6 +431,7 @@ Security model:
 
 - The server listens on `127.0.0.1` only, and every request must carry a `Host` of exactly `127.0.0.1:PORT`. Use the printed `http://127.0.0.1:PORT/` link: `localhost` is refused on purpose, because the server does not listen on `[::1]`, where another local user could.
 - The link holds a per-run token. Whoever has the link controls the run, so do not share it. The token is never logged, and the server's access log is off.
+- With `PETRIFY_WEB_PASSWORD` set, every request, the page itself included, needs the password (HTTP Basic), and the token is not accepted. Because the browser sends a remembered password by itself, a request that the browser marks as coming from another site is refused. The password is never printed or logged.
 - The unprocessed input feed is never served unless the run was started with `--web-raw-preview`, which shows it next to the processed feed and lists it as a weakened protection.
 - The page does not protect against the active mode: a plugin mode runs in the petrify process and receives the unprocessed frames whatever the page shows.
 - Text that comes from a plugin (its description, option help, weakened sentences, error messages) is shown as plain text, with control and formatting characters removed and the length capped. Text from package metadata (mode names, package names, versions) is reduced to printable ASCII, other characters shown as `?`, so a name cannot pass for another mode's. Only runtime mode options can be changed, and a numeric one only within the bounds the mode declares.
@@ -460,7 +472,7 @@ WEB_PORT=8766
 PETRIFY_MODEL_DIR=/var/lib/petrify/models
 ```
 
-Start it with `systemctl enable --now petrify@front`. `$$` and `%%` are systemd's escapes for `$` and `%`, so the shell expands the variables and `date` on every start. Use the full path of `petrify` if it is not on the service's `PATH`, and leave out `--web` if the page is not needed: the page link with its token is printed to the service's log, so whoever can read that log can control the run (from reading the code: the link goes to stderr, which systemd logs; not tested under systemd).
+Start it with `systemctl enable --now petrify@front`. `$$` and `%%` are systemd's escapes for `$` and `%`, so the shell expands the variables and `date` on every start. Use the full path of `petrify` if it is not on the service's `PATH`, and leave out `--web` if the page is not needed: the page link with its token is printed to the service's log, so whoever can read that log can control the run (from reading the code: the link goes to stderr, which systemd logs; not tested under systemd). With `PETRIFY_WEB_PASSWORD` set (an `Environment=` line, or a line in the `EnvironmentFile=`, kept readable only by the service), no link with a token is logged.
 
 ### What a stop does to the recording
 

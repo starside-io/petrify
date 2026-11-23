@@ -6,6 +6,7 @@ uvicorn server on 127.0.0.1 with an ephemeral port. No browser, no device.
 
 from __future__ import annotations
 
+import base64
 import html.parser
 import json
 import logging
@@ -1309,7 +1310,9 @@ def test_t13b_app_js_builds_no_id_attribute_link_or_navigation_from_data() -> No
     for forbidden in (".href", "dataset", "window.open", "location.href", "location.assign",
                       "location.replace", "location =", "createElement(tag", "src ="):
         if forbidden == "src =":
-            assert not re.search(r'\.src\s*=\s*(?!\s|"/(?:stream|raw)\.mjpg\?token=")', js)
+            # Only the two stream paths, with the token or (password mode) bare.
+            assert not re.search(
+                r'\.src\s*=\s*(?!\s|"/(?:stream|raw)\.mjpg(?:\?token="|";))', js)
             continue
         if forbidden == "createElement(tag":
             # Tags are literals, or the tag parameter of element(), whose callers pass literals.
@@ -1378,13 +1381,17 @@ def _run_page(tmp_path: Path, state: dict, *, actions: list[dict] | None = None,
               patch_response: dict | None = None,
               later_states: list[dict] | None = None,
               tab_actions: list[dict] | None = None,
-              session_storage: str | dict | None = None) -> dict:
+              session_storage: str | dict | None = None, hash: str | None = None,
+              state_status: int | None = None) -> dict:
     scenario = tmp_path / "scenario.json"
-    scenario.write_text(json.dumps({"state": state, "actions": actions or [],
-                                    "patch_response": patch_response,
-                                    "later_states": later_states or [],
-                                    "tab_actions": tab_actions or [],
-                                    "session_storage": session_storage}), encoding="utf-8")
+    data = {"state": state, "actions": actions or [], "patch_response": patch_response,
+            "later_states": later_states or [], "tab_actions": tab_actions or [],
+            "session_storage": session_storage}
+    if hash is not None:
+        data["hash"] = hash
+    if state_status is not None:
+        data["state_status"] = state_status
+    scenario.write_text(json.dumps(data), encoding="utf-8")
     result = subprocess.run([NODE, str(HARNESS), str(STATIC_DIR), str(scenario)],
                             capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stderr
@@ -1885,3 +1892,239 @@ def test_w2_plugin_and_server_text_in_the_panel_stays_text(tmp_path: Path) -> No
     assert report["weakened"][1] == "Second <i>weakened</i> sentence."
     assert all(child["children"] == [] for row in report["modeList"] for child in row["children"])
     assert not [i for i in report["record"]["ids"] if "<" in i]
+
+
+# ---------------------------------------------------------------------------
+# Password mode (PETRIFY_WEB_PASSWORD): HTTP Basic on every route
+# ---------------------------------------------------------------------------
+
+PASSWORD = "correct horse b\u00e4ttery"
+CHALLENGE = 'Basic realm="petrify", charset="UTF-8"'
+
+
+def _basic(user: str, password: str) -> dict[str, str]:
+    raw = f"{user}:{password}".encode()
+    return {"Authorization": "Basic " + base64.b64encode(raw).decode("ascii")}
+
+
+BASIC = _basic("anyone", PASSWORD)
+EVERY_ROUTE = PUBLIC + PROTECTED
+
+
+@pytest.fixture
+def password_client(control: RunControl) -> Iterator[TestClient]:
+    _ended(control)
+    app = create_app(control, ScriptedFeed([]), password=PASSWORD, port=PORT)  # type: ignore[arg-type]
+    with _client(app) as c:
+        yield c
+
+
+@pytest.mark.parametrize(("method", "path"), EVERY_ROUTE)
+def test_password_mode_every_route_needs_credentials(
+    password_client: TestClient, method: str, path: str
+) -> None:
+    response = _request(password_client, method, path)
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == CHALLENGE
+    assert response.json() == {"error": "Unauthorized"}
+    for name, value in EXPECTED_SECURITY_HEADERS.items():
+        assert response.headers.get(name) == value
+
+
+@pytest.mark.parametrize(("method", "path"), EVERY_ROUTE)
+@pytest.mark.parametrize("user", ["anyone", "", "admin", "\u00e9l\u00e8ve"])
+def test_password_mode_the_right_password_with_any_user_passes(
+    password_client: TestClient, method: str, path: str, user: str
+) -> None:
+    response = _request(password_client, method, path, headers=_basic(user, PASSWORD))
+    assert response.status_code == 200
+    assert "www-authenticate" not in response.headers
+
+
+def test_password_mode_a_password_with_a_colon_is_whole() -> None:
+    control = RunControl(PetrifyConfig(), (W, H))
+    app = create_app(control, ScriptedFeed([]), password="a:b:c", port=PORT)  # type: ignore[arg-type]
+    with _client(app) as c:
+        assert c.get("/api/state", headers=_basic("u", "a:b:c")).status_code == 200
+        # The user name ends at the first colon (RFC 7617), so the rest is the password.
+        assert c.get("/api/state", headers=_basic("u:a", "b:c")).status_code == 200
+        assert c.get("/api/state", headers=_basic("u", "a:b")).status_code == 401
+
+
+@pytest.mark.parametrize(("method", "path"), EVERY_ROUTE)
+@pytest.mark.parametrize(
+    "headers",
+    [
+        _basic("anyone", "wrong"),
+        _basic("anyone", PASSWORD + "x"),
+        _basic("anyone", PASSWORD[:-1]),
+        _basic(PASSWORD, ""),
+        {"Authorization": "Basic " + base64.b64encode(PASSWORD.encode()).decode()},
+        {"Authorization": "Basic !!!not-base64!!!"},
+        {"Authorization": "Basic " + base64.b64encode(b"\xff\xfe:x").decode()},
+        {"Authorization": "Basic "},
+        {"Authorization": "Basic"},
+        {"Authorization": f"Bearer {PASSWORD}".encode()},
+        {"Authorization": f"Bearer {TOKEN}"},
+        {"Authorization": b"Basic \xe9t\xe9"},
+    ],
+    ids=["wrong", "longer", "shorter", "user-only", "no-colon", "bad-base64", "bad-utf8",
+         "empty", "no-value", "bearer-password", "bearer-token", "non-ascii"],
+)
+def test_password_mode_rejects_bad_credentials(
+    password_client: TestClient, method: str, path: str, headers: dict[str, Any]
+) -> None:
+    response = _request(password_client, method, path, headers=headers)
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == CHALLENGE
+    assert response.json() == {"error": "Unauthorized"}
+
+
+def test_password_mode_ignores_a_token_in_the_query(password_client: TestClient) -> None:
+    assert password_client.get(f"/stream.mjpg?token={PASSWORD}").status_code == 401
+    assert password_client.get(f"/stream.mjpg?token={TOKEN}").status_code == 401
+    assert password_client.get("/stream.mjpg", headers=BASIC).status_code == 200
+
+
+@pytest.mark.parametrize(("method", "path"), EVERY_ROUTE)
+@pytest.mark.parametrize("site", ["cross-site", "same-site", "CROSS-SITE", "bogus", ""])
+def test_password_mode_refuses_other_fetch_sites(
+    password_client: TestClient, method: str, path: str, site: str
+) -> None:
+    response = _request(password_client, method, path,
+                        headers={**BASIC, "Sec-Fetch-Site": site})
+    assert response.status_code == 403
+    assert response.json() == {"error": "Forbidden"}
+    # Refused before the credentials are looked at: no challenge for the browser to show.
+    assert "www-authenticate" not in response.headers
+    without = _request(password_client, method, path, headers={"Sec-Fetch-Site": site})
+    assert without.status_code == 403
+
+
+@pytest.mark.parametrize(("method", "path"), EVERY_ROUTE)
+@pytest.mark.parametrize("site", ["same-origin", "none", "Same-Origin", None])
+def test_password_mode_allows_same_origin_and_direct_requests(
+    password_client: TestClient, method: str, path: str, site: str | None
+) -> None:
+    headers = dict(BASIC)
+    if site is not None:
+        headers["Sec-Fetch-Site"] = site
+    assert _request(password_client, method, path, headers=headers).status_code == 200
+
+
+def test_token_mode_does_not_check_fetch_sites(client: TestClient) -> None:
+    # Token mode has no ambient credentials, so it is unchanged.
+    response = client.get("/api/state", headers={**AUTH, "Sec-Fetch-Site": "cross-site"})
+    assert response.status_code == 200
+    assert "www-authenticate" not in client.get("/api/state").headers
+
+
+def test_password_mode_keeps_the_host_and_origin_checks(password_client: TestClient) -> None:
+    assert password_client.get("/", headers={**BASIC, "host": "localhost:8765"}).status_code == 400
+    assert password_client.get("/", headers={**BASIC, "host": "evil.example"}).status_code == 400
+    for method, path in (("PATCH", "/api/config"), ("POST", "/api/stop")):
+        bad = _request(password_client, method, path,
+                       headers={**BASIC, "Origin": "http://evil.example"})
+        assert bad.status_code == 403
+    good = _request(password_client, "PATCH", "/api/config",
+                    headers={**BASIC, "Origin": ORIGIN})
+    assert good.status_code == 200
+    text = _request(password_client, "PATCH", "/api/config",
+                    headers={**BASIC, "Content-Type": "text/plain"})
+    assert text.status_code == 415
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"token": TOKEN, "password": PASSWORD}],
+    ids=["neither", "both"],
+)
+def test_create_app_needs_exactly_one_of_token_and_password(
+    control: RunControl, kwargs: dict[str, str]
+) -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        create_app(control, MjpegSink(), port=PORT, **kwargs)
+
+
+@pytest.mark.parametrize("password", ["", " ", "\t\n"])
+def test_create_app_refuses_an_empty_password(control: RunControl, password: str) -> None:
+    with pytest.raises(ValueError, match="password"):
+        create_app(control, MjpegSink(), password=password, port=PORT)
+
+
+def test_password_mode_real_server_never_logs_the_password(
+    control: RunControl, all_logs: _Collect
+) -> None:
+    sink = MjpegSink(max_fps=None)
+    app = create_app(control, sink, password=PASSWORD, port=0)
+    handle = serve_in_thread(app, 0)
+    try:
+        base = f"http://127.0.0.1:{handle.port}"
+        with httpx.Client(base_url=base, timeout=10.0) as http:
+            page = http.get("/")
+            assert page.status_code == 401
+            assert page.headers["www-authenticate"] == CHALLENGE
+            assert http.get("/", auth=("me", PASSWORD)).status_code == 200
+            assert http.get("/static/app.js", auth=("me", PASSWORD)).status_code == 200
+            assert http.get("/api/state", auth=("me", "nope")).status_code == 401
+            assert http.get("/api/state", auth=("me", PASSWORD)).status_code == 200
+    finally:
+        handle.stop()
+    encoded = base64.b64encode(f"me:{PASSWORD}".encode()).decode()
+    for record in _server_records(all_logs):
+        text = _record_text(record)
+        assert PASSWORD not in text and encoded not in text
+
+
+@needs_node
+def test_page_without_a_fragment_token_sends_no_token_and_lets_the_browser_authenticate(
+    tmp_path: Path,
+) -> None:
+    report = _run_page(tmp_path, _state(None, None, raw_preview=True), hash="")
+    assert report["hidden"]["token-missing"] is True
+    assert report["text"]["run-state"] == "Run: Running"
+    fetches = report["record"]["fetches"]
+    assert fetches and all(f["url"] == "/api/state" for f in fetches)
+    for call in fetches:
+        assert "Authorization" not in call["headers"]
+        assert call["credentials"] == "same-origin"
+        assert "token" not in call["url"]
+    assert report["streams"] == {"processed": "/stream.mjpg", "raw": "/raw.mjpg"}
+
+
+@needs_node
+def test_page_without_a_token_shows_not_authorized_only_after_a_401(tmp_path: Path) -> None:
+    report = _run_page(tmp_path, _state(None, None), hash="", state_status=401)
+    assert report["hidden"]["token-missing"] is False
+    assert report["text"]["run-state"] == "Not authorized"
+    assert report["streams"] == {"processed": None, "raw": None}
+
+
+@needs_node
+def test_page_with_a_fragment_token_still_sends_it(tmp_path: Path) -> None:
+    report = _run_page(tmp_path, _state(None, None, raw_preview=True))
+    assert report["hidden"]["token-missing"] is True
+    fetches = report["record"]["fetches"]
+    assert fetches
+    for call in fetches:
+        assert call["headers"]["Authorization"] == "Bearer harness-token-0123456789"
+        assert call["credentials"] == "omit"
+    assert report["streams"] == {
+        "processed": "/stream.mjpg?token=harness-token-0123456789",
+        "raw": "/raw.mjpg?token=harness-token-0123456789",
+    }
+
+
+@needs_node
+def test_page_with_a_wrong_fragment_token_does_not_claim_a_missing_password(
+    tmp_path: Path,
+) -> None:
+    report = _run_page(tmp_path, _state(None, None), state_status=401)
+    assert report["hidden"]["token-missing"] is True
+    assert report["text"]["run-state"].startswith("Cannot reach petrify")
+
+
+def test_page_notice_mentions_both_ways_in() -> None:
+    text = " ".join((STATIC_DIR / "index.html").read_text(encoding="utf-8").split())
+    assert "Open the full link printed in the terminal" in text
+    assert "PETRIFY_WEB_PASSWORD" in text

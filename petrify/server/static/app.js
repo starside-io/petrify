@@ -34,12 +34,15 @@
     return value;
   }
 
+  /* With a token from the link, every request carries it and no credentials.
+     Without one, the run may use a password (HTTP Basic): the browser then adds
+     the credentials it remembers to same-origin requests by itself. */
   function api(method, path, body) {
     var options = {
       method: method,
-      headers: { "Authorization": "Bearer " + token },
+      headers: token ? { "Authorization": "Bearer " + token } : {},
       cache: "no-store",
-      credentials: "omit",
+      credentials: token ? "omit" : "same-origin",
       referrerPolicy: "no-referrer"
     };
     if (body !== undefined) {
@@ -549,14 +552,32 @@
     showMode(state.mode, state.modes);
     if (!streamsStarted && !state.ended) {
       streamsStarted = true;
-      $("stream-processed").src = "/stream.mjpg?token=" + encodeURIComponent(token);
+      /* Without a token the browser sends its remembered password by itself. */
+      if (token) {
+        $("stream-processed").src = "/stream.mjpg?token=" + encodeURIComponent(token);
+      } else {
+        $("stream-processed").src = "/stream.mjpg";
+      }
       if (state.raw_preview) {
-        $("stream-raw").src = "/raw.mjpg?token=" + encodeURIComponent(token);
+        if (token) {
+          $("stream-raw").src = "/raw.mjpg?token=" + encodeURIComponent(token);
+        } else {
+          $("stream-raw").src = "/raw.mjpg";
+        }
       }
     }
     if (state.ended) {
       end("The run has ended. The feed and the settings are no longer live.");
     }
+  }
+
+  function notAuthorized() {
+    if (pollTimer !== null) {
+      window.clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    $("token-missing").hidden = false;
+    text("run-state", "Not authorized");
   }
 
   function end(message) {
@@ -590,6 +611,10 @@
 
   function poll() {
     api("GET", "/api/state").then(function (result) {
+      if (result.status === 401 && !token) {
+        notAuthorized();
+        return;
+      }
       if (result.status !== 200) {
         throw new Error("status " + result.status);
       }
@@ -825,11 +850,6 @@
 
   function start() {
     wireTabs();
-    if (!token) {
-      $("token-missing").hidden = false;
-      text("run-state", "No access token");
-      return;
-    }
     wire();
     poll();
     pollTimer = window.setInterval(poll, POLL_MS);

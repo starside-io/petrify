@@ -24,16 +24,30 @@ other page open in the user's browser is treated as hostile. The server binds
 to ``127.0.0.1`` only; every request must carry a ``Host`` of exactly
 ``127.0.0.1:<port>`` (defeats DNS rebinding). ``localhost`` is refused: the
 server does not listen on ``[::1]``, where another local user could, so a link
-through ``localhost`` could reach that impostor. Every route except the page
-and its assets needs the per-run token (a Bearer header, or a ``token`` query
-parameter on the two stream routes only); ``PATCH`` and ``POST`` accept no
-``Origin`` other than ``http://127.0.0.1:<port>``; ``PATCH`` needs a JSON
-content type and a small body. There are no redirects (a trailing slash is a
-404, so a token in the query is never echoed in a ``Location``). No CORS
-headers are sent, and every response carries no-store, nosniff, no-referrer,
-frame-deny, same-origin resource and opener policies and a strict
-Content-Security-Policy. The token is never logged, and uvicorn's access log is
-off.
+through ``localhost`` could reach that impostor.
+
+The app runs in one of two access modes, chosen by :func:`create_app`:
+
+- Token mode (the default for ``petrify run --web``): every route except the
+  page and its assets needs the per-run token (a Bearer header, or a ``token``
+  query parameter on the two stream routes only). The page reads the token
+  from the URL fragment.
+- Password mode (``PETRIFY_WEB_PASSWORD`` set): every route, the page and its
+  assets included, needs HTTP Basic credentials. Any user name is accepted and
+  only the password is checked; a request without valid credentials gets a 401
+  with a ``WWW-Authenticate: Basic`` challenge, so the browser asks for the
+  password and then sends it on every same-origin request by itself. Bearer
+  tokens and the ``token`` query parameter are not accepted. Because those
+  credentials are ambient, any request whose ``Sec-Fetch-Site`` header is
+  present and is neither ``same-origin`` nor ``none`` is refused with a 403.
+
+In both modes ``PATCH`` and ``POST`` accept no ``Origin`` other than
+``http://127.0.0.1:<port>``; ``PATCH`` needs a JSON content type and a small
+body. There are no redirects (a trailing slash is a 404, so a token in the
+query is never echoed in a ``Location``). No CORS headers are sent, and every
+response carries no-store, nosniff, no-referrer, frame-deny, same-origin
+resource and opener policies and a strict Content-Security-Policy. The token
+and the password are never logged, and uvicorn's access log is off.
 
 Connections: uvicorn serves at most :data:`LIMIT_CONCURRENCY` connections at
 once (it answers 503 beyond that) and closes an idle keep-alive connection
@@ -42,11 +56,13 @@ headers never finish, so a local process can still occupy connection slots and
 make the page unreachable for a while; it cannot read or change anything, and
 the processing loop is not affected.
 
-The token holder can change any runtime setting within the ranges of
+Whoever holds the token or the password can change any runtime setting within the ranges of
 :mod:`petrify.server.control`; the settings that weaken the protection are
 listed on the page (``weakened`` in the state).
 """
 
+import base64
+import binascii
 import json
 import logging
 import secrets
@@ -89,6 +105,9 @@ SECURITY_HEADERS: dict[str, str] = {
     "Cross-Origin-Opener-Policy": "same-origin",
 }
 
+BASIC_CHALLENGE = 'Basic realm="petrify", charset="UTF-8"'
+ALLOWED_FETCH_SITES = ("same-origin", "none")
+
 _STATIC_TYPES = {
     "app.js": "text/javascript; charset=utf-8",
     "app.css": "text/css; charset=utf-8",
@@ -124,8 +143,9 @@ def _static_bytes(name: str) -> bytes:
 class _ServerState:
     """Per-app settings shared by the middleware and the routes."""
 
-    token: str
+    token: str | None
     port: int
+    password: str | None = None
     closing: threading.Event = field(default_factory=threading.Event)
 
     def allowed_hosts(self) -> tuple[str]:
@@ -135,8 +155,34 @@ class _ServerState:
         return (f"http://127.0.0.1:{self.port}",)
 
 
+def basic_password_ok(header: str | None, expected: bytes) -> bool:
+    """Whether an ``Authorization`` header carries HTTP Basic credentials with ``expected``.
+
+    Any user name is accepted; only the password (UTF-8 bytes) is compared, in
+    constant time. A missing or malformed header is simply not authorized.
+    """
+    if not header:
+        return False
+    scheme, _, value = header.strip().partition(" ")
+    if scheme.lower() != "basic":
+        return False
+    try:
+        decoded = base64.b64decode(value.strip().encode("ascii"), validate=True)
+    except (binascii.Error, UnicodeEncodeError, ValueError):
+        return False
+    _user, colon, supplied = decoded.partition(b":")
+    if not colon:
+        return False
+    return secrets.compare_digest(supplied, expected)
+
+
 class _SecurityMiddleware:
-    """Pure ASGI middleware: Host check, security headers, and a minimal 500 on any error."""
+    """Pure ASGI middleware: Host check, security headers, and a minimal 500 on any error.
+
+    In password mode it also refuses cross-site requests (``Sec-Fetch-Site``) and
+    requires HTTP Basic credentials on every route, the page and its assets
+    included.
+    """
 
     def __init__(self, app: Any, state: _ServerState) -> None:
         self.app = app
@@ -176,6 +222,20 @@ class _SecurityMiddleware:
         if host not in self.state.allowed_hosts():
             await _send_json(send_secured, 400, {"error": _STATUS_MESSAGES[400]})
             return
+        if self.state.password is not None:
+            fetch_site = _header(scope, b"sec-fetch-site")
+            if fetch_site is not None and fetch_site.strip().lower() not in ALLOWED_FETCH_SITES:
+                await _send_json(send_secured, 403, {"error": _STATUS_MESSAGES[403]})
+                return
+            expected = self.state.password.encode("utf-8")
+            if not basic_password_ok(_header(scope, b"authorization"), expected):
+                await _send_json(
+                    send_secured,
+                    401,
+                    {"error": _STATUS_MESSAGES[401]},
+                    extra_headers=[(b"www-authenticate", BASIC_CHALLENGE.encode("ascii"))],
+                )
+                return
         try:
             await self.app(scope, receive, send_secured)
         except Exception as exc:  # noqa: BLE001
@@ -188,7 +248,20 @@ class _SecurityMiddleware:
 _LOWER_SECURITY = {k.lower() for k in SECURITY_HEADERS}
 
 
-async def _send_json(send: Any, status: int, payload: dict[str, Any]) -> None:
+def _header(scope: dict[str, Any], name: bytes) -> str | None:
+    for key, value in scope.get("headers", []):
+        if key == name:
+            return value.decode("latin-1")
+    return None
+
+
+async def _send_json(
+    send: Any,
+    status: int,
+    payload: dict[str, Any],
+    *,
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+) -> None:
     body = json.dumps(payload).encode("utf-8")
     await send(
         {
@@ -197,6 +270,7 @@ async def _send_json(send: Any, status: int, payload: dict[str, Any]) -> None:
             "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(body)).encode("ascii")),
+                *(extra_headers or []),
             ],
         }
     )
@@ -207,7 +281,8 @@ def create_app(
     control: RunControl,
     processed: MjpegSink,
     *,
-    token: str,
+    token: str | None = None,
+    password: str | None = None,
     raw: MjpegSink | None = None,
     port: int,
 ) -> "FastAPI":
@@ -217,8 +292,12 @@ def create_app(
     (``/raw.mjpg`` does not exist when it is None; when it is given, the control
     lists the raw preview as a weakened protection). ``port`` is the port the
     browser uses, checked in the ``Host`` and ``Origin`` headers; with 0,
-    :func:`serve_in_thread` fills in the bound port. Raises ``RuntimeError`` when
-    FastAPI or uvicorn is missing.
+    :func:`serve_in_thread` fills in the bound port.
+
+    Exactly one of ``token`` (token mode) and ``password`` (password mode, HTTP
+    Basic) must be given; see the module docstring. Raises ``ValueError`` when
+    neither or both are given, or when the one given is unusable, and
+    ``RuntimeError`` when FastAPI or uvicorn is missing.
     """
     require_web()
     import anyio  # noqa: PLC0415
@@ -227,12 +306,18 @@ def create_app(
     from fastapi.responses import JSONResponse, Response, StreamingResponse  # noqa: PLC0415
     from starlette.exceptions import HTTPException  # noqa: PLC0415
 
-    if not isinstance(token, str) or len(token) < 16:
+    if (token is None) == (password is None):
+        raise ValueError("Give exactly one of a session token and a password")
+    if password is not None:
+        if not isinstance(password, str) or not password.strip():
+            raise ValueError("The password must be a non-empty string, not only whitespace")
+    elif not isinstance(token, str) or len(token) < 16:
         raise ValueError("The session token must be a string of at least 16 characters")
-    state = _ServerState(token=token, port=int(port))
+    state = _ServerState(token=token, port=int(port), password=password)
     index_html = _static_bytes("index.html")
     static_files = {name: _static_bytes(name) for name in _STATIC_TYPES}
-    token_bytes = token.encode("utf-8")
+    token_bytes = token.encode("utf-8") if token is not None else None
+    password_bytes = password.encode("utf-8") if password is not None else None
 
     if raw is not None:
         control.mark_raw_preview()
@@ -242,7 +327,14 @@ def create_app(
     app.add_middleware(_SecurityMiddleware, state=state)
 
     def error(status: int, message: str | None = None) -> JSONResponse:
-        return JSONResponse({"error": message or _STATUS_MESSAGES.get(status, "Error")}, status)
+        headers = (
+            {"WWW-Authenticate": BASIC_CHALLENGE}
+            if status == 401 and password_bytes is not None
+            else None
+        )
+        return JSONResponse(
+            {"error": message or _STATUS_MESSAGES.get(status, "Error")}, status, headers=headers
+        )
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
@@ -253,6 +345,11 @@ def create_app(
         return error(422)
 
     def authorized(request: Request, *, allow_query: bool) -> bool:
+        if password_bytes is not None:
+            # The middleware already checked it; checked again so no route relies on it alone.
+            return basic_password_ok(request.headers.get("authorization"), password_bytes)
+        if token_bytes is None:
+            return False
         supplied: str | None = None
         header = request.headers.get("authorization")
         if header is not None:

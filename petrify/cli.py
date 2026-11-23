@@ -22,6 +22,7 @@ import argparse
 import dataclasses
 import logging
 import math
+import os
 import secrets
 import sys
 from pathlib import Path
@@ -1096,6 +1097,12 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
         parser.error("--web-raw-preview requires --web")
     if not 0 <= args.web_port <= 65535:
         parser.error(f"--web-port must be in 0..65535, got {args.web_port}")
+    if args.web:
+        password = os.environ.get(WEB_PASSWORD_ENV)
+        if password and not password.strip():
+            parser.error(
+                f"{WEB_PASSWORD_ENV} holds only whitespace; set a real password or unset it"
+            )
 
     if not (0.0 < args.downsample <= 1.0):
         parser.error(f"--downsample must be in (0, 1], got {args.downsample}")
@@ -1624,6 +1631,17 @@ def _run_main(argv: list[str]) -> int:
     return 0
 
 
+WEB_PASSWORD_ENV = "PETRIFY_WEB_PASSWORD"
+
+
+def _web_password() -> str | None:
+    """The page password from :data:`WEB_PASSWORD_ENV`, or None when it is unset or empty.
+
+    A whitespace-only value is refused earlier, as a usage error.
+    """
+    return os.environ.get(WEB_PASSWORD_ENV) or None
+
+
 def _run_with_web(
     args: argparse.Namespace,
     settings: _RunSettings,
@@ -1637,7 +1655,9 @@ def _run_with_web(
     The processing loop stays on the calling (main) thread; the server runs on a
     daemon thread and is stopped when the run ends for any reason. The process
     does not wait after the run: the page then reports that the run has ended.
-    The link printed here is the only place the token is shown. ``factory`` is
+    The link printed here is the only place the token is shown. With
+    :data:`WEB_PASSWORD_ENV` set, the page asks for that password (HTTP Basic)
+    instead, no token is made, and the password is never printed. ``factory`` is
     the loaded mode and ``modes`` the listed ones (metadata only), for the page.
     """
     from petrify.pipeline import OutputsKeptInterrupt, run_stream  # noqa: PLC0415
@@ -1646,7 +1666,8 @@ def _run_with_web(
     from petrify.sinks.mjpeg import MjpegSink  # noqa: PLC0415
 
     try:
-        token = secrets.token_urlsafe(32)
+        password = _web_password()
+        token = None if password is not None else secrets.token_urlsafe(32)
         control = RunControl(
             settings.config,
             (source.info.width, source.info.height),
@@ -1655,18 +1676,28 @@ def _run_with_web(
         )
         processed = MjpegSink()
         raw = MjpegSink() if args.web_raw_preview else None
-        app = create_app(control, processed, token=token, raw=raw, port=args.web_port)
+        if password is not None:
+            app = create_app(control, processed, password=password, raw=raw, port=args.web_port)
+        else:
+            app = create_app(control, processed, token=token, raw=raw, port=args.web_port)
         handle = serve_in_thread(app, args.web_port)
     except BaseException:
         source.close()
         raise
     try:
-        print(
-            f"Web page (this link gives control of this run to whoever has it): "
-            f"http://127.0.0.1:{handle.port}/#token={token}",
-            file=sys.stderr,
-            flush=True,
-        )
+        if password is not None:
+            print(
+                f"Web page (protected by {WEB_PASSWORD_ENV}): http://127.0.0.1:{handle.port}/",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"Web page (this link gives control of this run to whoever has it): "
+                f"http://127.0.0.1:{handle.port}/#token={token}",
+                file=sys.stderr,
+                flush=True,
+            )
         run_stream(
             source,
             settings.config,

@@ -38,6 +38,12 @@ from petrify.pipeline import OutputConfig, RunReport
 IN = "in.mp4"
 OUT = "out.mp4"
 
+
+@pytest.fixture(autouse=True)
+def _no_web_password_from_shell(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a PETRIFY_WEB_PASSWORD set in the developer's shell out of these tests."""
+    monkeypatch.delenv("PETRIFY_WEB_PASSWORD", raising=False)
+
 NON_DEFAULT_ARGV = (
     # ROI / Compositor
     "--roi", "10", "20", "320", "80",
@@ -963,6 +969,65 @@ def test_web_tokens_differ_per_run(
     _, second, _ = _web_run(["--source", IN, "--web", "--web-port", "0"], capsys, caplog)
     a, b = _WEB_LINE.search(first), _WEB_LINE.search(second)
     assert a is not None and b is not None and a.group(2) != b.group(2)
+
+
+_WEB_PASSWORD = "cli-p\u00e4ssword-Zq7"
+
+
+def test_web_password_mode_prints_no_token_and_never_the_password(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import petrify.server.app as server_app
+
+    monkeypatch.setenv("PETRIFY_WEB_PASSWORD", _WEB_PASSWORD)
+    real_create_app = server_app.create_app
+    seen: dict[str, Any] = {}
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real_create_app(*args, **kwargs)
+
+    monkeypatch.setattr(server_app, "create_app", spy)
+    rs, err, logs = _web_run(["--source", IN, "--web", "--web-port", "0"], capsys, caplog)
+    assert seen["password"] == _WEB_PASSWORD and "token" not in seen
+    assert "#token=" not in err and "token=" not in err
+    assert _WEB_PASSWORD not in err and _WEB_PASSWORD not in logs
+    lines = [line for line in err.splitlines() if "Web page" in line]
+    assert len(lines) == 1
+    assert re.fullmatch(
+        r"Web page \(protected by PETRIFY_WEB_PASSWORD\): http://127\.0\.0\.1:\d+/", lines[0])
+    assert "petrify-web" in rs.seen["threads"]  # type: ignore[attr-defined]
+
+
+def test_web_empty_password_keeps_token_mode(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("PETRIFY_WEB_PASSWORD", "")
+    _, err, _ = _web_run(["--source", IN, "--web", "--web-port", "0"], capsys, caplog)
+    assert _WEB_LINE.search(err) is not None
+    assert "PETRIFY_WEB_PASSWORD" not in err
+
+
+@pytest.mark.parametrize("value", [" ", "\t", "  \n "])
+def test_web_whitespace_only_password_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch, run_stream: mock.MagicMock,
+    capsys: pytest.CaptureFixture[str], value: str,
+) -> None:
+    monkeypatch.setenv("PETRIFY_WEB_PASSWORD", value)
+    with pytest.raises(SystemExit) as excinfo:
+        main(["run", "--source", IN, "--web"])
+    assert excinfo.value.code == 2
+    assert "PETRIFY_WEB_PASSWORD holds only whitespace" in capsys.readouterr().err
+    run_stream.assert_not_called()
+
+
+def test_web_password_is_ignored_without_web(
+    monkeypatch: pytest.MonkeyPatch, run_stream: mock.MagicMock
+) -> None:
+    monkeypatch.setenv("PETRIFY_WEB_PASSWORD", " ")
+    assert main(["run", "--source", IN, "--output", OUT]) == 0
 
 
 def test_web_server_is_stopped_when_the_run_fails(capsys: pytest.CaptureFixture[str]) -> None:
