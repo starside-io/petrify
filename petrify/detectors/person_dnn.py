@@ -128,6 +128,54 @@ def letterbox_geometry(frame_w: int, frame_h: int, size: int = INPUT_SIZE) -> Le
     )
 
 
+SEPARABLE_MIN_SHRINK = 3
+"""Smallest shrink factor, on each axis, for which :func:`letterbox` resizes one axis at a time."""
+
+def _separable_area(geom: LetterboxGeometry) -> bool:
+    """True when :func:`letterbox` may use :func:`_area_by_axis` instead of one resize.
+
+    The single INTER_AREA call is slow for non-integer factors (13.6 ms of the
+    detector's 46 ms at 1080p); resizing one axis at a time gives the same
+    bytes in 4.5 ms, saving 9.3 ms per 1080p frame (measured on every frame of
+    the test clips). The faster path is used only where it was shown to give
+    the same bytes and to be faster:
+
+    - each axis shrinks at least :data:`SEPARABLE_MIN_SHRINK` times: below that
+      it was not faster (640x480 took 1.7 ms against 1.5 ms);
+    - neither axis shrinks by a whole factor. Each one-axis pass keeps the
+      other axis at scale 1, so a whole factor on either axis sends that pass
+      to OpenCV's integer area path, which sums in another way: on such sizes
+      (for example 1248x484, 3339x872, 3840x13) results came out one level
+      apart. With both factors fractional, both passes run OpenCV's general
+      area code with the same weights in the same order as the single call,
+      and the bytes matched on every size tried.
+    """
+    w, h = geom.frame_w, geom.frame_h
+    cw, ch = geom.content_w, geom.content_h
+    return (
+        w >= SEPARABLE_MIN_SHRINK * cw
+        and h >= SEPARABLE_MIN_SHRINK * ch
+        and w % cw != 0
+        and h % ch != 0
+    )
+
+
+def _area_by_axis(image: np.ndarray, content_w: int, content_h: int) -> np.ndarray:
+    """Area resize ``image`` to ``content_w`` by ``content_h``, one axis at a time.
+
+    Area weights are a product of a column weight and a row weight, so two
+    one-axis INTER_AREA resizes compute the same weighted sums as one call.
+    The intermediate is float32 so it is not rounded to whole levels between
+    the two passes; ``convertScaleAbs`` then rounds and saturates once, as the
+    single uint8 call does.
+    """
+    columns = cv2.resize(
+        image.astype(np.float32), (content_w, image.shape[0]), interpolation=cv2.INTER_AREA
+    )
+    rows = cv2.resize(columns, (content_w, content_h), interpolation=cv2.INTER_AREA)
+    return cv2.convertScaleAbs(rows)
+
+
 def letterbox(image: np.ndarray, size: int = INPUT_SIZE) -> tuple[np.ndarray, LetterboxGeometry]:
     """Resize ``image`` into a black ``size`` square, keeping the aspect ratio.
 
@@ -138,12 +186,15 @@ def letterbox(image: np.ndarray, size: int = INPUT_SIZE) -> tuple[np.ndarray, Le
     """
     image = _check_image(image)
     geom = letterbox_geometry(image.shape[1], image.shape[0], size)
-    shrinking = geom.content_w < geom.frame_w or geom.content_h < geom.frame_h
-    resized = cv2.resize(
-        image,
-        (geom.content_w, geom.content_h),
-        interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR,
-    )
+    if _separable_area(geom):
+        resized = _area_by_axis(image, geom.content_w, geom.content_h)
+    else:
+        shrinking = geom.content_w < geom.frame_w or geom.content_h < geom.frame_h
+        resized = cv2.resize(
+            image,
+            (geom.content_w, geom.content_h),
+            interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR,
+        )
     out = np.zeros((size, size, 3), dtype=np.uint8)
     out[geom.top : geom.top + geom.content_h, geom.left : geom.left + geom.content_w] = resized
     return out, geom

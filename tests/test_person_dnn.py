@@ -218,6 +218,87 @@ def test_letterbox_image_places_content_and_black_padding(w: int, h: int) -> Non
     assert (square[mask] == 0).all()
 
 
+def _reference_resize(image: np.ndarray) -> np.ndarray:
+    """The single resize call letterbox made before the one-axis-at-a-time path."""
+    g = letterbox_geometry(image.shape[1], image.shape[0])
+    shrinking = g.content_w < g.frame_w or g.content_h < g.frame_h
+    return cv2.resize(
+        image,
+        (g.content_w, g.content_h),
+        interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR,
+    )
+
+
+def _test_images(w: int, h: int, seed: int) -> list[np.ndarray]:
+    rng = np.random.default_rng(seed)
+    ys, xs = np.indices((h, w))
+    checker = (((ys + xs) % 2) * 255).astype(np.uint8)
+    return [
+        rng.integers(0, 256, (h, w, 3), dtype=np.uint8),
+        (rng.integers(0, 2, (h, w, 3)) * 255).astype(np.uint8),
+        np.full((h, w, 3), 137, dtype=np.uint8),
+        np.repeat(checker[:, :, np.newaxis], 3, axis=2),
+    ]
+
+
+# Sizes where resizing one axis at a time gave values one level off the single
+# call: each has a whole shrink factor on one axis, so one pass took OpenCV's
+# integer area path. They must take the single call.
+_SEPARABLE_MISMATCH_SIZES = [
+    (3840, 13), (3840, 5), (5, 3840), (13, 3840), (1248, 484), (1248, 1066),
+    (1000, 1248), (322, 1248), (3339, 872), (3749, 387), (4159, 1260), (774, 2494),
+]
+
+
+@pytest.mark.parametrize(
+    "w, h",
+    [
+        (1920, 1080), (3840, 2160), (1280, 720), (640, 480), (2560, 1440), (1919, 1081),
+        (1931, 1087), (2003, 1123), (1249, 937), (1248, 936), (417, 300), (415, 300),
+        (417, 417), (415, 415), (6000, 300), (300, 6000), (5000, 20), (20, 5000),
+        (4000, 331), (7, 3000), *_SEPARABLE_MISMATCH_SIZES,
+    ],
+)
+def test_letterbox_content_is_byte_identical_to_one_resize(w: int, h: int) -> None:
+    # The one-axis-at-a-time path is a speedup only: the network must see the
+    # same bytes as before, so detections cannot change.
+    for image in _test_images(w, h, seed=w * 10007 + h):
+        square, g = letterbox(image)
+        content = square[g.top : g.top + g.content_h, g.left : g.left + g.content_w]
+        assert np.array_equal(content, _reference_resize(image))
+
+
+@pytest.mark.parametrize("w, h", [(1920, 1080), (3840, 2160), (1280, 720), (1931, 1087)])
+def test_large_frames_use_the_separable_path(w: int, h: int) -> None:
+    assert pd._separable_area(letterbox_geometry(w, h))
+
+
+@pytest.mark.parametrize(
+    "w, h",
+    [
+        (640, 480),  # shrinks less than 3 times: the single call is as fast
+        (1000, 750),
+        (1248, 936),  # an integer scale on both axes: OpenCV's own fast path
+        (415, 300),  # no shrink at all
+        (416, 416),
+        *_SEPARABLE_MISMATCH_SIZES,  # a whole shrink factor on one axis
+    ],
+)
+def test_other_frames_take_the_single_resize(
+    monkeypatch: pytest.MonkeyPatch, w: int, h: int
+) -> None:
+    assert not pd._separable_area(letterbox_geometry(w, h))
+
+    def refuse(*args: object) -> np.ndarray:
+        raise AssertionError("the separable path must not run for this size")
+
+    monkeypatch.setattr(pd, "_area_by_axis", refuse)
+    image = np.full((h, w, 3), 90, dtype=np.uint8)
+    square, g = letterbox(image)
+    content = square[g.top : g.top + g.content_h, g.left : g.left + g.content_w]
+    assert np.array_equal(content, _reference_resize(image))
+
+
 @pytest.mark.parametrize(
     "w, h", [(640, 480), (1920, 1080), (480, 640), (1, 1), (8, 8), (5, 3000), (3000, 5)]
 )
