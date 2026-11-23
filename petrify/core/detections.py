@@ -29,6 +29,9 @@ import numpy as np
 
 _T = TypeVar("_T")
 
+MAX_HELD = 1_000_000
+"""Largest ``Box.held`` a result may carry; a larger count is treated as corrupt."""
+
 
 class MalformedDetections(ValueError):
     """A detection result breaks the :class:`Detections` contract."""
@@ -59,13 +62,23 @@ FIELD_OF: Mapping[DetectionKind, str] = MappingProxyType({
 
 @dataclass(frozen=True)
 class Box:
-    """Axis-aligned box in full-resolution pixel coordinates."""
+    """Axis-aligned box in full-resolution pixel coordinates.
+
+    ``held`` is the number of refined frames since the box last had a matching
+    detection: frames that reached the refiners, which excludes frames whose
+    detection failed closed, so it is not a count of stream frames. 0 means the
+    box was not carried over from an earlier frame; a refiner may also produce a
+    new box with 0. Only refiners (such as the tracker) may set it above 0, so a
+    mode can tell a held box from a fresh one. It takes part in equality and
+    hashing.
+    """
 
     x: int
     y: int
     w: int
     h: int
     score: float | None = None
+    held: int = 0
 
 
 @dataclass(frozen=True)
@@ -92,7 +105,11 @@ class Detections:
       and ``h >= 0``, and ``score`` None or a finite real number. Detectors may
       return boxes that start before 0 or extend past the frame edge; the check
       clips them to the frame. A box wholly outside the frame becomes a zero-area
-      box on the nearest edge and is never dropped.
+      box on the nearest edge and is never dropped. ``held`` must be a Python
+      ``int`` (not a bool), unlike the coordinates, which also accept numpy
+      integers: only refiners set it, from Python counters, so any other type
+      means a confused producer. It is 0 for detector results and between 0 and
+      :data:`MAX_HELD` for refiner results.
     - ``faces``: a tuple of :class:`Face`, each with a box as above (clipped the
       same way) and ``landmarks`` None or a non-empty tuple of ``(x, y)`` float
       points. Landmarks are set exactly when LANDMARKS is provided. Landmark
@@ -196,7 +213,9 @@ def _clip(start: int, length: int, limit: int) -> tuple[int, int]:
     return lo, hi - lo
 
 
-def _checked_box(box: object, where: str, height: int, width: int) -> Box:
+def _checked_box(
+    box: object, where: str, height: int, width: int, allow_held: bool
+) -> Box:
     """Return ``box`` rebuilt as a base :class:`Box` clipped to the frame."""
     if not isinstance(box, Box):
         raise MalformedDetections(f"{where}: expected a Box, got {type(box).__name__}")
@@ -218,9 +237,27 @@ def _checked_box(box: object, where: str, height: int, width: int) -> Box:
             raise MalformedDetections(
                 f"{where}: Box.score must be None or a finite real number, got {box.score!r}"
             )
+    held = box.held
+    # Exactly int: only refiners set this field and they use Python ints, so a
+    # bool, a numpy integer or an int subclass means a producer is confused.
+    if type(held) is not int:
+        raise MalformedDetections(
+            f"{where}: Box.held must be an int, got {type(held).__name__}"
+        )
+    if held < 0:
+        raise MalformedDetections(f"{where}: Box.held must be non-negative, got {held}")
+    if held > MAX_HELD:
+        # No real hold lasts this long; such a count is a counter bug, not a box.
+        raise MalformedDetections(f"{where}: Box.held must be at most {MAX_HELD}, got {held}")
+    if held > 0 and not allow_held:
+        # Only a refiner may carry a box over; a detector claiming one would
+        # let a mode treat a fresh detection as stale.
+        raise MalformedDetections(
+            f"{where}: Box.held is {held} but held boxes are not allowed here"
+        )
     x, w = _clip(x, w, width)
     y, h = _clip(y, h, height)
-    return Box(x=x, y=y, w=w, h=h, score=score)
+    return Box(x=x, y=y, w=w, h=h, score=score, held=held)
 
 
 def _checked_landmarks(landmarks: object, where: str) -> tuple[tuple[float, float], ...]:
@@ -260,6 +297,8 @@ def check_detections(
     result: object,
     provides: frozenset[DetectionKind],
     frame_shape: tuple[int, ...],
+    *,
+    allow_held: bool = False,
 ) -> Detections:
     """Validate ``result`` and return a new, normalized base :class:`Detections`.
 
@@ -274,6 +313,11 @@ def check_detections(
     a field may be set only when a declared kind maps to it in :data:`FIELD_OF`.
     ``frame_shape`` is the shape of the frame the result was computed on (height
     first); boxes are clipped to it and a mask must match its first two dimensions.
+
+    Every box keeps its ``held`` count, which must be a Python ``int`` from 0 to
+    :data:`MAX_HELD`. ``allow_held`` permits ``held > 0``; the
+    engine sets it for refiner results only, so a detector result with a held
+    box is rejected.
 
     Raises
     ------
@@ -312,7 +356,7 @@ def check_detections(
                 f"persons must be a tuple, got {type(persons_in).__name__}"
             )
         persons = tuple(
-            _checked_box(box, f"persons[{i}]", height, width)
+            _checked_box(box, f"persons[{i}]", height, width, allow_held)
             for i, box in enumerate(persons_in)
         )
 
@@ -327,7 +371,7 @@ def check_detections(
             where = f"faces[{i}]"
             if not isinstance(face, Face):
                 raise MalformedDetections(f"{where}: expected a Face, got {type(face).__name__}")
-            box = _checked_box(face.box, f"{where}.box", height, width)
+            box = _checked_box(face.box, f"{where}.box", height, width, allow_held)
             landmarks: tuple[tuple[float, float], ...] | None = None
             if face.landmarks is None:
                 if need_landmarks:

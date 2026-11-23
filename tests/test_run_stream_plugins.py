@@ -344,8 +344,14 @@ def test_tracker_holds_a_person_box_for_the_hold_period(
     fake_persons.hits = {20: box}
     config = _plugin_config(tracker=TrackerConfig(hold_frames=5))
     run_stream(FakeSource(Scene(total=40)), config, OutputConfig(), sinks=[ListSink()])
-    with_box = [index for _, index, det in plugin.RENDERS if box in (det.persons or ())]
-    assert with_box == [20, 21, 22, 23, 24, 25]
+    persons = {index: det.persons or () for _, index, det in plugin.RENDERS}
+    assert sorted(persons) == list(range(40))
+    # Detected on frame 20, then the same box held with its miss count, then gone.
+    expected = {20: (box,)}
+    expected.update({i: (dataclasses.replace(box, held=i - 20),) for i in range(21, 26)})
+    for index, boxes in persons.items():
+        assert boxes == expected.get(index, ()), index
+    assert persons[20][0].held == 0
 
 
 @pytest.mark.usefixtures("fake_person_check")

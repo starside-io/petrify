@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from petrify.core.config import TrackerConfig
 from petrify.core.detections import Box, DetectionKind, Detections, Face
@@ -40,7 +40,8 @@ class Track:
         one per new track, and are never reused until :meth:`IouTracker.reset`.
     box:
         The detection matched this frame, or the last matched box unchanged
-        while the track is held.
+        while the track is held. The tracker stores the box it was given and
+        never sets :attr:`Box.held` itself; :class:`TrackerRefiner` does that.
     age:
         Frames since the track was created, counting the creation frame as 1.
     missed:
@@ -189,15 +190,24 @@ class IouTracker:
         return tuple(self._tracks)
 
 
+def _aged(track: Track) -> Box:
+    """The track's box with ``held`` counted from the last real detection."""
+    return replace(track.box, held=track.box.held + track.missed)
+
+
 class TrackerRefiner:
     """Engine refiner that keeps person boxes or faces covered through short misses.
 
     It feeds one kind of box to an :class:`IouTracker` on every frame it sees and
     returns only the boxes of held tracks, so the engine's union is "detected
     this frame plus held from earlier frames" without duplicating this frame's
-    detections. A held box is the last matched box, unchanged: there is no
-    motion extrapolation, so when the camera or the subject moves the held box
-    covers where the subject was, not where it is.
+    detections. A held box is the last matched box, with position and score
+    unchanged and :attr:`Box.held` set to the matched box's own ``held`` plus the
+    track's ``missed`` count. The count is cumulative so that a refiner placed
+    after another one, which may match a box that was itself held, keeps the
+    staleness instead of restarting it. It counts refined frames, not stream
+    frames: see the note on failed frames below. There is no motion extrapolation, so when the camera or
+    the subject moves the held box covers where the subject was, not where it is.
 
     ``kind`` selects what is tracked:
 
@@ -222,8 +232,8 @@ class TrackerRefiner:
     zero-area box (for example one clipped to the frame edge) is never held.
 
     The engine does not run refiners on a frame whose detection failed, so such
-    frames do not age the tracks: a hold then lasts more wall-clock frames, which
-    keeps a region covered longer. The input ``Detections`` is never mutated.
+    frames do not age the tracks and are not counted in ``held``: a hold then
+    lasts more wall-clock frames, which keeps a region covered longer. The input ``Detections`` is never mutated.
 
     Parameters
     ----------
@@ -289,7 +299,11 @@ class TrackerRefiner:
     def refine(self, frame: Frame, detections: Detections) -> Detections:
         """Advance the tracker one frame and return only the held boxes or faces."""
         if self.kind is DetectionKind.PERSONS:
-            held = tuple(t.box for t in self._tracker.update(detections.persons or ()) if t.held)
+            held = tuple(
+                _aged(t)
+                for t in self._tracker.update(detections.persons or ())
+                if t.held
+            )
             return Detections(persons=held) if held else Detections()
         return self._refine_faces(detections.faces or ())
 
@@ -310,9 +324,9 @@ class TrackerRefiner:
                             f"held face track {track.track_id} has no landmarks but "
                             "LANDMARKS is provided"
                         )
-                    held.append(Face(box=track.box, landmarks=points))
+                    held.append(Face(box=_aged(track), landmarks=points))
                 else:
-                    held.append(Face(box=track.box))
+                    held.append(Face(box=_aged(track)))
             elif self.landmarks:
                 seen = face_of_box[id(track.box)].landmarks
                 points = previous if seen is None else seen

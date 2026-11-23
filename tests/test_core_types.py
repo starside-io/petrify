@@ -48,6 +48,7 @@ from petrify.core import (
     Stage,
     check_detections,
 )
+from petrify.core.detections import MAX_HELD
 from petrify.detectors.bgdiff import BackgroundDiffer
 from petrify.detectors.motion import MotionDetector
 from petrify.detectors.person_hog import PersonDetector
@@ -445,6 +446,103 @@ def test_check_detections_rejects_bad_face_box(box: object, match: str) -> None:
     with pytest.raises(MalformedDetections, match=r"faces\[0\]\.box") as info:
         check_detections(d, _NO_LANDMARKS, _SHAPE)
     assert match in str(info.value)
+
+
+# ---------------------------------------------------------------------------
+# Box.held
+# ---------------------------------------------------------------------------
+
+
+def test_box_held_defaults_to_zero_and_positional_construction_still_works() -> None:
+    box = Box(1, 2, 3, 4, 0.5)
+    assert box.held == 0
+    assert box == Box(x=1, y=2, w=3, h=4, score=0.5, held=0)
+    assert Box(1, 2, 3, 4).held == 0
+
+
+def test_box_held_takes_part_in_equality_and_hash() -> None:
+    fresh = Box(1, 2, 3, 4, 0.5)
+    held = Box(1, 2, 3, 4, 0.5, held=2)
+    assert fresh != held
+    assert held == Box(1, 2, 3, 4, 0.5, held=2)
+    assert hash(held) == hash(Box(1, 2, 3, 4, 0.5, held=2))
+    assert len({fresh, held, Box(1, 2, 3, 4, 0.5)}) == 2
+
+
+def test_merged_keeps_the_held_field() -> None:
+    a = Detections(persons=(Box(0, 0, 1, 1, held=1),), faces=(Face(Box(0, 0, 2, 2, held=3)),))
+    b = Detections(persons=(Box(1, 1, 1, 1),), faces=(Face(Box(1, 1, 2, 2)),))
+    out = a.merged(b)
+    assert out.persons is not None and out.faces is not None
+    assert [box.held for box in out.persons] == [1, 0]
+    assert [face.box.held for face in out.faces] == [3, 0]
+
+
+def _held_result(name: str, held: object) -> Detections:
+    box = Box(0, 0, 1, 1, held=held)  # type: ignore[arg-type]
+    if name == "persons":
+        return Detections(persons=(box,))
+    return Detections(faces=(Face(box),))
+
+
+def _boxes(d: Detections, name: str) -> list[Box]:
+    if name == "persons":
+        assert d.persons is not None
+        return list(d.persons)
+    assert d.faces is not None
+    return [face.box for face in d.faces]
+
+
+@pytest.mark.parametrize("name", ["persons", "faces"])
+@pytest.mark.parametrize("allow_held", [False, True])
+def test_check_detections_copies_held_zero(name: str, allow_held: bool) -> None:
+    out = check_detections(_held_result(name, 0), _NO_LANDMARKS, _SHAPE, allow_held=allow_held)
+    assert [b.held for b in _boxes(out, name)] == [0]
+
+
+@pytest.mark.parametrize("name", ["persons", "faces"])
+def test_check_detections_copies_held_count_when_allowed(name: str) -> None:
+    out = check_detections(_held_result(name, 4), _NO_LANDMARKS, _SHAPE, allow_held=True)
+    (box,) = _boxes(out, name)
+    assert box == Box(0, 0, 1, 1, held=4)
+    assert type(box.held) is int
+
+
+@pytest.mark.parametrize("name", ["persons", "faces"])
+def test_check_detections_rejects_held_count_by_default(name: str) -> None:
+    with pytest.raises(MalformedDetections, match="Box.held is 1 but held boxes are not allowed"):
+        check_detections(_held_result(name, 1), _NO_LANDMARKS, _SHAPE)
+    with pytest.raises(MalformedDetections, match="not allowed"):
+        check_detections(_held_result(name, 1), _NO_LANDMARKS, _SHAPE, allow_held=False)
+
+
+@pytest.mark.parametrize("name", ["persons", "faces"])
+def test_check_detections_bounds_held(name: str) -> None:
+    out = check_detections(_held_result(name, MAX_HELD), _NO_LANDMARKS, _SHAPE, allow_held=True)
+    assert [b.held for b in _boxes(out, name)] == [MAX_HELD]
+    with pytest.raises(MalformedDetections, match=f"Box.held must be at most {MAX_HELD}"):
+        check_detections(_held_result(name, MAX_HELD + 1), _NO_LANDMARKS, _SHAPE, allow_held=True)
+
+
+@pytest.mark.parametrize("name", ["persons", "faces"])
+@pytest.mark.parametrize("allow_held", [False, True])
+@pytest.mark.parametrize(
+    ("held", "match"),
+    [
+        pytest.param(True, "Box.held must be an int, got bool", id="bool-true"),
+        pytest.param(False, "Box.held must be an int, got bool", id="bool-false"),
+        pytest.param(1.0, "Box.held must be an int, got float", id="float"),
+        pytest.param("1", "Box.held must be an int, got str", id="str"),
+        pytest.param(None, "Box.held must be an int, got NoneType", id="none"),
+        pytest.param(np.int64(1), "Box.held must be an int, got int64", id="numpy-int"),
+        pytest.param(-1, "Box.held must be non-negative", id="negative"),
+    ],
+)
+def test_check_detections_rejects_bad_held(
+    name: str, allow_held: bool, held: object, match: str
+) -> None:
+    with pytest.raises(MalformedDetections, match=match):
+        check_detections(_held_result(name, held), _NO_LANDMARKS, _SHAPE, allow_held=allow_held)
 
 
 # Frame for the clipping cases: H=10, W=20.

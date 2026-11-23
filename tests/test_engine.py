@@ -18,6 +18,7 @@ from petrify.core import (
     Engine,
     EngineConfig,
     EngineStats,
+    Face,
     Frame,
     FrameMeta,
     FrameTrace,
@@ -2359,6 +2360,9 @@ REFINER_FAILURES: dict[str, Callable[[Frame, Detections], object]] = {
     "not_detections": lambda f, d: [BOX_A],
     "field_outside_provides": lambda f, d: Detections(motion=True),
     "wrong_shape_mask": lambda f, d: Detections(mask=np.zeros((H, W + 1), dtype=bool)),
+    # allow_held admits a held count, never a malformed one.
+    "bool_held": lambda f, d: Detections(persons=(Box(0, 0, 1, 1, held=True),)),
+    "negative_held": lambda f, d: Detections(persons=(Box(0, 0, 1, 1, held=-1),)),
 }
 
 
@@ -2387,6 +2391,51 @@ def test_refiner_failure_fails_the_frame_closed(
     assert stats.failed_closed == 1 and stats.frames == 6
     messages = [r.getMessage() for r in caplog.records]
     assert any("Frame 3 failed closed (refiner FakeRefiner)" in m for m in messages)
+
+
+@pytest.mark.parametrize("name", ["persons", "faces"])
+def test_detector_marking_a_box_held_fails_the_frame_closed(
+    name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    kind = P if name == "persons" else FACES
+
+    def result(frame: Frame) -> Detections:
+        box = Box(0, 0, 1, 1, held=1 if frame.index == 2 else 0)
+        if name == "persons":
+            return Detections(persons=(box,))
+        return Detections(faces=(Face(box),))
+
+    detector = ResultDetector({kind}, result)
+    mode = RegionMode({kind}, policy="all")
+    with caplog.at_level(logging.WARNING, logger="petrify.core.engine"):
+        stats, traces, sink = _p_run(4, [detector], mode)
+    assert _is_black(dict(sink.written)[2], _image(2))
+    assert [t.index for t in traces if t.failed_closed] == [2]
+    assert 2 not in [i for i, _, _ in mode.seen]
+    assert stats.failed_closed == 1 and stats.frames == 4
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Frame 2 failed closed (detector ResultDetector)" in m for m in messages)
+    assert any("Box.held is 1" in m for m in messages)
+
+
+def test_refiner_held_boxes_reach_the_mode_with_the_count() -> None:
+    held_person = Box(1, 1, 2, 2, score=0.5, held=3)
+    held_face = Box(0, 0, 1, 1, held=2)
+
+    def hold(frame: Frame, detections: Detections) -> Detections:
+        return Detections(persons=(held_person,), faces=(Face(held_face),))
+
+    refiner = FakeRefiner({P}, {P, FACES}, hold)
+    mode = RegionMode({P, FACES}, policy="all")
+    stats, traces, _ = _p_run(2, [_box_detector(BOX_A)], mode, refiners=[refiner])
+    assert stats.failed_closed == 0
+    assert not any(t.failed_closed for t in traces)
+    for _, detections, present in mode.seen:
+        assert present
+        assert detections.persons == (BOX_A, held_person)
+        assert [b.held for b in detections.persons] == [0, 3]
+        assert detections.faces == (Face(held_face),)
+        assert detections.faces[0].box.held == 2
 
 
 def test_refiners_do_not_run_on_a_frame_whose_detection_failed() -> None:

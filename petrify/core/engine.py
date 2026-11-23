@@ -812,7 +812,9 @@ class Engine:
             for refiner in self._refiners:
                 try:
                     result = refiner.refine(frame, detections)
-                    merged = detections.merged(check_detections(result, refiner.provides, shape))
+                    merged = detections.merged(
+                        check_detections(result, refiner.provides, shape, allow_held=True)
+                    )
                     present = merged.subject_present
                     detections = merged
                 except Exception as exc:

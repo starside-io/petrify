@@ -8,6 +8,7 @@ engine.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Callable, Iterator, Sequence
 
@@ -24,7 +25,14 @@ from petrify.core import (
     SourceInfo,
     TrackerConfig,
 )
-from petrify.core.detections import Box, DetectionKind, Detections, Face, check_detections
+from petrify.core.detections import (
+    Box,
+    DetectionKind,
+    Detections,
+    Face,
+    MalformedDetections,
+    check_detections,
+)
 from petrify.detectors import TrackerRefiner as ExportedTrackerRefiner
 from petrify.detectors.tracker import IouTracker, Track, TrackerRefiner, iou
 
@@ -404,6 +412,11 @@ LM_1 = ((3.0, 4.0), (8.0, 4.0))
 LM_2 = ((4.0, 5.0), (9.0, 5.0))
 
 
+def _held(box: Box, missed: int) -> Box:
+    """``box`` as the refiner returns it after ``missed`` frames without a match."""
+    return dataclasses.replace(box, held=missed)
+
+
 def test_refiner_satisfies_protocol_and_is_exported() -> None:
     assert ExportedTrackerRefiner is TrackerRefiner
     assert isinstance(_refiner(), Refiner)
@@ -422,7 +435,7 @@ def test_refiner_holds_persons_for_exactly_hold_frames_then_drops() -> None:
     refiner = _refiner(P, hold=3)
     assert _persons(refiner, 0, BOX_A) is None  # Detected, nothing held.
     for i in (1, 2, 3):
-        assert _persons(refiner, i) == (BOX_A,)
+        assert _persons(refiner, i) == (_held(BOX_A, i),)
     assert _persons(refiner, 4) is None
     assert _persons(refiner, 5) is None
 
@@ -431,25 +444,25 @@ def test_refiner_returns_only_held_boxes() -> None:
     refiner = _refiner(P)
     _persons(refiner, 0, BOX_A, BOX_B)
     # BOX_B is detected again this frame, so only BOX_A is added by the refiner.
-    assert _persons(refiner, 1, BOX_B) == (BOX_A,)
+    assert _persons(refiner, 1, BOX_B) == (_held(BOX_A, 1),)
 
 
 def test_refiner_redetection_during_hold_stops_the_hold() -> None:
     refiner = _refiner(P, hold=3)
     _persons(refiner, 0, BOX_A)
-    assert _persons(refiner, 1) == (BOX_A,)
+    assert _persons(refiner, 1) == (_held(BOX_A, 1),)
     moved = Box(3, 2, 10, 10)
     assert _persons(refiner, 2, moved) is None  # No duplicate of the re-detected box.
     # The hold restarts from the re-detected box, with one box for the track.
-    assert _persons(refiner, 3) == (moved,)
+    assert _persons(refiner, 3) == (_held(moved, 1),)
 
 
 def test_refiner_treats_missing_persons_as_empty() -> None:
     refiner = _refiner(P, hold=2)
     refiner.refine(_frame(0), Detections(persons=(BOX_A,)))
     # persons=None ("not computed") ages the track like an empty tuple.
-    assert refiner.refine(_frame(1), Detections()).persons == (BOX_A,)
-    assert refiner.refine(_frame(2), Detections(motion=True)).persons == (BOX_A,)
+    assert refiner.refine(_frame(1), Detections()).persons == (_held(BOX_A, 1),)
+    assert refiner.refine(_frame(2), Detections(motion=True)).persons == (_held(BOX_A, 2),)
     out = refiner.refine(_frame(3), Detections())
     # Nothing held: the result leaves every field unset.
     assert out.persons is None and out.faces is None
@@ -466,8 +479,8 @@ def test_refiner_holds_faces_with_the_last_landmarks() -> None:
     _faces(refiner, 0, Face(BOX_A, LM_1))
     moved = Box(3, 2, 10, 10)
     assert _faces(refiner, 1, Face(moved, LM_2)) is None
-    assert _faces(refiner, 2) == (Face(moved, LM_2),)
-    assert _faces(refiner, 3) == (Face(moved, LM_2),)
+    assert _faces(refiner, 2) == (Face(_held(moved, 1), LM_2),)
+    assert _faces(refiner, 3) == (Face(_held(moved, 2), LM_2),)
     assert _faces(refiner, 4) is None
 
 
@@ -475,7 +488,7 @@ def test_refiner_holds_faces_without_landmarks() -> None:
     refiner = _refiner(FACES, hold=1)
     # Landmarks from the detector are dropped, since LANDMARKS is not provided.
     _faces(refiner, 0, Face(BOX_A, LM_1), Face(BOX_B))
-    assert _faces(refiner, 1) == (Face(BOX_A), Face(BOX_B))
+    assert _faces(refiner, 1) == (Face(_held(BOX_A, 1)), Face(_held(BOX_B, 1)))
     assert _faces(refiner, 2) is None
 
 
@@ -484,14 +497,17 @@ def test_refiner_matches_each_face_to_its_own_landmarks() -> None:
     _faces(refiner, 0, Face(BOX_B, LM_2), Face(BOX_A, LM_1))
     held = _faces(refiner, 1)
     assert held is not None
-    assert {face.box: face.landmarks for face in held} == {BOX_A: LM_1, BOX_B: LM_2}
+    assert {face.box: face.landmarks for face in held} == {
+        _held(BOX_A, 1): LM_1,
+        _held(BOX_B, 1): LM_2,
+    }
 
 
 def test_refiner_keeps_landmarks_when_a_match_has_none() -> None:
     refiner = _refiner(FACES, hold=1, landmarks=True)
     _faces(refiner, 0, Face(BOX_A, LM_1))
     _faces(refiner, 1, Face(BOX_A))  # For example a second face detector without landmarks.
-    assert _faces(refiner, 2) == (Face(BOX_A, LM_1),)
+    assert _faces(refiner, 2) == (Face(_held(BOX_A, 1), LM_1),)
 
 
 def test_refiner_rejects_a_held_face_that_never_had_landmarks() -> None:
@@ -516,8 +532,83 @@ def test_refiner_result_passes_check_detections(
     results = [refiner.refine(_frame(0), first)]
     results += [refiner.refine(_frame(i), Detections()) for i in (1, 2, 3)]
     for result in results:
-        check_detections(result, refiner.provides, SHAPE)
+        check_detections(result, refiner.provides, SHAPE, allow_held=True)
     assert len(getattr(results[1], field)) == 2
+
+
+def test_refiner_result_with_held_boxes_needs_allow_held() -> None:
+    # A held box is a refiner's claim; the same result from a detector is malformed.
+    for kind, first in ((P, Detections(persons=(BOX_A,))), (FACES, Detections(faces=(Face(BOX_A),)))):
+        refiner = _refiner(kind, hold=1)
+        refiner.refine(_frame(0), first)
+        result = refiner.refine(_frame(1), Detections())
+        with pytest.raises(MalformedDetections, match="held"):
+            check_detections(result, refiner.provides, SHAPE)
+
+
+def test_refiner_person_held_count_follows_missed() -> None:
+    refiner = _refiner(P, hold=4)
+    _persons(refiner, 0, BOX_A, BOX_B)
+    # BOX_B is seen again on frame 2, so its count restarts while BOX_A keeps counting.
+    expected = {
+        1: (_held(BOX_A, 1), _held(BOX_B, 1)),
+        2: (_held(BOX_A, 2),),
+        3: (_held(BOX_A, 3), _held(BOX_B, 1)),
+        4: (_held(BOX_A, 4), _held(BOX_B, 2)),
+    }
+    for i in (1, 2, 3, 4):
+        boxes = (BOX_B,) if i == 2 else ()
+        out = _persons(refiner, i, *boxes)
+        tracks = refiner._tracker._tracks
+        assert out == expected[i]
+        # Every returned count is the missed count of a live track.
+        missed = sorted(t.missed for t in tracks if t.held)
+        assert sorted(b.held for b in out) == missed
+
+
+def test_refiner_face_held_count_follows_missed() -> None:
+    refiner = _refiner(FACES, hold=3, landmarks=True)
+    _faces(refiner, 0, Face(BOX_A, LM_1))
+    for i in (1, 2, 3):
+        assert _faces(refiner, i) == (Face(_held(BOX_A, i), LM_1),)
+    # Re-detected: nothing is held on that frame, and the next hold starts at 1.
+    assert _faces(refiner, 4, Face(BOX_A, LM_2)) is None
+    assert _faces(refiner, 5) == (Face(_held(BOX_A, 1), LM_2),)
+
+
+def test_refiner_held_boxes_keep_position_and_score() -> None:
+    scored = Box(4, 6, 12, 14, score=0.75)
+    for kind in (P, FACES):
+        refiner = _refiner(kind, hold=2)
+        if kind is P:
+            _persons(refiner, 0, scored)
+            out = _persons(refiner, 1)
+            assert out is not None
+            box = out[0]
+        else:
+            _faces(refiner, 0, Face(scored))
+            faces = _faces(refiner, 1)
+            assert faces is not None
+            box = faces[0].box
+        assert (box.x, box.y, box.w, box.h, box.score) == (4, 6, 12, 14, 0.75)
+        assert box.held == 1
+
+
+def test_tracker_stores_the_detector_boxes_unchanged() -> None:
+    # The face refiner maps tracks to faces by box identity, so the tracker must
+    # keep the very object it was given; the held count goes on a copy.
+    refiner = _refiner(FACES, hold=2)
+    face = Face(BOX_A)
+    _faces(refiner, 0, face)
+    _faces(refiner, 1)
+    _faces(refiner, 2)
+    (track,) = refiner._tracker._tracks
+    assert track.box is BOX_A and track.box.held == 0
+    persons = _refiner(P, hold=2)
+    _persons(persons, 0, BOX_B)
+    _persons(persons, 1)
+    (track,) = persons._tracker._tracks
+    assert track.box is BOX_B and track.box.held == 0
 
 
 def test_refiner_frees_payload_of_expired_tracks() -> None:
@@ -684,9 +775,100 @@ def test_engine_holds_a_missed_person_and_counts_it_as_present() -> None:
     traces: list[FrameTrace] = []
     engine = _tracker_engine([_PersonsOnFrames([0])], mode, _refiner(P, hold=3), traces.append)
     engine.run(_ListSource(6))
-    assert [persons for _, persons, _ in mode.seen] == [(BOX_A,)] * 4 + [(), ()]
+    assert [persons for _, persons, _ in mode.seen] == [
+        (BOX_A,),
+        (_held(BOX_A, 1),),
+        (_held(BOX_A, 2),),
+        (_held(BOX_A, 3),),
+        (),
+        (),
+    ]
     assert [t.raw for t in traces] == [True, True, True, True, False, False]
     assert [present for _, _, present in mode.seen] == [True] * 4 + [False, False]
+
+
+def _chained_engine(
+    detectors: Sequence[object], mode: _RecordingMode, refiners: Sequence[object]
+) -> Engine:
+    return Engine(
+        detectors,  # type: ignore[arg-type]
+        mode,
+        [],
+        [_NullSink()],
+        EngineConfig(lookahead=0, cold_start_frames=0),
+        refiners=refiners,  # type: ignore[arg-type]
+    )
+
+
+def test_chained_trackers_keep_the_cumulative_held_count() -> None:
+    # The second tracker matches the first one's held boxes; its own count must
+    # continue from theirs, not restart at the match.
+    mode = _RecordingMode(frozenset({P}))
+    refiners = [_refiner(P, hold=2), _refiner(P, hold=4)]
+    _chained_engine([_PersonsOnFrames([0])], mode, refiners).run(_ListSource(8))
+    held = [[b.held for b in persons or ()] for _, persons, _ in mode.seen]
+    assert held == [[0], [1], [2], [3], [4], [5], [6], []]
+    assert [persons for _, persons, _ in mode.seen][3] == (_held(BOX_A, 3),)
+
+
+class _UpstreamHolder:
+    """Refiner that emits BOX_A held 1, 2, 3 on frames 1 to 3, then nothing."""
+
+    consumes = frozenset({P})
+    provides = frozenset({P})
+
+    def refine(self, frame: Frame, detections: Detections) -> Detections:
+        if 1 <= frame.index <= 3:
+            return Detections(persons=(_held(BOX_A, frame.index),))
+        return Detections()
+
+    def reset(self) -> None:
+        pass
+
+
+def test_tracker_counts_on_from_an_upstream_held_box() -> None:
+    mode = _RecordingMode(frozenset({P}))
+    refiners = [_UpstreamHolder(), _refiner(P, hold=2)]
+    _chained_engine([_PersonsOnFrames([0])], mode, refiners).run(_ListSource(7))
+    assert [persons for _, persons, _ in mode.seen] == [
+        (BOX_A,),
+        (_held(BOX_A, 1),),
+        (_held(BOX_A, 2),),
+        (_held(BOX_A, 3),),
+        (_held(BOX_A, 4),),
+        (_held(BOX_A, 5),),
+        (),
+    ]
+
+
+class _FailsOnFrames(_PersonsOnFrames):
+    """Finds BOX_A on ``hits`` and raises on ``fails``."""
+
+    def __init__(self, hits: Sequence[int], fails: Sequence[int]) -> None:
+        super().__init__(hits)
+        self.fails = set(fails)
+
+    def detect(self, frame: Frame) -> Detections:
+        if frame.index in self.fails:
+            raise RuntimeError("detector broke")
+        return super().detect(frame)
+
+
+def test_held_does_not_count_frames_that_failed_closed() -> None:
+    # Pinned on purpose: refiners do not run on a failed frame, so the count is
+    # refined frames since the match, not stream frames.
+    mode = _RecordingMode(frozenset({P}))
+    traces: list[FrameTrace] = []
+    engine = _tracker_engine(
+        [_FailsOnFrames([0], [2, 3, 4])], mode, _refiner(P, hold=5), traces.append
+    )
+    engine.run(_ListSource(6))
+    assert [t.index for t in traces if t.failed_closed] == [2, 3, 4]
+    assert [(i, persons) for i, persons, _ in mode.seen] == [
+        (0, (BOX_A,)),
+        (1, (_held(BOX_A, 1),)),
+        (5, (_held(BOX_A, 2),)),
+    ]
 
 
 def test_engine_rejects_the_refiner_without_a_detector_for_its_kind() -> None:
@@ -713,7 +895,7 @@ def test_engine_resets_the_refiner_when_reconfigured_with_new_detectors() -> Non
     engine.open(INFO)
     engine.step(_frame(0))
     engine.step(_frame(1))
-    assert mode.seen[-1][1] == (BOX_A,)  # Held.
+    assert mode.seen[-1][1] == (_held(BOX_A, 1),)  # Held.
     engine.reconfigure(detectors=[_PersonsOnFrames([])], refiners=[refiner])
     engine.step(_frame(2))
     engine.close()
