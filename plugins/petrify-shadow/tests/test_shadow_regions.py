@@ -29,6 +29,7 @@ from petrify_shadow.regions import (
     FACE_ZONE,
     HEAD_ZONE,
     HELD_GROWTH_CAP,
+    HELD_GROWTH_PER_FRAME,
     HELD_REGION_FRAMES,
     MIN_PAD_PX,
     ORPHAN_HEAD_MASK_SHARE,
@@ -37,6 +38,7 @@ from petrify_shadow.regions import (
     PreparedMask,
     Rect,
     dilate_px,
+    held_count,
     held_growth,
     orphan_indices,
     orphan_persons,
@@ -218,13 +220,21 @@ def test_pad_face_contains_box_property() -> None:
 # --- held growth ------------------------------------------------------------
 
 
+def test_held_growth_constants() -> None:
+    assert HELD_GROWTH_PER_FRAME == Fraction(25, 100)
+    assert HELD_GROWTH_CAP == 3
+
+
 def test_held_growth_linear_and_capped() -> None:
     assert held_growth(0) == 1
-    assert held_growth(1) == Fraction(11, 10)
-    assert held_growth(3) == Fraction(13, 10)
-    assert held_growth(9) == Fraction(19, 10)
-    assert held_growth(10) == HELD_GROWTH_CAP == 2
-    assert held_growth(1000) == 2
+    assert held_growth(1) == Fraction(5, 4)
+    assert held_growth(2) == Fraction(3, 2)
+    assert held_growth(3) == Fraction(7, 4)
+    assert held_growth(4) == 2
+    assert held_growth(7) == Fraction(11, 4)
+    assert held_growth(8) == HELD_GROWTH_CAP == 3
+    assert held_growth(9) == 3
+    assert held_growth(1000) == 3
     with pytest.raises(ValueError):
         held_growth(-1)
     with pytest.raises(ValueError):
@@ -235,11 +245,13 @@ def test_pad_face_grow_literal() -> None:
     box = Box(100, 100, 40, 50)
     # Unclipped padded rect: x 88 to 152, y 77.5 to 157.5.
     assert pad_face(box, 0.3, H, W, grow=1) == Rect(88, 77, 152, 158)
-    # 1.1: half width 35.2 around 120, half height 44 around 117.5.
-    assert pad_face(box, 0.3, H, W, grow=held_growth(1)) == Rect(84, 73, 156, 162)
+    # 1.25: half width 40 around 120, half height 50 around 117.5.
+    assert pad_face(box, 0.3, H, W, grow=held_growth(1)) == Rect(80, 67, 160, 168)
+    # 3: half width 96, half height 120, clipped at the top only.
+    assert pad_face(box, 0.3, H, W, grow=held_growth(8)) == Rect(24, 0, 216, 238)
+    assert pad_face(box, 0.3, H, W, grow=held_growth(50)) == Rect(24, 0, 216, 238)
+    assert pad_face(box, 0.3, H, W, grow=3.0) == Rect(24, 0, 216, 238)
     # 2: half width 64, half height 80.
-    assert pad_face(box, 0.3, H, W, grow=held_growth(10)) == Rect(56, 37, 184, 198)
-    assert pad_face(box, 0.3, H, W, grow=held_growth(50)) == Rect(56, 37, 184, 198)
     assert pad_face(box, 0.3, H, W, grow=2.0) == Rect(56, 37, 184, 198)
 
 
@@ -332,19 +344,22 @@ def test_pad_person_grow_literal() -> None:
     box = Box(100, 100, 200, 400)
     # Unclipped padded rect: x 90 to 310, y 80 to 520, center (200, 300).
     assert pad_person(box, H, W, grow=1) == Rect(90, 80, 310, 520)
-    # 1.1: half width 121, half height 242.
-    assert pad_person(box, H, W, grow=held_growth(1)) == Rect(79, 58, 321, 542)
-    # 2: half width 220, half height 440, clipped at the top and left only.
-    assert pad_person(box, H, W, grow=held_growth(10)) == Rect(0, 0, 420, 740)
-    assert pad_person(box, H, W, grow=held_growth(50)) == Rect(0, 0, 420, 740)
+    # 1.25: half width 137.5, half height 275.
+    assert pad_person(box, H, W, grow=held_growth(1)) == Rect(62, 25, 338, 575)
+    # 3: half width 330, half height 660, clipped at the top and left only.
+    assert pad_person(box, H, W, grow=held_growth(8)) == Rect(0, 0, 530, 960)
+    assert pad_person(box, H, W, grow=held_growth(50)) == Rect(0, 0, 530, 960)
+    # 2: half width 220, half height 440.
     assert pad_person(box, H, W, grow=2.0) == Rect(0, 0, 420, 740)
 
 
 def test_pad_person_grow_rounds_outward() -> None:
     # Padded x 7.5 to 62.5 (rounded out to 7 and 63), center 35, half width 27.5;
-    # 1.1 gives half width 30.25, so x 4.75 to 65.25, rounded out to 4 and 66.
-    assert pad_person(Box(10, 10, 50, 30), H, W, grow=held_growth(1)).x0 == 4  # type: ignore[union-attr]
-    assert pad_person(Box(10, 10, 50, 30), H, W, grow=held_growth(1)).x1 == 66  # type: ignore[union-attr]
+    # 1.25 gives half width 34.375, so x 0.625 to 69.375, rounded out to 0 and 70.
+    assert pad_person(Box(10, 10, 50, 30), H, W, grow=held_growth(1)).x0 == 0  # type: ignore[union-attr]
+    assert pad_person(Box(10, 10, 50, 30), H, W, grow=held_growth(1)).x1 == 70  # type: ignore[union-attr]
+    # 1.5 gives half width 41.25, so x -6.25 to 76.25: clipped to 0, rounded out to 77.
+    assert pad_person(Box(10, 10, 50, 30), H, W, grow=held_growth(2)).x1 == 77  # type: ignore[union-attr]
 
 
 def test_pad_person_grows_before_clipping() -> None:
@@ -378,9 +393,9 @@ def test_pad_person_grow_contains_ungrown_property() -> None:
 
 
 def test_held_region_frames_is_where_the_growth_reaches_the_cap() -> None:
-    assert HELD_REGION_FRAMES == 10
+    assert HELD_REGION_FRAMES == 8
     assert held_growth(HELD_REGION_FRAMES) == HELD_GROWTH_CAP
-    assert held_growth(HELD_REGION_FRAMES - 1) < HELD_GROWTH_CAP
+    assert held_growth(HELD_REGION_FRAMES - 1) == Fraction(11, 4) < HELD_GROWTH_CAP
 
 
 # --- dilate_px --------------------------------------------------------------
@@ -896,12 +911,23 @@ def test_orphan_indices_name_positions_in_the_input() -> None:
     assert orphan_indices(None, (), None, "face", H, W) == ()
 
 
-def test_orphans_grow_with_their_held_count() -> None:
-    persons = (Box(100, 100, 200, 400), Box(500, 100, 200, 400))
-    grown = orphan_persons(persons, (), None, "face", H, W, held=(0, 10))
-    assert grown == (pad_person(persons[0], H, W), pad_person(persons[1], H, W, grow=2))
-    assert orphan_persons(persons, (), None, "face", H, W, held=None) == tuple(
-        pad_person(p, H, W) for p in persons
+def test_orphans_grow_with_the_held_count_of_their_box() -> None:
+    fresh = Box(100, 100, 200, 400)
+    held = Box(500, 100, 200, 400, held=8)
+    grown = orphan_persons((fresh, held), (), None, "face", H, W)
+    assert grown == (pad_person(fresh, H, W), pad_person(held, H, W, grow=3))
+    assert orphan_persons((Box(500, 100, 200, 400, held=1),), (), None, "face", H, W) == (
+        pad_person(held, H, W, grow=Fraction(5, 4)),
     )
-    with pytest.raises(ValueError, match="one count per person box"):
-        orphan_persons(persons, (), None, "face", H, W, held=(0,))
+    for bad in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="held"):
+            orphan_persons((Box(500, 100, 200, 400, held=bad),), (), None, "face", H, W)  # type: ignore[arg-type]
+
+
+def test_held_count_reads_the_box() -> None:
+    assert held_count(Box(0, 0, 5, 5)) == 0
+    assert held_count(Box(0, 0, 5, 5, held=3)) == 3
+    assert type(held_count(Box(0, 0, 5, 5, held=np.int64(2)))) is int  # type: ignore[arg-type]
+    for bad in (-1, True, np.bool_(True), 1.0, None):
+        with pytest.raises(ValueError, match="held"):
+            held_count(Box(0, 0, 5, 5, held=bad))  # type: ignore[arg-type]

@@ -158,9 +158,10 @@ class ShadowFactory:
         ``--detector motion``: that check comes before the engine's terser
         mandatory error and also rejects a live switch to the motion detector.
 
-        A new mode that replaces a previous :class:`ShadowMode` takes over its
-        held-box memory. Each newly built mode with a mask style, no bodybox and
-        ``--detector motion`` logs :data:`WARN_MASK_WITHOUT_PERSONS` once.
+        Nothing carries over from ``previous`` to a new mode: the held counts
+        travel with the boxes. Each newly built mode with a mask style, no
+        bodybox and ``--detector motion`` logs :data:`WARN_MASK_WITHOUT_PERSONS`
+        once.
         """
         params = parse_params(ctx.options)
         if "bodybox" in params.styles and ctx.config.detector == "motion":
@@ -175,10 +176,7 @@ class ShadowFactory:
             and ctx.config.detector == "motion"
         ):
             logger.warning(WARN_MASK_WITHOUT_PERSONS)
-        # The held-box memory carries over, so a held cover does not shrink on
-        # the frame the options change.
-        held_from = previous if isinstance(previous, ShadowMode) else None
-        return ShadowMode(params, held_from=held_from)
+        return ShadowMode(params)
 
 
 _UNREADABLE = object()

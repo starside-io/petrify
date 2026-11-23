@@ -432,8 +432,9 @@ def test_frames_without_a_detection_are_unchanged_and_a_face_has_only_its_padded
     assert report.stats.failed_closed == 0
     for i, (out, given) in enumerate(zip(sink.images, src.yielded, strict=True)):
         if i in (5, 6, 7):
-            # The same box on consecutive frames counts as held, so its cover grows.
-            _assert_only_covered(out, given, _face_rect(FACE_BOX, held=i - 5), f"frame {i}")
+            # Fresh on every frame (held 0), so the same box on consecutive frames
+            # is not grown.
+            _assert_only_covered(out, given, _face_rect(FACE_BOX), f"frame {i}")
         else:
             assert np.array_equal(out, given), f"frame {i}"
 
@@ -523,9 +524,10 @@ def test_a_face_missing_for_fewer_frames_than_the_hold_stays_covered_at_its_grow
     assert report.stats.failed_closed == 0
     for i, (out, given) in enumerate(zip(sink.images, src.yielded, strict=True)):
         if i >= 5:
-            # Missed on 8 to 10 and held by the tracker at the same box, so the
-            # mode keeps counting it as held and its cover keeps growing.
-            _assert_only_covered(out, given, _face_rect(FACE_BOX, held=i - 5), f"frame {i}")
+            # Fresh on 5 to 7 and 11; missed on 8 to 10 and held by the tracker at
+            # the same box with held 1 to 3, so only those covers grow.
+            held = i - 7 if 8 <= i <= 10 else 0
+            _assert_only_covered(out, given, _face_rect(FACE_BOX, held=held), f"frame {i}")
         else:
             assert np.array_equal(out, given), f"frame {i}"
 
@@ -693,7 +695,7 @@ def test_the_snapshot_lists_the_five_options_and_the_mode_weakened_sentences_and
     assert after.last_error is None
 
 
-def test_equal_style_sets_in_another_order_keep_the_running_mode_and_its_held_faces(
+def test_equal_style_sets_in_another_order_keep_the_running_mode(
     fakes: Fakes, renders: _RenderSpy
 ) -> None:
     fakes.faces.every = lambda index: Detections(faces=(_face(FACE_BOX),))
@@ -713,17 +715,9 @@ def test_equal_style_sets_in_another_order_keep_the_running_mode_and_its_held_fa
     assert report.stats.reconfigurations == 0
     assert report.stats.failed_closed == 0
     assert len({id(mode) for mode in renders.modes}) == 1
-    # The stationary face keeps growing across the change: the held memory survived.
-    for i, (out, given) in enumerate(zip(sink.images, src.yielded, strict=True)):
-        region = _region(_face_rect(FACE_BOX, held=i))
-        assert not out[region].any(), f"frame {i}"
-    smaller = _region(_face_rect(FACE_BOX, held=0))
-    grown = _region(_face_rect(FACE_BOX, held=6))
-    ring = grown & ~smaller & ~_mask()
-    assert ring.any()
-    # A mode rebuilt at the change would start again from the ungrown cover on frame 6.
-    assert np.array_equal(sink.images[6][ring], np.zeros_like(src.yielded[6][ring]))
-    assert src.yielded[6][ring].any()
+    # The face is fresh on every frame, so its cover is the ungrown one throughout.
+    for i, out in enumerate(sink.images):
+        assert not out[_region(_face_rect(FACE_BOX))].any(), f"frame {i}"
 
 
 # ---------------------------------------------------------------------------

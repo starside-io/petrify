@@ -28,7 +28,7 @@ from conftest import ShadowEntryPoint, read_pyproject
 from petrify_shadow import SHADOW, __version__
 from petrify_shadow.mode import ShadowMode
 from petrify_shadow.options import OPTIONS, parse_params
-from petrify_shadow.regions import HELD_REGION_FRAMES, held_growth, pad_person
+from petrify_shadow.regions import pad_person
 
 import petrify.pipeline as pipeline
 from petrify.core import Frame, PetrifyConfig
@@ -172,17 +172,13 @@ def test_run_stream_covers_the_person_box(
     assert report.stats.failed_closed == 0
     assert len(sink.images) == SCENE.total
     for i, (out, given) in enumerate(zip(sink.images, src.yielded, strict=True)):
-        # The fake box is the same on every frame, so the mode sees it as held:
-        # it grows each frame, and from the growth cap on it is no region and
-        # the frame is black.
-        held = i - SCENE.enter
-        if SCENE.enter <= i < SCENE.gone and held >= HELD_REGION_FRAMES:
-            assert not out.any(), f"frame {i}"
-        elif SCENE.enter <= i < SCENE.gone:
+        # The fake box is the same on every frame but fresh (held 0) on each, so
+        # it is never grown and stays a region however long it lasts.
+        if SCENE.enter <= i < SCENE.gone:
             # The padded person box is filled black and the rest is shown. The
             # fake box does not follow the scene's subject: this checks the
             # mechanics end to end, not the detector.
-            rect = pad_person(PERSON, SCENE_H, SCENE_W, grow=held_growth(held))
+            rect = pad_person(PERSON, SCENE_H, SCENE_W)
             assert rect is not None
             box = np.zeros((SCENE_H, SCENE_W), bool)
             box[rect.y0 : rect.y1, rect.x0 : rect.x1] = True

@@ -51,6 +51,7 @@ from petrify.core.detections import Box, DetectionKind, Detections, Face
 from petrify.core.engine import Engine, Output
 from petrify.core.frame import SourceInfo
 from petrify.core.plugin import ModeContext, resolve_options
+from petrify.detectors.tracker import TrackerRefiner
 
 H, W = 120, 160
 SHAPE = (H, W, 3)
@@ -199,7 +200,8 @@ def _check_plan(
         assert result == Plan(action)  # type: ignore[arg-type]
         return
     wants_faces = bool(styles & {"gaussian", "pixelate", "noise", "facebox", "eyebar"})
-    assert result.faces == ((FACE,) if wants_faces and faces == "one" else ())
+    face = _held_face(FACE, face_held)
+    assert result.faces == ((face,) if wants_faces and faces == "one" else ())
     grown = pad_face(FACE.box, params.padding, H, W, grow=held_growth(face_held))  # type: ignore[attr-defined]
     assert result.face_rects == ((grown,) if result.faces else ())
     wants_mask = bool(styles & {"silhouette", "silhouette_color", "outline"})
@@ -211,10 +213,22 @@ def _check_plan(
     assert result.person_rects == expected_people
 
 
-def _held_for(detections: Detections, face_held: int, person_held: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    return (
-        (face_held,) * len(detections.faces or ()),
-        (person_held,) * len(detections.persons or ()),
+def _held_box(box: Box, held: int) -> Box:
+    return dataclasses.replace(box, held=held)
+
+
+def _held_face(face: Face, held: int) -> Face:
+    return dataclasses.replace(face, box=_held_box(face.box, held))
+
+
+def _held_for(detections: Detections, face_held: int, person_held: int) -> Detections:
+    """``detections`` with every face box held ``face_held`` and every person box ``person_held``."""
+    faces = detections.faces
+    persons = detections.persons
+    return dataclasses.replace(
+        detections,
+        faces=None if faces is None else tuple(_held_face(f, face_held) for f in faces),
+        persons=None if persons is None else tuple(_held_box(b, person_held) for b in persons),
     )
 
 
@@ -239,9 +253,8 @@ def test_plan_follows_the_decision_table(
 def test_plan_follows_the_decision_table_for_held_boxes(
     face_held: int, person_held: int, faces: str, mask: str, persons: str, group: str
 ) -> None:
-    detections = _detections(faces, mask, persons)
-    held, held_persons = _held_for(detections, face_held, person_held)
-    result = plan(_params(GROUPS[group]), detections, True, SHAPE, held, held_persons)
+    detections = _held_for(_detections(faces, mask, persons), face_held, person_held)
+    result = plan(_params(GROUPS[group]), detections, True, SHAPE)
     _check_plan(result, True, faces, mask, persons, group, face_held, person_held)
 
 
@@ -325,9 +338,8 @@ def test_plan_written_out_held_cases(
     face_held: int, person_held: int, faces: str, persons: str, group: str, action: str,
     orphans: tuple[Box, ...],
 ) -> None:
-    detections = _detections(faces, "none", persons)
-    held, held_persons = _held_for(detections, face_held, person_held)
-    result = plan(_params(GROUPS[group]), detections, True, SHAPE, held, held_persons)
+    detections = _held_for(_detections(faces, "none", persons), face_held, person_held)
+    result = plan(_params(GROUPS[group]), detections, True, SHAPE)
     assert result.action == action
     grow = held_growth(person_held)
     assert result.orphans == tuple(pad_person(b, H, W, grow=grow) for b in orphans)
@@ -396,8 +408,11 @@ def test_plan_rejects_inputs_it_cannot_decide() -> None:
         plan(dataclasses.replace(params, styles=frozenset()), Detections(), True, SHAPE)
     with pytest.raises(ValueError, match="unknown"):
         plan(dataclasses.replace(params, styles=frozenset({"blur"})), Detections(), True, SHAPE)
-    with pytest.raises(ValueError, match="one count per face"):
-        plan(params, Detections(faces=(FACE,)), True, SHAPE, held=())
+    for bad in (-1, True, 1.5, None):
+        with pytest.raises(ValueError, match="held"):
+            plan(params, Detections(faces=(_held_face(FACE, bad),)), True, SHAPE)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="held"):
+            plan(params, Detections(persons=(_held_box(PERSON_EMPTY, bad),)), True, SHAPE)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="mask shape"):
         plan(_params(["silhouette"]), Detections(mask=np.zeros((H, W + 1), bool)), True, SHAPE)
     with pytest.raises(ValueError):
@@ -406,9 +421,9 @@ def test_plan_rejects_inputs_it_cannot_decide() -> None:
 
 def test_plan_is_pure() -> None:
     params = _params(STYLE_NAMES)
-    detections = _detections("one", "populated", "both")
-    first = plan(params, detections, True, SHAPE, held=(3,))
-    second = plan(params, detections, True, SHAPE, held=(3,))
+    detections = _held_for(_detections("one", "populated", "both"), 3, 2)
+    first = plan(params, detections, True, SHAPE)
+    second = plan(params, detections, True, SHAPE)
     assert first.face_rects == second.face_rects
     assert first.orphans == second.orphans
     assert first.person_rects == second.person_rects
@@ -740,21 +755,35 @@ def test_a_held_face_grows_until_the_cap_and_then_is_no_region() -> None:
     image = _image(0, BIG)
     face = _face_at(95, 95)
     for n in range(CAP):
-        out = _render_faces(mode, image, face)
+        out = _render_faces(mode, image, _held_face(face, n))
         expected = pad_face(face.box, 0.3, 200, 200, grow=held_growth(n))
         assert _filled_rect(out, image) == expected
     assert expected.width > pad_face(face.box, 0.3, 200, 200).width  # type: ignore[union-attr]
     # From the cap on the held face alone no longer localizes the subject: black.
-    for _ in range(3):
-        assert not _render_faces(mode, image, face).any()
+    for n in (CAP, CAP + 1, 15):
+        assert not _render_faces(mode, image, _held_face(face, n)).any()
+
+
+def test_the_held_count_is_read_from_each_box_for_faces_and_persons() -> None:
+    # One instance, frames in no particular order: only the box decides.
+    mode = ShadowMode(_params(["bodybox", "facebox"], color="red"))
+    image = _image(0, BIG)
+    face = _face_at(95, 75)
+    person = Box(80, 60, 40, 100)
+    for face_held, person_held in [(3, 0), (0, 5), (7, 7), (0, 0), (1, 2)]:
+        detections = Detections(faces=(_held_face(face, face_held),),
+                                persons=(_held_box(person, person_held),))
+        out = mode.render(_frame(image), detections, True)
+        want = _region_in(pad_person(person, 200, 200, grow=held_growth(person_held)), BIG)
+        want |= _region_in(pad_face(face.box, 0.3, 200, 200, grow=held_growth(face_held)), BIG)
+        assert np.array_equal(np.any(out != image, axis=2), want), (face_held, person_held)
+        assert _all_color(out, want, RED)
 
 
 def test_a_capped_held_face_is_still_drawn_when_another_region_exists() -> None:
     mode = ShadowMode(_params(["facebox"], color="red"))
     image = _image(0, BIG)
-    held = _face_at(95, 95)
-    for _ in range(CAP + 2):
-        _render_faces(mode, image, held)
+    held = _held_face(_face_at(95, 95), CAP + 2)
     # A fresh second face makes the frame draw; the capped face keeps its cover.
     fresh = _face_at(20, 20)
     out = _render_faces(mode, image, held, fresh)
@@ -773,10 +802,10 @@ def _region_in(rect: Rect | None, shape: tuple[int, ...]) -> np.ndarray:
 def test_camera2_frame_280_held_face_leaves_its_person_box_an_orphan() -> None:
     # Reviewer's numbers: a face held for 2 frames and the person box of the
     # frame; the real face has walked to (439, 128, 13, 15), out of the held cover.
-    held = Face(Box(429, 118, 11, 14))
+    held = Face(Box(429, 118, 11, 14, held=2))
     person = Box(409, 111, 60, 154)
     detections = Detections(faces=(held,), persons=(person,), motion=True)
-    p = plan(_params(["facebox"]), detections, True, (480, 640, 3), held=(2,))
+    p = plan(_params(["facebox"]), detections, True, (480, 640, 3))
     assert p.action == "draw"
     assert p.face_rects == (pad_face(held.box, 0.3, 480, 640, grow=held_growth(2)),)
     assert p.orphans == (pad_person(person, 480, 640),)
@@ -784,7 +813,8 @@ def test_camera2_frame_280_held_face_leaves_its_person_box_an_orphan() -> None:
     r = p.orphans[0]
     assert r.x0 <= x and r.y0 <= y and x + w <= r.x1 and y + h <= r.y1
     # The same face detected fresh still clears the box.
-    assert plan(_params(["facebox"]), detections, True, (480, 640, 3), held=(0,)).orphans == ()
+    fresh = Detections(faces=(_held_face(held, 0),), persons=(person,), motion=True)
+    assert plan(_params(["facebox"]), fresh, True, (480, 640, 3)).orphans == ()
 
 
 def test_a_held_face_with_a_person_box_gives_the_orphan_fill() -> None:
@@ -796,12 +826,12 @@ def test_a_held_face_with_a_person_box_gives_the_orphan_fill() -> None:
     # Fresh face: the person box is cleared and shown outside the face cover.
     face0 = _region(pad_face(FACE.box, 0.3, H, W))
     assert np.array_equal(first[orphan & ~face0], image[orphan & ~face0])
-    # Held face, the person box moved: the box is an orphan, filled black under
-    # the grown face cover.
-    moved = Box(PERSON_FACE.x + 1, PERSON_FACE.y, PERSON_FACE.w, PERSON_FACE.h)
-    out = mode.render(_frame(image), Detections(faces=(FACE,), persons=(moved,)), True)
+    # Held face, fresh person box: the box is an orphan, filled black under the
+    # grown face cover.
+    held = Detections(faces=(_held_face(FACE, 1),), persons=(PERSON_FACE,))
+    out = mode.render(_frame(image), held, True)
     face1 = _region(pad_face(FACE.box, 0.3, H, W, grow=held_growth(1)))
-    box = _region(pad_person(moved, H, W))
+    box = _region(pad_person(PERSON_FACE, H, W))
     assert _all_color(out, face1, RED)
     assert _all_color(out, box & ~face1, BLACK)
 
@@ -811,11 +841,13 @@ def test_held_person_boxes_grow_and_stop_counting_at_the_cap() -> None:
     image = _image(0, BIG)
     person = Box(80, 60, 30, 60)
     for n in range(CAP):
-        out = mode.render(_frame(image), Detections(persons=(person,)), True)
+        held = Detections(persons=(_held_box(person, n),))
+        out = mode.render(_frame(image), held, True)
         assert _filled_rect(out, image) == pad_person(person, 200, 200, grow=held_growth(n))
-    assert not mode.render(_frame(image), Detections(persons=(person,)), True).any()
-    # A frame without person boxes clears the memory.
-    assert not mode.render(_frame(image), Detections(persons=()), True).any()
+    for n in (CAP, CAP + 1, 15):
+        held = Detections(persons=(_held_box(person, n),))
+        assert not mode.render(_frame(image), held, True).any()
+    # The same box detected fresh again is a region with no growth.
     out = mode.render(_frame(image), Detections(persons=(person,)), True)
     assert _filled_rect(out, image) == pad_person(person, 200, 200)
 
@@ -825,7 +857,8 @@ def test_held_orphans_grow() -> None:
     image = _image(0, BIG)
     person = Box(80, 60, 30, 60)
     for n in range(4):
-        out = mode.render(_frame(image), Detections(faces=(), persons=(person,)), True)
+        detections = Detections(faces=(), persons=(_held_box(person, n),))
+        out = mode.render(_frame(image), detections, True)
         rect = pad_person(person, 200, 200, grow=held_growth(n))
         inside = _region_in(rect, BIG)
         assert not out[inside].any()
@@ -871,52 +904,41 @@ def test_eyebar_without_landmarks_fills_the_whole_face_rect() -> None:
     assert np.array_equal(out[~rect], image[~rect])
 
 
-def test_a_changed_box_resets_the_count() -> None:
+@pytest.mark.parametrize("styles", [("facebox",), ("bodybox",), ("facebox", "bodybox")])
+def test_a_fresh_box_equal_to_the_previous_frames_box_is_not_grown_and_stays_a_region(
+    styles: tuple[str, ...],
+) -> None:
+    # Accepted coverage change: the earlier rule took an identical box on the next
+    # frame for a held one, grew it and cut it off after 10 frames.
+    mode = ShadowMode(_params(styles, color="red"))
+    image = _image(0, BIG)
+    face = _face_at(95, 75)
+    person = Box(80, 60, 40, 100)
+    want = np.zeros(BIG[:2], bool)
+    if "facebox" in styles:
+        want |= _region_in(pad_face(face.box, 0.3, 200, 200), BIG)
+    if "bodybox" in styles:
+        want |= _region_in(pad_person(person, 200, 200), BIG)
+    detections = Detections(
+        faces=(face,) if "facebox" in styles else (), persons=(person,)
+    )
+    for i in range(30):
+        out = mode.render(_frame(image, i), detections, True)
+        # With facebox alone the fresh face also clears its person box every
+        # frame, so no orphan fill appears.
+        assert np.array_equal(np.any(out != image, axis=2), want), f"frame {i}"
+
+
+def test_two_faces_are_grown_by_their_own_counts() -> None:
     mode = ShadowMode(_params(["facebox"], color="red"))
     image = _image(0, BIG)
-    for _ in range(3):
-        _render_faces(mode, image, _face_at(95, 95))
-    moved = _face_at(96, 95)
-    out = _render_faces(mode, image, moved)
-    assert _filled_rect(out, image) == pad_face(moved.box, 0.3, 200, 200)
-
-
-def test_a_frame_without_faces_clears_the_memory() -> None:
-    mode = ShadowMode(_params(["facebox"], color="red"))
-    image = _image(0, BIG)
-    face = _face_at(95, 95)
-    for _ in range(3):
-        _render_faces(mode, image, face)
-    assert not mode.render(_frame(image), Detections(faces=()), True).any()
-    out = _render_faces(mode, image, face)
-    assert _filled_rect(out, image) == pad_face(face.box, 0.3, 200, 200)
-
-
-def test_a_pass_frame_without_faces_clears_the_memory() -> None:
-    mode = ShadowMode(_params(["facebox"], color="red"))
-    image = _image(0, BIG)
-    face = _face_at(95, 95)
-    for _ in range(3):
-        _render_faces(mode, image, face)
-    assert mode.render(_frame(image), Detections(), False) is image
-    out = _render_faces(mode, image, face)
-    assert _filled_rect(out, image) == pad_face(face.box, 0.3, 200, 200)
-
-
-def test_two_faces_are_counted_independently() -> None:
-    params = _params(["facebox"], color="red")
-    mode = ShadowMode(params)
-    image = _image(0, BIG)
-    a, b, b2 = _face_at(20, 20), _face_at(150, 150), _face_at(151, 150)
-    expected_counts = [(a, b, (0, 0)), (a, b2, (1, 0)), (a, b2, (2, 1)), (a, b, (3, 0))]
-    for fa, fb, counts in expected_counts:
-        detections = Detections(faces=(fa, fb))
-        want = plan(params, detections, True, BIG, held=counts)
-        out = mode.render(_frame(image), detections, True)
+    a, b = _face_at(20, 20), _face_at(150, 150)
+    for counts in [(0, 0), (1, 0), (0, 3), (2, 7)]:
+        out = _render_faces(mode, image, _held_face(a, counts[0]), _held_face(b, counts[1]))
         drawn = np.zeros(BIG[:2], bool)
-        for rect in want.face_rects:
-            drawn[rect.y0 : rect.y1, rect.x0 : rect.x1] = True
-        assert np.array_equal(np.any(out != image, axis=2), drawn)
+        for face, n in zip((a, b), counts, strict=True):
+            drawn |= _region_in(pad_face(face.box, 0.3, 200, 200, grow=held_growth(n)), BIG)
+        assert np.array_equal(np.any(out != image, axis=2), drawn), counts
 
 
 # ---------------------------------------------------------------------------
@@ -934,100 +956,105 @@ def _ctx(
     return ModeContext(info, config, resolved)
 
 
-def test_create_hands_the_held_memory_to_the_replacing_mode() -> None:
-    big_info = dataclasses.replace(INFO, width=200, height=200)
-    face = _face_at(95, 95)
+def _tracked_engine(
+    mode: ShadowMode, info: SourceInfo, faces: dict[int, Face], persons: dict[int, Box],
+    hold: int = 15,
+) -> Engine:
+    """An engine with fake face and person detectors and the real tracker for both."""
+    refiners = [
+        TrackerRefiner(DetectionKind.PERSONS, iou_threshold=0.3, hold_frames=hold, max_tracks=8),
+        TrackerRefiner(DetectionKind.FACES, iou_threshold=0.3, hold_frames=hold, max_tracks=8,
+                       landmarks=True),
+    ]
+    engine = Engine([_FakeFaces(faces), _FakePersons(persons)], mode, [], [_Sink()],
+                    EngineConfig(lookahead=0, cold_start_frames=0), refiners=refiners)
+    engine.open(info)
+    return engine
+
+
+BIG_INFO = dataclasses.replace(INFO, width=200, height=200)
+TRACKED_FACE = Face(Box(95, 75, 10, 10), landmarks=((97.0, 78.0), (103.0, 78.0)))
+TRACKED_PERSON = Box(80, 60, 40, 100)
+def _big_frame(image: np.ndarray, index: int) -> Frame:
+    return Frame(image=image, index=index, timestamp=index / 10.0, source=BIG_INFO)
+
+
+DETECTED = range(4)
+"""Frames on which the fake detectors find the face and the person; missed from then on."""
+
+
+@pytest.mark.parametrize("switch", [None, 2, 6, 11])
+def test_a_live_option_change_covers_exactly_as_the_old_mode_would_have(
+    switch: int | None,
+) -> None:
+    # strength does not change facebox or bodybox output, so a mode built for it
+    # must render every frame exactly like the old instance: the held count
+    # travels with the box, not with the mode.
+    styles = ("facebox", "bodybox")
+    faces = {i: TRACKED_FACE for i in DETECTED}
+    persons = {i: TRACKED_PERSON for i in DETECTED}
     image = _image(0, BIG)
 
-    def widths(switch: int | None) -> list[int]:
-        mode = SHADOW.create(_ctx(("facebox",), info=big_info, color="red"))
-        out = []
-        for i in range(8):
-            if i == switch:
-                mode = SHADOW.create(_ctx(("facebox",), info=big_info, color="red", padding=0.31), mode)
-            out.append(_filled_rect(_render_faces(mode, image, face), image).width)
-        return out
-
-    continuous, switched = widths(None), widths(4)
-    assert all(s >= c for s, c in zip(switched, continuous, strict=True))
-    # The replacing mode starts from the previous count, not from 0.
-    assert switched[4] == pad_face(face.box, 0.31, 200, 200, grow=held_growth(4)).width  # type: ignore[union-attr]
-
-
-@pytest.mark.parametrize("styles", [("bodybox",), ("facebox",)])
-def test_the_held_person_memory_is_handed_over_too(styles: tuple[str, ...]) -> None:
-    # Observable as the grown bodybox rect (bodybox) or orphan rect (facebox, no
-    # face) on the first frame of the replacing mode.
-    big_info = dataclasses.replace(INFO, width=200, height=200)
-    person = Box(80, 60, 30, 60)
-    image = _image(0, BIG)
-    detections = Detections(faces=(), persons=(person,))
-    expected = pad_person(person, 200, 200, grow=held_growth(3))
-    old = SHADOW.create(_ctx(styles, info=big_info, color="red"))
-    for _ in range(3):
-        old.render(_frame(image), detections, True)
-    direct = ShadowMode(_params(styles, color="red", padding=0.4), held_from=old)  # type: ignore[arg-type]
-    built = SHADOW.create(_ctx(styles, info=big_info, color="red", padding=0.4), old)
-    assert built is not old
-    for mode in (direct, built):
-        out = mode.render(_frame(image), detections, True)
-        changed = np.any(out != image, axis=2)
-        assert np.array_equal(changed, _region_in(expected, BIG))
-
-
-def test_reviewer_reconfigure_sequence_keeps_the_held_cover() -> None:
-    # reconf.py: a face detected on frames 0 to 4, then held by the tracker; the
-    # options change on frame 12. The cover must not shrink on the switch.
-    from petrify.detectors.tracker import TrackerRefiner
-
-    h, w = 200, 300
-    info = SourceInfo(width=w, height=h, fps=25.0, frame_count=None, seekable=False,
-                      live=True, uri="t")
-    face = Face(Box(100, 80, 20, 24), landmarks=((106.0, 88.0), (114.0, 88.0)))
-
-    class Faces:
-        provides = frozenset({DetectionKind.FACES, DetectionKind.LANDMARKS})
-        stateful = False
-
-        def detect(self, frame: Frame) -> Detections:
-            return Detections(faces=(face,) if frame.index < 5 else ())
-
-        def reset(self) -> None:
-            pass
-
-    def widths(switch: int | None) -> list[int]:
-        mode = SHADOW.create(_ctx(("facebox",), info=info, color="red"))
-        tracker = TrackerRefiner(
-            DetectionKind.FACES, iou_threshold=0.3, hold_frames=15, max_tracks=8, landmarks=True
-        )
-        engine = Engine([Faces()], mode, [], [_Sink()],
-                        EngineConfig(lookahead=0, cold_start_frames=0), refiners=[tracker])
-        engine.open(info)
-        img = np.full((h, w, 3), 128, np.uint8)
+    def run(switch: int | None) -> list[np.ndarray]:
+        mode = SHADOW.create(_ctx(styles, info=BIG_INFO, color="red"))
+        engine = _tracked_engine(mode, BIG_INFO, faces, persons)  # type: ignore[arg-type]
         outs: list[Output] = []
-        for i in range(20):
+        for i in range(14):
             if i == switch:
-                new = SHADOW.create(_ctx(("facebox",), info=info, color="red", padding=0.31), mode)
+                new = SHADOW.create(_ctx(styles, info=BIG_INFO, color="red", strength="low"), mode)
+                assert new is not mode
                 engine.reconfigure(mode=new)
-            outs += engine.step(Frame(image=img, index=i, timestamp=i / 25, source=info))
+            outs += engine.step(_big_frame(image, i))
         outs += engine.flush()
         engine.close()
-        result = []
-        for o in outs:
-            red = np.all(o.image == np.array(RED, np.uint8), axis=2)
-            result.append(int(red.any(axis=0).sum()) if red.any() else 0)
-        return result
+        return [o.image for o in outs]
 
-    # The reviewer switched on frame 12. The face box is the same from frame 0, so
-    # its count reaches the cap on frame 10 and frames 10 on are black either way;
-    # switching on frame 7 keeps the switch frame inside the trusted range.
-    for switch in (7, 12):
-        continuous, switched = widths(None), widths(switch)
-        assert all(s >= c for s, c in zip(switched, continuous, strict=True)), (
-            continuous, switched
+    continuous, switched = run(None), run(switch)
+    assert len(continuous) == len(switched) == 14
+    for i, (a, b) in enumerate(zip(continuous, switched, strict=True)):
+        assert np.array_equal(a, b), f"frame {i}"
+
+
+@pytest.mark.parametrize("styles", [("facebox",), ("facebox", "bodybox")])
+def test_tracker_held_face_and_person_grow_then_turn_black_past_the_cut_off(
+    styles: tuple[str, ...],
+) -> None:
+    # Through the real engine and the real TrackerRefiner: detected on frames 0
+    # to 3, then held with counts 1, 2, ... from frame 4 on.
+    faces = {i: TRACKED_FACE for i in DETECTED}
+    persons = {i: TRACKED_PERSON for i in DETECTED}
+    image = _image(0, BIG)
+    engine = _tracked_engine(ShadowMode(_params(styles, color="red")), BIG_INFO, faces, persons)
+    outs: list[Output] = []
+    for i in range(14):
+        outs += engine.step(_big_frame(image, i))
+    outs += engine.flush()
+    assert engine.close().failed_closed == 0
+    assert [o.trace.index for o in outs] == list(range(14))
+    last = DETECTED.stop - 1
+    for o in outs:
+        i, out = o.trace.index, o.image
+        held = max(i - last, 0)
+        if held >= HELD_REGION_FRAMES:
+            # Both boxes are past the cut-off and nothing else localizes the subject.
+            assert not out.any(), f"frame {i}"
+            continue
+        face_rect = _region_in(
+            pad_face(TRACKED_FACE.box, 0.3, 200, 200, grow=held_growth(held)), BIG
         )
-    assert widths(7)[7] >= widths(None)[7] > 0
-    assert widths(None)[HELD_REGION_FRAMES:] == [0] * (20 - HELD_REGION_FRAMES)
+        # A held face does not clear its person box, so with facebox alone the
+        # held person box is an orphan, filled black; bodybox fills it red.
+        person_rect = _region_in(pad_person(TRACKED_PERSON, 200, 200, grow=held_growth(held)), BIG)
+        if held == 0 and styles == ("facebox",):
+            person_rect = np.zeros(BIG[:2], bool)
+        assert np.array_equal(np.any(out != image, axis=2), face_rect | person_rect), f"frame {i}"
+        assert _all_color(out, face_rect, RED), f"frame {i}"
+        if person_rect.any():
+            body_color = RED if "bodybox" in styles else BLACK
+            assert _all_color(out, person_rect & ~face_rect, body_color), f"frame {i}"
+    # The cut-off frame is the derived one: 8 held frames after the last detection.
+    assert HELD_REGION_FRAMES == 8
+    assert outs[last + 7].image.any() and not outs[last + 8].image.any()
 
 
 @pytest.mark.parametrize(
@@ -1078,8 +1105,7 @@ def test_noise_is_not_reproducible_through_create() -> None:
     a = first.render(_frame(image), detections, True)[region]
     b = second.render(_frame(image), detections, True)[region]
     assert _equal_share(a, b) < 0.05
-    # One mode, consecutive frames: the box is held the second time, so compare
-    # only the first frame's rect, which the grown rect contains.
+    # One mode, consecutive frames: the noise differs between them too.
     c = first.render(_frame(image, 1), detections, True)[region]
     assert _equal_share(a, c) < 0.05
 
@@ -1289,13 +1315,13 @@ def test_draw_requires_a_writable_contiguous_out() -> None:
 
 
 def _timing_case(
-    h: int, w: int, styles: tuple[str, ...], n_faces: int, shift: int = 0
+    h: int, w: int, styles: tuple[str, ...], n_faces: int
 ) -> tuple[Frame, Detections]:
     image = np.random.default_rng(0).integers(1, 256, (h, w, 3), dtype=np.uint8)
     fw = max(8, w // 16)
     faces = []
     for k in range(n_faces):
-        x = (k % 5) * (w // 5) + w // 20 + shift
+        x = (k % 5) * (w // 5) + w // 20
         y = (k // 5) * (h // 3) + h // 10
         faces.append(Face(Box(x, y, fw, fw), landmarks=((x + fw * 0.3, y + fw * 0.4),
                                                         (x + fw * 0.7, y + fw * 0.4))))
@@ -1305,7 +1331,7 @@ def _timing_case(
         m = np.zeros((h, w), np.uint8)
         cv2.ellipse(m, (w // 2, h // 2), (w // 8, h // 3), 0, 0, 360, 1, -1)
         mask = m.astype(bool)
-        persons = (Box(w // 2 - w // 8 + shift, h // 6, w // 4, 2 * h // 3),)
+        persons = (Box(w // 2 - w // 8, h // 6, w // 4, 2 * h // 3),)
     frame = Frame(image=image, index=0, timestamp=0.0, source=INFO)
     return frame, Detections(faces=tuple(faces), mask=mask, persons=persons)
 
@@ -1319,15 +1345,13 @@ def test_render_timing_is_printed() -> None:
     ]
     lines = []
     for (h, w), (name, styles, n) in itertools.product(((480, 640), (1080, 1920)), cases):
-        # Boxes alternate by one pixel, so no box is held and no frame turns
-        # black at the growth cap, which would time a plain zero fill.
-        variants = [_timing_case(h, w, styles, n, shift) for shift in (0, 1)]
+        frame, detections = _timing_case(h, w, styles, n)
         mode = ShadowMode(_params(styles))
-        mode.render(*variants[0], True)  # Warm up caches.
+        mode.render(frame, detections, True)  # Warm up caches.
         runs = 30
         start = time.perf_counter()
-        for k in range(runs):
-            mode.render(*variants[k % 2], True)
+        for _ in range(runs):
+            mode.render(frame, detections, True)
         ms = (time.perf_counter() - start) / runs * 1000
         lines.append(f"{w}x{h} {name}: {ms:.2f} ms")
     print("\nshadow render timing:\n  " + "\n  ".join(lines))

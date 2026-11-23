@@ -41,7 +41,7 @@ from typing import ClassVar, Literal
 
 import numpy as np
 
-from petrify.core.detections import Box, DetectionKind, Detections, Face
+from petrify.core.detections import DetectionKind, Detections, Face
 from petrify.core.frame import Frame
 from petrify.core.plugin import DetectPolicy
 from petrify_shadow.options import (
@@ -57,6 +57,7 @@ from petrify_shadow.regions import (
     Primary,
     Rect,
     dilate_px,
+    held_count,
     held_growth,
     orphan_indices,
     pad_face,
@@ -202,20 +203,6 @@ def _frame_size(shape: Sequence[int]) -> tuple[int, int]:
     return int(shape[0]), int(shape[1])
 
 
-def _held_counts(held: Sequence[int] | None, n: int, what: str) -> tuple[int, ...]:
-    if held is None:
-        return (0,) * n
-    counts = tuple(held)
-    if len(counts) != n:
-        raise ValueError(f"held counts must give one count per {what}: {len(counts)} for {n}")
-    for count in counts:
-        if isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)):
-            raise ValueError(f"held counts must be integers, got {count!r}")
-        if count < 0:
-            raise ValueError(f"held counts must not be negative, got {count}")
-    return counts
-
-
 def _trusted(count: int) -> bool:
     """True when a box held ``count`` frames still counts as a region."""
     return count < HELD_REGION_FRAMES
@@ -232,16 +219,14 @@ def plan(
     detections: Detections,
     subject_present: bool,
     shape: Sequence[int],
-    held: Sequence[int] | None = None,
-    held_persons: Sequence[int] | None = None,
 ) -> Plan:
     """Return what to do with a frame of ``shape``; pure, draws nothing.
 
-    ``held`` gives, per entry of ``detections.faces`` and in the same order, the
-    number of consecutive earlier frames the box was seen unchanged (see
-    :class:`ShadowMode`); ``held_persons`` does the same for
-    ``detections.persons``. None means 0 for every box. Every face rect, bodybox
-    rect and orphan rect is padded with ``grow=held_growth(count)`` of its box.
+    The held count of each face and person box is its own
+    :attr:`~petrify.core.detections.Box.held`: the refined frames the box has
+    been carried without a matching detection, set by a refiner such as the
+    tracker, 0 for a box detected on this frame. Every face rect, bodybox rect and
+    orphan rect is padded with ``grow=held_growth(count)`` of its box.
 
     Rules, in order:
 
@@ -278,16 +263,16 @@ def plan(
     unless a person box makes that person an orphan. The mask share minimum only
     stops a few stray pixels from doing this; it does not solve it.
 
-    Raises ValueError for a style set the mode cannot draw, held counts of the
-    wrong length or not non-negative integers, a mask whose shape is not the
-    frame's, or a malformed box.
+    Raises ValueError for a style set the mode cannot draw, a box whose ``held``
+    is not a non-negative integer, a mask whose shape is not the frame's, or a
+    malformed box.
     """
     styles = _checked_styles(params.styles)
     h, w = _frame_size(shape)
     faces = detections.faces or ()
     persons = detections.persons
-    face_counts = _held_counts(held, len(faces), "face")
-    person_counts = _held_counts(held_persons, len(persons or ()), "person box")
+    face_counts = tuple(held_count(face.box) for face in faces)
+    person_counts = tuple(held_count(box) for box in persons or ())
     mask = detections.mask
     if mask is not None and tuple(mask.shape) != (h, w):
         raise ValueError(f"mask shape {mask.shape} does not match the frame {(h, w)}")
@@ -410,44 +395,43 @@ def draw(out: np.ndarray, p: Plan, params: ShadowParams, rng: np.random.Generato
             apply_eyebar(out, face, rect, color)
 
 
-BoxKey = tuple[int, int, int, int]
-
-
-def _advance(memory: dict[BoxKey, int], boxes: Sequence[Box]) -> tuple[dict[BoxKey, int], tuple[int, ...]]:
-    """Return the new memory and the held count of each box, from the previous frame's memory."""
-    keys = [(box.x, box.y, box.w, box.h) for box in boxes]
-    counts = tuple(memory[key] + 1 if key in memory else 0 for key in keys)
-    return dict(zip(keys, counts, strict=True)), counts
-
-
 class ShadowMode:
     """Cover the selected regions on frames with a subject, as decided by :func:`plan`.
 
-    Held boxes. With ``--track`` a face or person the detector misses keeps its
-    last box unchanged, so a moving subject can leave it. The mode therefore
-    remembers the face boxes and the person boxes of the previous frame it
-    rendered, each keyed by ``(x, y, w, h)``. A box equal to one of the same kind
-    on the previous frame is held: its count is that box's count plus one, and
-    its padded rect is grown by :func:`~petrify_shadow.regions.held_growth` (10
-    percent per held frame, at most 2 times). Any other box has count 0. Each
-    memory holds only the previous frame's boxes, so a box that changes resets
-    its count, and a frame without faces (or without person boxes) clears that
-    memory. Both are updated on every rendered frame, whatever the action.
+    Held boxes. With ``--track`` the tracker keeps the last box of a face or
+    person the detector misses, unchanged, so a moving subject can leave it. The
+    tracker marks such a box with its held count (:attr:`Box.held
+    <petrify.core.detections.Box.held>`, the frames since its last matching
+    detection), and the mode reads that count from each box. A held box's padded
+    rect is grown by :func:`~petrify_shadow.regions.held_growth` (25 percent per
+    held frame, at most 3 times); a box with count 0 is not grown.
 
     How held boxes are trusted (see :func:`plan`): a held face never clears its
     person box from the orphan rule, and a held box whose count has reached
-    :data:`~petrify_shadow.regions.HELD_REGION_FRAMES` (the growth cap) is drawn
-    but does not count as a region, so a frame with nothing else turns black.
+    :data:`~petrify_shadow.regions.HELD_REGION_FRAMES` (8, the growth cap) is
+    drawn but does not count as a region, so a frame with nothing else turns
+    black. A held cover below the cap can still miss a subject that moved faster
+    than it grows.
 
-    Limits, accepted: a box that truly stays still is also seen as held, grows up
-    to the cap and then stops counting as a region, which only covers more. The
-    score is not part of the key, so a fresh detection with the exact same box as
-    the previous frame counts as held too, with the same effect. A held cover
-    below the cap can still miss a subject that moved faster than it grows.
+    Two coverage changes against the earlier rule, which guessed held boxes by
+    comparing each box with the previous frame's boxes, accepted because the box
+    is in fact fresh:
 
-    The memory belongs to the instance. A mode built to replace another one,
-    after a live option change, takes it over through ``held_from``, so a held
-    cover does not shrink on the switch frame.
+    1. A fresh detection identical to the previous frame's box is no longer
+       treated as held: it gets no growth, and a face with such a box clears its
+       person box from the orphan rule.
+    2. A still subject with fresh detections is no longer cut off: its boxes
+       stay regions however many identical frames follow, where the earlier rule
+       stopped counting them after 10 identical frames and turned a frame
+       with nothing else black.
+
+    On every other frame the mode covers at least as much as before: a held box
+    whose last detection differed from the box on the frame before it gets the
+    same count as before, with more growth and an earlier cut-off.
+
+    State: apart from its noise generator the mode keeps no per-frame state, since
+    the held count travels with each box. A new instance built after a live
+    option change therefore covers exactly as the old one would have.
     """
 
     name: ClassVar[str] = "shadow"
@@ -460,7 +444,6 @@ class ShadowMode:
         params: ShadowParams,
         *,
         rng: np.random.Generator | None = None,
-        held_from: ShadowMode | None = None,
     ) -> None:
         self.params = params
         # Per instance, since they follow the selected styles; the registry checks
@@ -470,14 +453,6 @@ class ShadowMode:
         # No seed: the noise style must not be reproducible, so the generator draws
         # its seed from OS entropy. Only tests pass a seeded one.
         self._rng = rng if rng is not None else np.random.default_rng()
-        self._held_faces: dict[BoxKey, int] = {}
-        self._held_persons: dict[BoxKey, int] = {}
-        if held_from is not None:
-            if not isinstance(held_from, ShadowMode):
-                raise TypeError(f"held_from must be a ShadowMode, got {type(held_from).__name__}")
-            # Copies, so the two instances never share state.
-            self._held_faces = dict(held_from._held_faces)
-            self._held_persons = dict(held_from._held_persons)
 
     def render(self, frame: Frame, detections: Detections, subject_present: bool) -> np.ndarray:
         """Return ``frame.image`` itself, a new black image, or a covered copy.
@@ -486,13 +461,7 @@ class ShadowMode:
         :func:`plan` refuses; the engine then fails the frame closed.
         """
         image = _checked_image(frame.image)
-        # Counted before planning, so a frame that then fails still advances the
-        # memory: a held box keeps growing rather than starting over.
-        self._held_faces, face_counts = _advance(
-            self._held_faces, [face.box for face in detections.faces or ()]
-        )
-        self._held_persons, person_counts = _advance(self._held_persons, detections.persons or ())
-        p = plan(self.params, detections, subject_present, image.shape, face_counts, person_counts)
+        p = plan(self.params, detections, subject_present, image.shape)
         if p.action == "pass":
             return frame.image
         if p.action == "black":
