@@ -27,7 +27,13 @@ from typing import Any
 import cv2
 
 from petrify.core.frame import Frame, SourceInfo
-from petrify.sources.stream import _JOIN_TIMEOUT, _LatestFrameReader, _open_live, _usable_fps
+from petrify.sources.stream import (
+    _JOIN_TIMEOUT,
+    _check_read_timeout,
+    _LatestFrameReader,
+    _open_live,
+    _usable_fps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,10 @@ class CameraSource:
     driver reports a width or height that is not positive, frames are read
     during construction until one arrives and its size is used; that frame is
     discarded.
+
+    ``read_timeout`` (seconds, above 0) ends iteration with ``OSError`` when no
+    frame arrives for that long, the first frame included, as ``StreamSource``
+    does. ``None`` waits without limit.
     """
 
     def __init__(
@@ -57,10 +67,12 @@ class CameraSource:
         capture_factory: Callable[[int], Any] = cv2.VideoCapture,
         clock: Callable[[], float] = time.monotonic,
         *,
+        read_timeout: float | None = None,
         _join_timeout: float = _JOIN_TIMEOUT,
     ) -> None:
         if max_read_failures < 1:
             raise ValueError("max_read_failures must be at least 1")
+        _check_read_timeout(read_timeout)
 
         def configure(cap: Any) -> None:
             if width is not None:
@@ -97,6 +109,7 @@ class CameraSource:
             max_read_failures=max_read_failures,
             clock=clock,
             join_timeout=_join_timeout,
+            read_timeout=read_timeout,
         )
         logger.info(
             "Input: %s  |  %dx%d @ %.2f fps  |  live",

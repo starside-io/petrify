@@ -92,11 +92,14 @@ def open_source(
     *,
     fps: float | None = None,
     capture_factory: Callable[[Any], Any] | None = None,
+    read_timeout: float | None = None,
 ) -> Source:
     """Open the source a spec names (see :func:`source_kind` for the forms).
 
     ``fps`` sets the frame rate of an image folder (default 25). ``capture_factory``
-    replaces ``cv2.VideoCapture`` for the live sources (tests). A missing video
+    replaces ``cv2.VideoCapture`` for the live sources (tests). ``read_timeout``
+    (seconds) makes a live source raise ``OSError`` when no frame arrives for that
+    long; it raises ``ValueError`` for a file or an image folder. A missing video
     file raises ``FileNotFoundError``; for a bare integer the message suggests
     ``camera:N``. No error message holds a spec with ``@`` or ``://`` other than
     as :func:`display_spec` shows it.
@@ -105,6 +108,11 @@ def open_source(
     live_kwargs: dict[str, Any] = {}
     if capture_factory is not None:
         live_kwargs["capture_factory"] = capture_factory
+    if read_timeout is not None:
+        if kind not in ("camera", "stream"):
+            # A file or folder never stalls; accepting it silently would hide a mistake.
+            raise ValueError("read_timeout applies only to a camera or a stream source")
+        live_kwargs["read_timeout"] = read_timeout
     if kind == "camera":
         return CameraSource(int(spec.partition(":")[2]), **live_kwargs)
     if kind == "stream":

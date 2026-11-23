@@ -940,3 +940,249 @@ def test_release_error_does_not_escape_capture_thread(
     assert escaped == []
     assert fake.release_count == 1
     _assert_release_warning(caplog)
+
+
+# --- read_timeout (--source-timeout) ------------------------------------------------------
+
+TIMEOUT = 0.2  # Short, so the tests stay fast; the upper bounds below are generous.
+
+
+class _StallingCapture(FakeCapture):
+    """Delivers ``frames`` images, then ``read`` blocks until ``unblock`` is set."""
+
+    def __init__(self, frames: int, *, width: int = WIDTH, height: int = HEIGHT) -> None:
+        super().__init__(
+            [make_image(v + 1, width, height) for v in range(frames)], width=width, height=height
+        )
+        self.remaining = frames
+        self.stalled = threading.Event()
+        self.unblock = threading.Event()
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        if self.remaining > 0:
+            self.remaining -= 1
+            return super().read()
+        self.stalled.set()
+        self.unblock.wait()
+        return False, None
+
+
+def _expect_timeout(it: Iterator[Any], label: str) -> float:
+    """Call ``next(it)`` until it raises the timeout; return the seconds the raising call took."""
+    while True:
+        started = time.monotonic()
+        try:
+            next(it)
+        except OSError as exc:
+            elapsed = time.monotonic() - started
+            assert str(exc) == f"{label}: no frame received within {TIMEOUT:g} s"
+            return elapsed
+
+
+@pytest.mark.parametrize(
+    ("factory", "label"),
+    [(stream_source, "stream rtsp://cam.example"), (camera_source, "camera:0")],
+)
+@pytest.mark.parametrize("frames", [0, 3], ids=["first-frame", "mid-stream"])
+def test_read_timeout_ends_a_stalled_source_with_oserror(
+    factory: Any, label: str, frames: int
+) -> None:
+    fake = _StallingCapture(frames)
+    src = factory(fake, max_read_failures=3, read_timeout=TIMEOUT)
+    it = iter(src)
+    try:
+        elapsed = _expect_timeout(it, label)
+        assert fake.stalled.is_set()
+        assert TIMEOUT * 0.5 <= elapsed < WAIT
+        # The error ends the iteration for good.
+        with pytest.raises(StopIteration):
+            next(it)
+        (capture_thread,) = capture_threads()  # Still inside the stalled read().
+        assert fake.release_count == 0
+    finally:
+        fake.unblock.set()
+    # The thread ends as soon as read() returns, without close(), and releases the capture.
+    capture_thread.join(WAIT)
+    assert not capture_thread.is_alive()
+    assert fake.release_count == 1
+    src.close()
+    assert fake.release_count == 1
+
+
+def test_read_timeout_counts_from_the_last_frame_not_from_the_start() -> None:
+    # Frames keep arriving, each well within the timeout, for longer than the timeout
+    # in total: the source must not time out.
+    fake = FakeCapture([make_image(v) for v in range(1, 9)], gated=True)
+    src = stream_source(fake, max_read_failures=1, read_timeout=TIMEOUT)
+    it = iter(src)
+    received = []
+    started = time.monotonic()
+    for _ in range(8):
+        time.sleep(TIMEOUT / 4)
+        fake.allow(1)
+        received.append(int(next(it).image[0, 0, 0]))
+    assert time.monotonic() - started > TIMEOUT
+    assert received == list(range(1, 9))
+    fake.open_gate()  # Then the script runs out: the normal end, not a timeout.
+    with pytest.raises(StopIteration):
+        next(it)
+    src.close()
+
+
+@pytest.mark.parametrize("factory", [stream_source, camera_source])
+def test_read_timeout_leaves_frames_that_arrive_in_time_unchanged(factory: Any) -> None:
+    def run(**kwargs: Any) -> list[tuple[int, float, int]]:
+        fake = FakeCapture([make_image(v) for v in (10, 20, 30)], gated=True)
+        src = factory(fake, max_read_failures=1, clock=FakeClock(), **kwargs)
+        it = iter(src)
+        got = []
+        for _ in range(3):
+            fake.allow(1)
+            frame = next(it)
+            got.append((frame.index, frame.timestamp, int(frame.image[0, 0, 0])))
+        fake.open_gate()
+        assert list(it) == []
+        src.close()
+        return got
+
+    with_timeout = run(read_timeout=WAIT)
+    assert with_timeout == run()
+    assert [v for _, _, v in with_timeout] == [10, 20, 30]
+
+
+def test_without_read_timeout_a_stalled_source_keeps_waiting() -> None:
+    fake = _StallingCapture(0)
+    src = stream_source(fake, max_read_failures=3, _join_timeout=0.01)
+    result: list[Any] = []
+    consumer = threading.Thread(target=lambda: result.append(list(src)))
+    consumer.start()
+    try:
+        assert fake.stalled.wait(WAIT)
+        consumer.join(TIMEOUT * 3)
+        assert consumer.is_alive()  # No timeout: still waiting, as before.
+        src.close()
+        consumer.join(WAIT)
+        assert result == [[]]
+    finally:
+        fake.unblock.set()
+        consumer.join(WAIT)
+    for thread in capture_threads():
+        thread.join(WAIT)
+
+
+def test_read_timeout_message_never_holds_the_credentials() -> None:
+    fake = _StallingCapture(0)
+    src = StreamSource(SECRET_URL, max_read_failures=3, capture_factory=lambda _url: fake,
+                       read_timeout=TIMEOUT)
+    try:
+        with pytest.raises(OSError) as excinfo:
+            next(iter(src))
+    finally:
+        fake.unblock.set()
+        src.close()
+    text = str(excinfo.value)
+    assert text == f"stream rtsp://***@cam.example:554: no frame received within {TIMEOUT:g} s"
+    assert SECRET not in text and TOKEN not in text
+
+
+@pytest.mark.parametrize("live", ["stream", "camera"])
+@pytest.mark.parametrize("value", [0, -1.0, math.nan, math.inf])
+def test_invalid_read_timeout_rejected_before_opening(live: str, value: float) -> None:
+    opened: list[Any] = []
+
+    def capture_factory(arg: Any) -> FakeCapture:
+        opened.append(arg)
+        return FakeCapture()
+
+    kwargs: dict[str, Any] = {"capture_factory": capture_factory, "read_timeout": value}
+    with pytest.raises(ValueError, match="read_timeout must be a finite number above 0"):
+        if live == "stream":
+            StreamSource("rtsp://cam.example/live", **kwargs)
+        else:
+            CameraSource(**kwargs)
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("spec", "cls"), [("rtsp://cam.example/live", StreamSource), ("camera:0", CameraSource)]
+)
+def test_open_source_passes_read_timeout_to_live_sources(spec: str, cls: type) -> None:
+    from petrify.sources import open_source  # noqa: PLC0415
+
+    fake = _StallingCapture(0)
+    src = open_source(spec, capture_factory=lambda _arg: fake, read_timeout=TIMEOUT)
+    try:
+        assert isinstance(src, cls)
+        with pytest.raises(OSError, match="no frame received within"):
+            next(iter(src))
+    finally:
+        fake.unblock.set()
+        src.close()
+
+
+def test_open_source_rejects_read_timeout_for_a_file_or_folder(tmp_path: Any) -> None:
+    from petrify.sources import open_source  # noqa: PLC0415
+
+    for spec in (str(tmp_path / "clip.mp4"), str(tmp_path)):
+        with pytest.raises(ValueError, match="read_timeout applies only to a camera or a stream"):
+            open_source(spec, read_timeout=TIMEOUT)
+
+
+class _ListSink:
+    """Records every written image, and whether the run closed or aborted it."""
+
+    critical = True
+
+    def __init__(self) -> None:
+        self.images: list[np.ndarray] = []
+        self.opened = self.closed = self.aborted = 0
+
+    def open(self, info: Any) -> None:
+        self.opened += 1
+
+    def write(self, image: np.ndarray, meta: Any) -> None:
+        self.images.append(image.copy())
+
+    def close(self) -> None:
+        self.closed += 1
+
+    def abort(self) -> None:
+        self.aborted += 1
+
+
+def test_read_timeout_through_run_stream_keeps_the_processed_recording(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from petrify.core.config import (  # noqa: PLC0415
+        BackgroundConfig,
+        EngineConfig,
+        PetrifyConfig,
+        RoiConfig,
+    )
+    from petrify.pipeline import OutputConfig, run_stream  # noqa: PLC0415
+
+    frames = 12
+    # Motion detector and no sample check: HOG never runs on these small frames.
+    fake = _StallingCapture(frames, width=192, height=144)
+    src = stream_source(fake, max_read_failures=3, read_timeout=TIMEOUT, _join_timeout=0.01)
+    sink = _ListSink()
+    config = PetrifyConfig(
+        roi=RoiConfig(mode="disabled"),
+        background=BackgroundConfig(strategy="running", sample_check=False),
+        engine=EngineConfig(lookahead=3),
+    )
+    try:
+        with (
+            caplog.at_level(logging.ERROR, logger="petrify.pipeline"),
+            pytest.raises(OSError, match=r"stream rtsp://cam\.example: no frame received within"),
+        ):
+            run_stream(src, config, OutputConfig(), sinks=[sink])
+    finally:
+        fake.unblock.set()
+    # The existing live-error path: the outputs are finalized, not aborted, and every
+    # frame the source delivered was written (the lookahead tail included).
+    assert (sink.opened, sink.closed, sink.aborted) == (1, 1, 0)
+    assert len(sink.images) == frames - src.dropped > 0
+    assert "the recording up to that point was kept" in caplog.text
+    for thread in capture_threads():
+        thread.join(WAIT)

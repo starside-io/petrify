@@ -169,6 +169,11 @@ def _probe_size(cap: Any, *, label: str, max_read_failures: int) -> tuple[int, i
     raise OSError(f"{message} after {max_read_failures} failed reads")
 
 
+def _check_read_timeout(read_timeout: float | None) -> None:
+    if read_timeout is not None and not (math.isfinite(read_timeout) and read_timeout > 0):
+        raise ValueError(f"read_timeout must be a finite number above 0, got {read_timeout}")
+
+
 def _usable_fps(value: float) -> bool:
     return math.isfinite(value) and value > 0
 
@@ -192,6 +197,7 @@ class _LatestFrameReader:
         max_read_failures: int,
         clock: Callable[[], float],
         join_timeout: float = _JOIN_TIMEOUT,
+        read_timeout: float | None = None,
     ) -> None:
         self._capture = capture
         self._info = info
@@ -199,6 +205,7 @@ class _LatestFrameReader:
         self._max_read_failures = max_read_failures
         self._clock = clock
         self._join_timeout = join_timeout
+        self._read_timeout = read_timeout
 
         self._cond = threading.Condition()
         # State below is guarded by _cond.
@@ -213,6 +220,11 @@ class _LatestFrameReader:
         self._dropped = 0
         self._iterating = False
         self._next_index = 0
+        # time.monotonic() when the last frame was published (or the thread
+        # started), for read_timeout. Not ``clock``: that one makes the frame
+        # timestamps and may be a fake in tests.
+        self._last_arrival = 0.0
+        self._timeout_message: str | None = None
 
         self._closing = threading.Event()  # Interrupts the retry wait in the thread.
         self._release_lock = threading.Lock()
@@ -245,6 +257,7 @@ class _LatestFrameReader:
             if self._thread is not None or self._closed:
                 return
             self._start_time = self._clock()
+            self._last_arrival = time.monotonic()
             self._thread = threading.Thread(
                 target=self._run, name=f"petrify-capture {self._label}", daemon=True
             )
@@ -291,6 +304,7 @@ class _LatestFrameReader:
                     if self._latest is not None:
                         self._dropped += 1
                     self._latest = (frame_image, timestamp)
+                    self._last_arrival = time.monotonic()
                     self._cond.notify_all()
         finally:
             with self._cond:
@@ -302,12 +316,35 @@ class _LatestFrameReader:
                 self._release()
 
     def _take(self) -> tuple[np.ndarray, float] | None:
-        """Block until a new frame is available and take it; None when the stream is over."""
+        """Block until a new frame is available and take it; None when the stream is over.
+
+        With ``read_timeout``, raises ``OSError`` when no frame has arrived for that
+        many seconds (since the last frame, or since the thread started).
+        """
         with self._cond:
             while self._latest is None and not self._stopped and not self._closed:
-                self._cond.wait()
+                if self._timeout_message is not None:
+                    break
+                if self._read_timeout is None:
+                    self._cond.wait()
+                    continue
+                remaining = self._last_arrival + self._read_timeout - time.monotonic()
+                if remaining <= 0:
+                    self._timeout_message = (
+                        f"{self._label}: no frame received within {self._read_timeout:g} s"
+                    )
+                    # The capture thread may be stuck in read() for good: let it end
+                    # (and release the capture) as soon as read() returns, even if
+                    # close() is never called.
+                    self._closing.set()
+                    break
+                self._cond.wait(remaining)
             if self._closed:
                 return None
+            if self._timeout_message is not None:
+                # Checked before the slot: a frame that a stuck read() delivers after
+                # the timeout does not restart a stream that was declared dead.
+                raise OSError(self._timeout_message) from None
             if self._latest is not None:
                 item = self._latest
                 self._latest = None
@@ -427,6 +464,10 @@ class StreamSource:
     When the backend reports a width or height that is not positive, frames are
     read during construction until one arrives and its size is used; that frame
     is discarded.
+
+    ``read_timeout`` (seconds, above 0) ends iteration with ``OSError`` when no
+    frame arrives for that long, the first frame included, so a stalled stream
+    ends the run instead of blocking it. ``None`` waits without limit.
     """
 
     def __init__(
@@ -436,10 +477,12 @@ class StreamSource:
         capture_factory: Callable[[str], Any] = cv2.VideoCapture,
         clock: Callable[[], float] = time.monotonic,
         *,
+        read_timeout: float | None = None,
         _join_timeout: float = _JOIN_TIMEOUT,
     ) -> None:
         if max_read_failures < 1:
             raise ValueError("max_read_failures must be at least 1")
+        _check_read_timeout(read_timeout)
         redacted = redact_url(url)
         label = f"stream {redacted}"
         cap, fps, width, height = _open_live(
@@ -464,6 +507,7 @@ class StreamSource:
             max_read_failures=max_read_failures,
             clock=clock,
             join_timeout=_join_timeout,
+            read_timeout=read_timeout,
         )
         logger.info(
             "Input: %s  |  %dx%d @ %.2f fps  |  live",

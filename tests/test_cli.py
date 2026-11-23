@@ -1653,3 +1653,427 @@ def test_t8_missing_model_fails_fast_with_one_line_and_exit_1(
     assert str(tmp_path / "none") in message
     assert "\n" not in message
     assert "Traceback" not in capsys.readouterr().err
+
+
+# --- Phase 6 T8: --source-timeout ----------------------------------------------------------
+
+STREAM = "rtsp://cam.example/live"
+
+
+def _open_source_kwargs() -> dict[str, Any]:
+    call = petrify.sources.open_source.call_args  # type: ignore[attr-defined]
+    return dict(call.kwargs)
+
+
+@pytest.mark.parametrize("spec", [STREAM, "camera:0"])
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        (["--source-timeout", "2.5"], 2.5),
+        (["--source-timeout=4"], 4.0),
+        (["--source-t", "3"], 3.0),
+    ],
+    ids=["separate", "equals", "abbreviated"],
+)
+def test_p6t8_source_timeout_reaches_open_source(
+    run_stream: mock.MagicMock, spec: str, flag: list[str], expected: float
+) -> None:
+    assert main(["run", "--source", spec, "--output", OUT, *flag]) == 0
+    assert _open_source_kwargs() == {"fps": None, "read_timeout": expected}
+
+
+def test_p6t8_without_source_timeout_a_live_source_opens_as_before(
+    run_stream: mock.MagicMock,
+) -> None:
+    assert main(["run", "--source", STREAM, "--output", OUT]) == 0
+    petrify.sources.open_source.assert_called_once_with(STREAM, fps=None)  # type: ignore[attr-defined]
+    parser = _build_run_parser()
+    settings = _resolve_run(parser, parser.parse_args(["--source", STREAM, "--output", OUT]))
+    assert settings.source_timeout is None
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        ([IN, "--source-timeout", "5"], "--source-timeout applies only to a live source"),
+        (["frames/*.png", "--source-timeout", "5"],
+         "--source-timeout applies only to a live source"),
+        ([STREAM, "--source-timeout", "0"], "--source-timeout must be > 0, got 0.0"),
+        ([STREAM, "--source-timeout", "-1"], "--source-timeout must be > 0, got -1.0"),
+        ([STREAM, "--source-timeout", "nan"], "--source-timeout must be > 0, got nan"),
+        ([STREAM, "--source-timeout", "inf"], "--source-timeout must be > 0, got inf"),
+        ([STREAM, "--source-timeout", "soon"], "invalid float value"),
+    ],
+)
+def test_p6t8_source_timeout_usage_errors(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str], argv: list[str], message: str
+) -> None:
+    err = _usage_error(["run", "--source", *argv, "--output", OUT], capsys)
+    assert message in err
+    run_stream.assert_not_called()
+
+
+def test_p6t8_source_timeout_help() -> None:
+    text = " ".join(_build_run_parser().format_help().split())
+    assert "--source-timeout SECONDS" in text
+    assert "Live sources only. Default: no limit." in text
+
+
+class _StalledCapture:
+    """A capture that delivers ``frames`` frames, then blocks in ``read`` until released."""
+
+    def __init__(self, frames: int) -> None:
+        import cv2  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+
+        self._props = {cv2.CAP_PROP_FRAME_WIDTH: 320.0, cv2.CAP_PROP_FRAME_HEIGHT: 256.0,
+                       cv2.CAP_PROP_FPS: 25.0}
+        self._image = np.full((256, 320, 3), 90, np.uint8)
+        self.remaining = frames
+        self.unblock = threading.Event()
+
+    def isOpened(self) -> bool:  # noqa: N802 (mirrors the OpenCV API)
+        return True
+
+    def get(self, prop: int) -> float:
+        return self._props.get(prop, 0.0)
+
+    def read(self) -> tuple[bool, Any]:
+        if self.remaining > 0:
+            self.remaining -= 1
+            return True, self._image.copy()
+        self.unblock.wait()
+        return False, None
+
+    def release(self) -> None:
+        pass
+
+
+def test_p6t8_stalled_stream_ends_the_run_with_exit_1_and_keeps_the_recording(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from tests.test_run_stream import ListSink  # noqa: PLC0415
+
+    fake = _StalledCapture(frames=8)
+    real_open_source = petrify.sources.open_source
+    sink = ListSink()
+
+    def open_source(spec: str, **kwargs: Any) -> Any:
+        return real_open_source(spec, capture_factory=lambda _url: fake, **kwargs)
+
+    try:
+        with (
+            caplog.at_level(logging.INFO),
+            mock.patch.object(petrify.sources, "open_source", side_effect=open_source),
+            mock.patch.object(petrify.pipeline, "_build_sinks", return_value=[sink]),
+        ):
+            code = main(["run", "--source", STREAM, "--preview", "--no-roi",
+                         "--source-timeout", "0.2"])
+    finally:
+        fake.unblock.set()
+    assert code == 1
+    assert (sink.opened, sink.closed, sink.aborted) == (1, 1, 0)
+    assert sink.images
+    assert "the recording up to that point was kept" in caplog.text
+    fatal = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Fatal error")]
+    assert fatal == ["Fatal error: stream rtsp://cam.example: no frame received within 0.2 s"]
+
+
+# --- Phase 6 T10: --profile cctv ------------------------------------------------------------
+
+
+class _ProfileFactory:
+    """A mode factory with the given ``requires`` and ``needs_background``, for the profile."""
+
+    name = "erase"
+    summary = "Test mode."
+    options = ()
+    roi_overlay = False
+
+    def __init__(self, kinds: frozenset[Any], needs_background: bool) -> None:
+        self._kinds = kinds
+        self.needs_background = needs_background
+
+    def requires(self, options: Any) -> frozenset[Any]:
+        return self._kinds
+
+
+def _profile_run(
+    argv: list[str], caplog: pytest.LogCaptureFixture, factory: Any = None
+) -> tuple[PetrifyConfig, dict[str, Any], list[str]]:
+    """Run ``petrify run ARGV`` with run_stream mocked; return the config, the
+    open_source keyword arguments, and the profile log lines."""
+    patches = [
+        mock.patch.object(petrify.pipeline, "run_stream", return_value=_report()),
+        mock.patch.object(petrify.sources, "open_source", return_value=_StubSource()),
+    ]
+    if factory is not None:
+        patches.append(mock.patch.object(petrify.cli, "_load_mode", return_value=(factory, None)))
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="petrify.cli"):
+        for patch in patches:
+            patch.start()
+        try:
+            assert main(["run", *argv]) == 0
+            config = petrify.pipeline.run_stream.call_args.args[1]  # type: ignore[attr-defined]
+            kwargs = _open_source_kwargs()
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Profile")]
+    return config, kwargs, lines
+
+
+def test_p6t10_profile_sets_every_value_on_a_stream(caplog: pytest.LogCaptureFixture) -> None:
+    from petrify.core.config import PersonDnnConfig  # noqa: PLC0415
+
+    config, kwargs, lines = _profile_run(
+        ["--source", STREAM, "--output", OUT, "--profile", "cctv"], caplog
+    )
+    assert config.detector == "both"
+    assert config.person_dnn == PersonDnnConfig()
+    assert config.engine.lookahead == 10
+    assert config.background.strategy == "running"
+    assert config.background.sample_check is True
+    assert config.background.sample_checkers == ("hog", "dnn")
+    assert config.faces is None  # erase uses no faces.
+    assert kwargs == {"fps": None, "read_timeout": 10.0}
+    # Never set by the profile.
+    assert config.tracker is None
+    assert config.segment is None
+    assert config.engine.frame_budget_ms is None
+    assert lines == [
+        "Profile cctv: set --detector both, --person-detector dnn, --lookahead 10, "
+        "--source-timeout 10, --background-check hog,dnn; explicit flags win"
+    ]
+
+
+def test_p6t10_profile_raises_the_camera_lookahead(caplog: pytest.LogCaptureFixture) -> None:
+    config, kwargs, _ = _profile_run(
+        ["--source", "camera:0", "--output", OUT, "--profile", "cctv"], caplog
+    )
+    assert config.engine.lookahead == 10
+    assert kwargs["read_timeout"] == 10.0
+
+
+def test_p6t10_profile_on_a_file_sets_no_timeout_and_no_background_check(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config, kwargs, lines = _profile_run(
+        ["--source", IN, "--output", OUT, "--profile", "cctv"], caplog
+    )
+    assert kwargs == {"fps": None}
+    assert config.background.strategy == "locked"
+    assert config.background.sample_checkers == BackgroundConfig().sample_checkers
+    assert lines == [
+        "Profile cctv: set --detector both, --person-detector dnn, --lookahead 10; "
+        "explicit flags win"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kinds", "faces"),
+    [
+        ({"persons"}, False),
+        ({"persons", "faces"}, True),
+        ({"landmarks"}, True),
+        ({"mask", "motion"}, False),
+    ],
+)
+def test_p6t10_profile_sets_faces_only_for_a_mode_that_uses_them(
+    caplog: pytest.LogCaptureFixture, kinds: set[str], faces: bool
+) -> None:
+    from petrify.core.config import FaceYuNetConfig  # noqa: PLC0415
+    from petrify.core.detections import DetectionKind  # noqa: PLC0415
+
+    factory = _ProfileFactory(frozenset(DetectionKind(k) for k in kinds), needs_background=True)
+    config, _, (line,) = _profile_run(
+        ["--source", IN, "--output", OUT, "--profile", "cctv"], caplog, factory
+    )
+    assert config.faces == (FaceYuNetConfig() if faces else None)
+    assert ("--faces" in line) is faces
+
+
+def test_p6t10_explicit_faces_is_not_reported_as_set_by_the_profile(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from petrify.core.config import FaceYuNetConfig  # noqa: PLC0415
+    from petrify.core.detections import DetectionKind  # noqa: PLC0415
+
+    factory = _ProfileFactory(frozenset({DetectionKind.FACES}), needs_background=False)
+    config, _, (line,) = _profile_run(
+        ["--source", IN, "--output", OUT, "--profile", "cctv", "--faces"], caplog, factory
+    )
+    assert config.faces == FaceYuNetConfig()
+    assert "--faces" not in line
+
+
+@pytest.mark.parametrize(
+    ("spec", "background", "needs_background", "expected"),
+    [
+        (STREAM, [], True, ("hog", "dnn")),
+        (STREAM, ["--background", "calibrate"], True, ("hog", "dnn")),
+        (IN, ["--background", "running"], True, ("hog", "dnn")),
+        (IN, [], True, ("hog",)),  # Locked: the pre-scan uses HOG.
+        (STREAM, [], False, ("hog",)),  # The mode uses no background.
+        (STREAM, ["--background", "calibrate"], False, ("hog",)),
+    ],
+)
+def test_p6t10_profile_sets_background_check_only_where_it_applies(
+    caplog: pytest.LogCaptureFixture,
+    spec: str,
+    background: list[str],
+    needs_background: bool,
+    expected: tuple[str, ...],
+) -> None:
+    from petrify.core.detections import DetectionKind  # noqa: PLC0415
+
+    factory = _ProfileFactory(frozenset({DetectionKind.MOTION}), needs_background)
+    config, _, (line,) = _profile_run(
+        ["--source", spec, "--output", OUT, "--profile", "cctv", *background], caplog, factory
+    )
+    assert config.background.sample_checkers == expected
+    assert ("--background-check" in line) is (expected == ("hog", "dnn"))
+
+
+@pytest.mark.parametrize(
+    ("spec", "extra", "check"),
+    [
+        # Equal to the built-in default: still explicit, so the profile does not touch it.
+        (STREAM, ["--detector", "motion"], lambda c, k: c.detector == "motion"),
+        (STREAM, ["--detector=person"], lambda c, k: c.detector == "person"),
+        (STREAM, ["--detecto", "motion"], lambda c, k: c.detector == "motion"),
+        (STREAM, ["--person-detector", "hog"], lambda c, k: c.person_dnn is None),
+        (STREAM, ["--person-d=hog"], lambda c, k: c.person_dnn is None),
+        ("camera:0", ["--lookahead", "3"], lambda c, k: c.engine.lookahead == 3),
+        (STREAM, ["--looka=0"], lambda c, k: c.engine.lookahead == 0),
+        (STREAM, ["--source-timeout", "2"], lambda c, k: k["read_timeout"] == 2.0),
+        (STREAM, ["--source-ti=30"], lambda c, k: k["read_timeout"] == 30.0),
+        (STREAM, ["--background-check", "hog"],
+         lambda c, k: c.background.sample_checkers == ("hog",)),
+        (STREAM, ["--background-ch=hog,yunet"],
+         lambda c, k: c.background.sample_checkers == ("hog", "yunet")),
+        (STREAM, ["--no-background-check"],
+         lambda c, k: c.background.sample_check is False
+         and c.background.sample_checkers == ("hog",)),
+        (STREAM, ["--no-back"], lambda c, k: c.background.sample_check is False),
+    ],
+)
+def test_p6t10_explicit_flags_win_over_the_profile(
+    caplog: pytest.LogCaptureFixture, spec: str, extra: list[str], check: Any
+) -> None:
+    config, kwargs, (line,) = _profile_run(
+        ["--source", spec, "--output", OUT, "--profile", "cctv", *extra], caplog
+    )
+    assert check(config, kwargs)
+    flag = extra[0].split("=")[0]
+    full = {
+        "--detecto": "--detector", "--person-d": "--person-detector", "--looka": "--lookahead",
+        "--source-ti": "--source-timeout", "--background-ch": "--background-check",
+        "--no-back": "--background-check", "--no-background-check": "--background-check",
+    }.get(flag, flag)
+    assert f"{full} " not in line  # Not reported as set by the profile.
+
+
+def test_p6t10_explicit_motion_runs_motion_only(caplog: pytest.LogCaptureFixture) -> None:
+    config, _, (line,) = _profile_run(
+        ["--source", IN, "--output", OUT, "--profile", "cctv", "--detector", "motion"], caplog
+    )
+    assert config.detector == "motion"
+    assert line == (
+        "Profile cctv: set --person-detector dnn, --lookahead 10; explicit flags win"
+    )
+
+
+def test_p6t10_profile_abbreviated_and_equals_forms(caplog: pytest.LogCaptureFixture) -> None:
+    for form in (["--prof", "cctv"], ["--profile=cctv"], ["--prof=cctv"]):
+        config, _, lines = _profile_run(["--source", IN, "--output", OUT, *form], caplog)
+        assert config.detector == "both"
+        assert len(lines) == 1
+
+
+def test_p6t10_explicit_dests_come_from_the_parse_not_the_strings() -> None:
+    from petrify.cli import _explicit_dests, _ModeCatalog  # noqa: PLC0415
+
+    argv = ["--source", IN, "--output=out.mp4", "--detecto", "motion", "--looka=10",
+            "--no-back", "--faces", "--mode-option", "a=b"]
+    assert _explicit_dests(_ModeCatalog(), argv) == {
+        "source", "output", "detector", "lookahead", "background_check", "faces", "mode_option",
+    }
+    # A flag name inside a value is not a flag.
+    assert _explicit_dests(_ModeCatalog(), ["--source=--detector", "--output", OUT]) == {
+        "source", "output",
+    }
+
+
+@pytest.mark.parametrize("name", ["webcam", "CCTV", ""])
+def test_p6t10_unknown_profile_is_a_usage_error(
+    run_stream: mock.MagicMock, capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    err = _usage_error(_run_args("--profile", name), capsys)
+    assert "only cctv is available" in err
+    run_stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--source", IN, "--output", OUT],
+        ["--source", STREAM, "--output", OUT],
+        ["--source", "camera:0", "--preview", "--background", "calibrate"],
+        ["--source", STREAM, "--output", OUT, "--detector", "both", "--lookahead", "4",
+         "--background-check", "hog", "--source-timeout", "7"],
+        ["--source", IN, "--output", OUT, "--person-detector", "dnn", "--faces"],
+    ],
+)
+def test_p6t10_no_profile_changes_nothing(
+    caplog: pytest.LogCaptureFixture, argv: list[str]
+) -> None:
+    config, kwargs, lines = _profile_run(argv, caplog)
+    parser = _build_run_parser()
+    settings = _resolve_run(parser, parser.parse_args(argv))
+    assert config == settings.config
+    assert kwargs == {"fps": None, **(
+        {} if settings.source_timeout is None else {"read_timeout": settings.source_timeout}
+    )}
+    assert lines == []
+
+
+def test_p6t10_profile_needs_the_dnn_model_like_person_detector_dnn(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cv2  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+
+    from tests.test_run_stream import ListSink  # noqa: PLC0415
+
+    monkeypatch.delenv("PETRIFY_MODEL_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))  # No per-user model directory.
+    for i in range(3):
+        cv2.imwrite(str(tmp_path / f"f{i:03d}.png"), np.full((256, 320, 3), 90, np.uint8))
+    with mock.patch.object(petrify.pipeline, "_build_sinks", return_value=[ListSink()]):
+        code = main(["run", "--source", str(tmp_path), "--preview", "--profile", "cctv",
+                     "--model-dir", str(tmp_path / "none")])
+    assert code == 1
+    (record,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    message = record.getMessage()
+    assert message.startswith(
+        "Fatal error: Model 'object_detection_nanodet_2022nov' "
+        "(file 'object_detection_nanodet_2022nov.onnx') was not found."
+    )
+    assert "\n" not in message
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_p6t10_profile_help_names_every_value_and_no_dashes() -> None:
+    # The help string itself: the formatter may wrap inside a hyphenated flag.
+    text = _build_run_parser()._option_string_actions["--profile"].help or ""
+    assert "--profile NAME" in " ".join(_build_run_parser().format_help().split())
+    for part in ("--detector both", "--person-detector dnn",
+                 "--lookahead 10", "--background-check hog,dnn", "--source-timeout 10",
+                 "Only cctv is available"):
+        assert part in text
+    assert "\u2014" not in text and "\u2013" not in text

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import math
 import secrets
 import sys
 from pathlib import Path
@@ -500,6 +501,14 @@ _RUN_HWACCEL_HELP = (
 
 _LIVE_KINDS = ("camera", "stream")
 
+# The presets --profile accepts. A webcam profile was left out on purpose: its
+# settings are not measured yet.
+_PROFILES = ("cctv",)
+# Values --profile cctv sets (see _profile_before_resolve and _profile_after_mode).
+_CCTV_LOOKAHEAD = 10
+_CCTV_SOURCE_TIMEOUT = 10.0
+_CCTV_BACKGROUND_CHECK = "hog,dnn"
+
 # Default port of the --web page (on 127.0.0.1 only).
 _WEB_PORT = 8765
 
@@ -570,6 +579,15 @@ class _ModeCatalog:
                 f"the mode {_one_line(text)!r} cannot be selected: {reasons}"
             )
         return text
+
+
+def _profile_name(text: str) -> str:
+    """The ``--profile`` type: accept a known profile, otherwise name the ones available."""
+    if text in _PROFILES:
+        return text
+    raise argparse.ArgumentTypeError(
+        f"unknown profile {_one_line(text)!r}: only {', '.join(_PROFILES)} is available"
+    )
 
 
 def _build_run_parser(modes: _ModeCatalog | None = None) -> argparse.ArgumentParser:
@@ -659,6 +677,35 @@ def _build_run_parser(modes: _ModeCatalog | None = None) -> argparse.ArgumentPar
         default=None,
         metavar="FLOAT",
         help="Frame rate of an image folder source (image folders only). Default: 25.",
+    )
+    src_group.add_argument(
+        "--source-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        dest="source_timeout",
+        help=(
+            "End the run when a live source (camera:N or a stream URL) delivers no frame "
+            "for SECONDS, the first frame included, instead of waiting for it forever. "
+            "The recording made so far is kept and petrify exits with code 1, so a "
+            "service manager can restart it. Live sources only. Default: no limit."
+        ),
+    )
+    src_group.add_argument(
+        "--profile",
+        type=_profile_name,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Preset of defaults. 'cctv', for a fixed security camera, sets --detector "
+            "both, --person-detector dnn (needs its model file), --lookahead "
+            f"{_CCTV_LOOKAHEAD}, --faces when the mode uses faces or face landmarks, "
+            f"--background-check {_CCTV_BACKGROUND_CHECK} when the mode uses a running or "
+            "calibrate background, and --source-timeout "
+            f"{_CCTV_SOURCE_TIMEOUT:g} on a live source. A flag given on the command line "
+            "always wins. It never turns on --track, --segment or a frame budget. Only "
+            "cctv is available. Default: no profile."
+        ),
     )
 
     # -- Outputs ------------------------------------------------------------
@@ -1005,6 +1052,7 @@ class _RunSettings:
     kind: str
     config: PetrifyConfig
     outputs: OutputConfig
+    source_timeout: float | None = None
 
 
 def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _RunSettings:
@@ -1073,6 +1121,13 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
         parser.error(f"--background-frame must be >= 0, got {args.background_frame}")
     if args.fps is not None and kind != "images":
         parser.error("--fps applies only to an image folder or glob source")
+    if args.source_timeout is not None:
+        if not (math.isfinite(args.source_timeout) and args.source_timeout > 0):
+            parser.error(f"--source-timeout must be > 0, got {args.source_timeout}")
+        if not live:
+            parser.error(
+                "--source-timeout applies only to a live source (camera:N or a stream URL)"
+            )
 
     if sum((args.roi is not None, args.no_roi, args.roi_auto)) > 1:
         parser.error("--roi, --no-roi and --roi-auto cannot be combined")
@@ -1201,7 +1256,85 @@ def _resolve_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> _
         virtualcam_device=args.virtualcam_device,
         preview=args.preview,
     )
-    return _RunSettings(kind=kind, config=config, outputs=outputs)
+    return _RunSettings(
+        kind=kind, config=config, outputs=outputs, source_timeout=args.source_timeout
+    )
+
+
+def _explicit_dests(catalog: _ModeCatalog, argv: list[str]) -> frozenset[str]:
+    """The ``dest`` of every run option given on the command line.
+
+    ``argv`` is parsed again with every default replaced by ``argparse.SUPPRESS``,
+    so only the options argparse actually consumed appear in the namespace. This
+    covers abbreviations (``--detect``), the ``--flag=value`` form, and a value
+    equal to the default, which matching the argument strings would get wrong.
+    ``argv`` already parsed once, so this parse cannot fail.
+    """
+    parser = _build_run_parser(catalog)
+    for action in parser._actions:
+        action.default = argparse.SUPPRESS
+    return frozenset(vars(parser.parse_args(argv)))
+
+
+def _profile_before_resolve(args: argparse.Namespace, explicit: frozenset[str]) -> list[str]:
+    """Apply the cctv values that do not depend on the mode; return them as flags.
+
+    They are set on ``args`` before ``_resolve_run``, so its checks see them (for
+    example ``--dnn-score-threshold`` then needs no ``--person-detector dnn``).
+    """
+    from petrify.sources import source_kind  # noqa: PLC0415
+
+    applied: list[str] = []
+    for dest, flag, value, shown in (
+        ("detector", "--detector", "both", "both"),
+        ("person_detector", "--person-detector", "dnn", "dnn"),
+        ("lookahead", "--lookahead", _CCTV_LOOKAHEAD, str(_CCTV_LOOKAHEAD)),
+    ):
+        if dest not in explicit:
+            setattr(args, dest, value)
+            applied.append(f"{flag} {shown}")
+    if "source_timeout" not in explicit and args.source is not None:
+        try:
+            live = source_kind(args.source) in _LIVE_KINDS
+        except ValueError:
+            live = False  # _resolve_run reports the spec as a usage error.
+        if live:
+            args.source_timeout = _CCTV_SOURCE_TIMEOUT
+            applied.append(f"--source-timeout {_CCTV_SOURCE_TIMEOUT:g}")
+    return applied
+
+
+def _profile_after_mode(
+    args: argparse.Namespace, explicit: frozenset[str], factory: Any, config: PetrifyConfig
+) -> list[str]:
+    """Apply the cctv values that depend on the loaded mode; return them as flags.
+
+    ``--faces`` is set only for a mode that uses faces or landmarks, and
+    ``--background-check`` only for a mode that uses a running or calibrate
+    background, so the profile never causes a "has no effect" warning for them.
+    """
+    from petrify.core.detections import DetectionKind  # noqa: PLC0415
+    from petrify.pipeline import _mode_options  # noqa: PLC0415
+
+    applied: list[str] = []
+    if "faces" not in explicit:
+        try:
+            kinds = factory.requires(_mode_options(factory, config))
+        except Exception:  # noqa: BLE001
+            # The run reports a failing requires at startup with its own error; the
+            # profile only has to avoid turning on faces on a guess.
+            kinds = frozenset()
+        if DetectionKind.FACES in kinds or DetectionKind.LANDMARKS in kinds:
+            args.faces = True
+            applied.append("--faces")
+    if (
+        not explicit & {"background_checkers", "background_check"}
+        and factory.needs_background
+        and config.background.strategy in ("running", "calibrate")
+    ):
+        args.background_checkers = _CCTV_BACKGROUND_CHECK
+        applied.append(f"--background-check {_CCTV_BACKGROUND_CHECK}")
+    return applied
 
 
 def _given(**values: object) -> dict[str, object]:
@@ -1367,6 +1500,10 @@ def _run_main(argv: list[str]) -> int:
     _configure_logging(args.verbose)
     if args.list_modes:
         return _list_modes(catalog, args.mode)
+    explicit = _explicit_dests(catalog, argv) if args.profile is not None else frozenset()
+    profile_applied: list[str] = []
+    if args.profile is not None:
+        profile_applied = _profile_before_resolve(args, explicit)
     settings = _resolve_run(parser, args)
     if args.threads is not None:
         _set_opencv_threads(args.threads)
@@ -1388,6 +1525,20 @@ def _run_main(argv: list[str]) -> int:
     settings = dataclasses.replace(
         settings, config=_mode_options_config(parser, args, factory, settings.config)
     )
+    if args.profile is not None:
+        late = _profile_after_mode(args, explicit, factory, settings.config)
+        if late:
+            # Resolved again so the new values pass the same checks as typed flags.
+            settings = _resolve_run(parser, args)
+            settings = dataclasses.replace(
+                settings, config=_mode_options_config(parser, args, factory, settings.config)
+            )
+        profile_applied += late
+        log.info(
+            "Profile %s: set %s; explicit flags win",
+            args.profile,
+            ", ".join(profile_applied) if profile_applied else "nothing",
+        )
     if mode_entry is not None:
         log.warning(_TRUST_WARNING.format(name=mode_name, origin=_one_line(mode_entry.origin)))
     if args.web:
@@ -1399,7 +1550,12 @@ def _run_main(argv: list[str]) -> int:
             log.error("%s", exc)
             return 1
     try:
-        source = open_source(args.source, fps=args.fps)
+        # read_timeout is passed only when set, so a run without --source-timeout
+        # opens the source exactly as before.
+        timeout = (
+            {} if settings.source_timeout is None else {"read_timeout": settings.source_timeout}
+        )
+        source = open_source(args.source, fps=args.fps, **timeout)
         if settings.outputs.file is not None and output_overwrites_input(
             source, settings.outputs.file
         ):
