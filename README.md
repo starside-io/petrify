@@ -269,7 +269,7 @@ No built-in mode uses faces or a mask: `--faces` and `--segment` only matter to 
 
 - **DNN person boxes replace HOG, they do not add to it.** With `--person-detector dnn` HOG no longer runs on the frames. The locked background pre-scan still uses HOG.
 - **The DNN misses small people.** The frame is scaled down to 416 px for the model, and no person smaller than about 110 px tall on a 1080p frame was found. Wide frames shrink people further. The background differ covers that gap only while it is on: with `--no-bg-diff`, or a mode that does not use it, a warning says that small or distant people can be shown.
-- **The DNN is slower than HOG.** On the 640x480 demo clip erase with `--detector person --person-detector dnn` takes about 34 ms per frame, against a few ms with HOG, and freezes 611 of 655 frames against 494 with HOG. At 1080p it takes about 77 ms per frame, so a 25 fps 1080p live source drops frames.
+- **The DNN is slower than HOG.** Measured on an idle machine, the DNN person detector takes a median of about 33 ms per frame on the 640x480 demo clip, against a few ms with HOG, and about 45 ms at 1080p, so a 25 fps 1080p live source drops frames. On the 640x480 clip erase with `--detector person --person-detector dnn` freezes 611 of 655 frames against 494 with HOG. See [Performance](#performance) for the other detectors.
 - **DNN person boxes are estimates.** Each box is padded by 10 percent of its width and 7 percent of its height on each side, because the model's boxes were measured to fall short of the person. An outstretched arm can still stick out of the box.
 - **The segmenter is tuned for close, large people.** It misses small, distant people and marks parts of empty scenes. That is why it is not offered as a background check, and it should not be the only person signal on CCTV footage.
 - **The face detector refuses tiny frames.** A frame with a side of 32 px or less is not processed and fails closed (black). One face detector instance is not thread-safe.
@@ -323,7 +323,7 @@ It logs a warning when `--person-detector dnn` is given with `--detector motion`
 | `camera:N` | Webcam number N |
 | `rtsp://`, `rtsps://`, `http://`, `https://` URL | A network stream (RTSP, HTTP MJPEG) |
 
-On a live source (`camera:N` or a stream URL) a capture thread keeps only the newest frame, so a slow run drops frames instead of falling behind. Stream URLs are redacted in logs and error messages: at most the scheme, host, and port are shown. Credentials are replaced with `***`, and the path and query are dropped.
+On a live source (`camera:N` or a stream URL) a capture thread keeps only the newest frame, so a slow run drops frames instead of falling behind. By default a live run waits for the next frame without limit; `--source-timeout SECONDS` ends it when the source stalls (see [Run options](#run-options)). Stream URLs are redacted in logs and error messages: at most the scheme, host, and port are shown. Credentials are replaced with `***`, and the path and query are dropped.
 
 For library use, `petrify.sources.PushSession` feeds in-memory frames to an engine one by one and returns the processed frames.
 
@@ -338,7 +338,28 @@ At least one is required, and several can be combined.
 | `--preview` | A local window. `q` or Escape ends the run. Needs an OpenCV build with GUI support |
 | `--web` | A local web page to watch the processed feed and change settings while the run is in progress. Needs `petrify[web]`. See [The web page](#the-web-page) |
 
-On a live source the run ends with Ctrl-C (or `q` in the preview window), and the output file is still finalized. A second Ctrl-C while the outputs are being finalized aborts. If a live run fails, the recording up to that point is kept and the error is logged.
+On a live source the run ends with Ctrl-C or SIGTERM (or `q` in the preview window), and the output file is still finalized. Both signals are handled the same way: a first signal that lands while the outputs are opened, a frame is processed, or the outputs are finalized takes effect when that step is done, and a second signal aborts. A live run stopped before its first frame writes no file. On a video file or image folder source a signal aborts the run and no output file is written (exit code 130). If a live run fails, the recording up to that point is kept and the error is logged. [Running several cameras](#running-several-cameras) describes what a stop from a service manager does to the recording.
+
+### Run options
+
+| Flag | Meaning |
+|---|---|
+| `--profile cctv` | A preset of defaults for a fixed security camera; see below. `cctv` is the only profile. Default: no profile |
+| `--source-timeout SECONDS` | End a live run (`camera:N` or a stream URL) when no frame arrives for SECONDS, the first frame included. The recording made so far is kept, the error is logged, and petrify exits with code 1, so a service manager can restart it. Refused for a video file or image folder (usage error, exit code 2). Default: no limit |
+| `--threads N` | Limit OpenCV's worker threads in this process to N (1 to 64), for several petrify processes on one machine. The run logs `OpenCV worker threads: N` with the count OpenCV reports, and a warning when it differs from the request: some OpenCV builds (the macOS ones) honor only 1. FFmpeg's encoder threads are not limited. Default: OpenCV's own thread count |
+
+`--profile cctv` sets these values for every flag not given on the command line. A flag given on the command line always wins, also in an abbreviated or `--flag=value` form.
+
+| Set | When |
+|---|---|
+| `--detector both` | Always |
+| `--person-detector dnn` | Always. The DNN model file must be in place, or the run stops at startup |
+| `--lookahead 10` | Always |
+| `--faces` | When the mode uses faces or face landmarks (for example `shadow` with a face style) |
+| `--background-check hog,dnn` | When the mode uses a background and the background is `running` or `calibrate` (the default on a live source), and neither `--background-check` nor `--no-background-check` was given |
+| `--source-timeout 10` | On a live source |
+
+It never turns on `--track`, `--segment`, or a frame budget. The run logs what the profile set, for example `Profile cctv: set --detector both, --person-detector dnn, --lookahead 10, --source-timeout 10, --background-check hog,dnn; explicit flags win`. There is no webcam profile: no setting was tested on a webcam.
 
 ### Defaults by source kind
 
@@ -377,7 +398,7 @@ A frame that cannot be processed safely is written black and counted: a detector
 Web page (this link gives control of this run to whoever has it): http://127.0.0.1:PORT/#token=...
 ```
 
-The page shows the processed feed (what the outputs receive), the run's status (source, background state, frame counters, frames failed closed and dropped, output frame rate, detect, render, and write timings, the ROI in use, the last error), a settings form, and a button that stops the run and finalizes the outputs. While the run is in progress the page can change:
+The page shows the processed feed (what the outputs receive), the run's status (source, background state, frame counters, frames failed closed and dropped, output frame rate, detect, render, and write timings, the mean and last call time of each detector and refiner, the ROI in use, the last error), a settings form, and a button that stops the run and finalizes the outputs. While the run is in progress the page can change:
 
 - the detector (`motion`, `person`, `both`)
 - the motion detector's area and variance thresholds and shadow detection
@@ -405,6 +426,68 @@ Security model:
 
 ---
 
+## Running several cameras
+
+Run one `petrify run` process per camera. One process cannot read several cameras. Give each process its own `--output` and, with `--web`, its own `--web-port`. `--threads N` limits the OpenCV worker threads of each process (see [Run options](#run-options)): some OpenCV builds honor only 1, and FFmpeg's encoder threads are not limited.
+
+### A systemd unit
+
+A template unit, one environment file per camera, and an output file named per start, so a restart never replaces an earlier recording (petrify moves a finished encode onto `--output`, replacing a file of that name):
+
+```ini
+# /etc/systemd/system/petrify@.service
+[Unit]
+Description=petrify camera %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=petrify
+EnvironmentFile=/etc/petrify/%i.env
+ExecStart=/bin/sh -c 'exec petrify run --source "$${SOURCE}" --output "$${OUTPUT_DIR}/%i-$$(date +%%Y%%m%%d-%%H%%M%%S).mp4" --profile cctv --threads 2 --web --web-port "$${WEB_PORT}"'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```ini
+# /etc/petrify/front.env (readable by root only: the URL can hold credentials)
+SOURCE=rtsp://user:password@192.0.2.10/stream
+OUTPUT_DIR=/var/lib/petrify/front
+WEB_PORT=8766
+PETRIFY_MODEL_DIR=/var/lib/petrify/models
+```
+
+Start it with `systemctl enable --now petrify@front`. `$$` and `%%` are systemd's escapes for `$` and `%`, so the shell expands the variables and `date` on every start. Use the full path of `petrify` if it is not on the service's `PATH`, and leave out `--web` if the page is not needed: the page link with its token is printed to the service's log, so whoever can read that log can control the run (from reading the code: the link goes to stderr, which systemd logs; not tested under systemd).
+
+### What a stop does to the recording
+
+- **`systemctl stop`.** systemd sends SIGTERM to every process of the unit, FFmpeg included (the default `KillMode=control-group`). petrify handles it like Ctrl-C and finalizes the recording. FFmpeg, which received the signal too, finalizes its own file and exits, so the frames still in the lookahead buffer are not recorded. petrify reads that file back and keeps it only when it reads back completely, with the warning `FFmpeg received the stop signal too and finalized the recording itself, so it ends early: PATH holds N frames, petrify produced M. The file was read back and is complete up to that point.` If it does not read back, nothing is saved and the run fails. Any other FFmpeg failure fails the run as before. In a test of 10 such group stops, all 10 kept the recording.
+- **A signal to petrify alone** (`kill PID`, or Ctrl-C in a terminal, since FFmpeg runs in its own session): the lookahead tail is written and the recording is finalized.
+- **A second signal** while the recording is being finalized aborts: the partial file is removed.
+- Keep `TimeoutStopSec` at its default (90 s) or higher: on a stop petrify waits up to 60 s for FFmpeg to finish before it kills it and discards the file (from the code, not measured).
+- **The older form `petrify INPUT OUTPUT`** writes its final encode directly to `OUTPUT`, so a stop during that encode can leave a truncated file there. Use `petrify run` under a service manager.
+
+### A stalled camera
+
+Without a limit a live run waits for the next frame forever. With `--source-timeout SECONDS` (set to 10 by `--profile cctv` on a live source) a source that delivers no frame for that long, the first frame included, ends the run with an error and exit code 1. The recording made so far is kept, and `Restart=on-failure` starts a new run with a new file. The timeout watches the source only: a detector call that never returns is not covered (see [Before you rely on it](#before-you-rely-on-it)).
+
+### Capacity
+
+Measured with the DNN person detector on the 1080p demo clip, on a 12 core machine. One machine and one clip: treat these as an order of magnitude, not a guarantee.
+
+| Processes at once | Frames per second, each |
+|---|---|
+| 1 | about 23 to 25 |
+| 2 | about 8.5 to 10 |
+| 4 | about 6.5 to 7.5 |
+
+Two processes together deliver less than one alone, because the video decoder and the FFmpeg encoder also use threads, and `--threads` does not limit the encoder. A live source faster than its process drops frames (see [Sources](#sources)). Per-detector costs are under [Performance](#performance).
+
+---
+
 ## Before you rely on it
 
 Known limitations, in particular for live use:
@@ -417,6 +500,10 @@ Known limitations, in particular for live use:
 6. **A slow entry at the frame edge can show through.** A subject entering slowly at the edge of the frame can be partly visible for a few frames before it is detected, more so with a small `--lookahead` (the `camera:N` default is 3).
 7. **A lasting lighting change freezes an online background.** With `running` or `calibrate` and the background differ on (the default), a lasting change in lighting makes every frame differ from the learned background, so the output freezes and keeps showing the old background.
 8. **Golden parity tests need demo clips that are not in the repository.** Without `data/camera.mp4` and `data/camera2.mp4` they are skipped.
+9. **The shadow mode can show distant people.** It does not use the background differ, and the DNN person detector found no person smaller than about 110 px tall on a 1080p frame. Running the DNN on tiles of the frame was tried and not kept: it cost 3.3 times as much and still found nobody under 110 px. A distant person that no detector localizes is shown whenever the frame has another region to draw (see the [plugin README](plugins/petrify-shadow/README.md#coverage-rules)).
+10. **Every detector runs on every processed frame.** There is no option to detect on every Nth frame only. When the detectors are slower than a live source, frames are dropped (see [Performance](#performance)), so the output frame rate falls.
+11. **A hung detector stalls the output.** `--frame-budget-ms` is checked after a detector call returns, and `--source-timeout` watches the source only, so a detector call that never returns stops the output until the process is stopped.
+12. **A stop can truncate the older form's output.** `petrify INPUT OUTPUT` writes its final encode directly to `OUTPUT`, so a stop during that encode can leave a truncated file there. `petrify run --output` writes to a partial file and moves it into place only when the encode succeeds.
 
 ---
 
@@ -598,6 +685,29 @@ Speed scales with resolution and source frame rate. Low-FPS cameras (6fps) proce
 
 - Use `--downsample 0.25` for 4K to reduce MOG2 cost.
 - With `petrify INPUT OUTPUT`, the bottleneck for large resolutions is OpenCV's `VideoWriter` (intermediate file I/O). Use a fast SSD or a RAM-backed `/tmp`.
+
+### Detector cost in `petrify run`
+
+Median time per frame of each detector, measured on the two demo clips on one development machine while it was idle. Another machine, another camera, or a loaded machine gives other numbers.
+
+| Detector | 640x480 | 1920x1080 |
+|---|---|---|
+| DNN person boxes (`--person-detector dnn`) | about 33 ms | about 45 ms |
+| YuNet faces (`--faces`) | about 7 ms | about 29 ms |
+| PP-HumanSeg mask (`--segment`) | about 10 ms | about 15 ms |
+| MOG2 motion | 1 to 2 ms | 1 to 2 ms |
+
+A 25 fps source leaves 40 ms per frame for every detector together, plus rendering and writing. A `shadow` run with the DNN person detector and faces at 1080p ran at about 12 to 13 frames per second. For several processes on one machine, see [Capacity](#capacity).
+
+The DNN person detector resizes a large frame for the model one axis at a time, which gives the same bytes as a single resize and saved about 9.5 ms per 1080p frame. It is used only for the frame sizes where the two were shown to be byte-identical; every other size keeps the single resize.
+
+To see where the time goes on your own setup, the web page lists the time of each detector and refiner, and every `petrify run` logs one line after the summary, in this form (each `N` a time to one decimal):
+
+```
+[INFO] petrify.pipeline: Detector and refiner times (moving average): MotionDetector N ms, PersonDnnDetector N ms, FaceYuNetDetector N ms, TrackerRefiner (persons) N ms, TrackerRefiner (faces) N ms
+```
+
+Each label is the class name, with the detection kind for the two tracker refiners, in run order; a component never sampled shows `n/a`. The times are moving averages that weight recent frames most, so on a long run they describe its end. The line is left out when the run had no detector or refiner.
 
 ---
 

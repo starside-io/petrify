@@ -2361,7 +2361,7 @@ def _log_summary(
     )
     if detectors:
         logger.info(
-            "Detector and refiner times (mean): %s",
+            "Detector and refiner times (moving average): %s",
             ", ".join(
                 f"{name} "
                 + ("n/a" if timing.mean_ms is None else f"{timing.mean_ms:.1f} ms")

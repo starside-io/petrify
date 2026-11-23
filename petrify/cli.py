@@ -600,8 +600,8 @@ def _build_run_parser(modes: _ModeCatalog | None = None) -> argparse.ArgumentPar
             "or an RTSP or HTTP stream. Output goes to a video file, a virtual camera,\n"
             "a preview window, or several of them at once.\n\n"
             "Frames are processed in one streaming pass. On a live source the run ends\n"
-            "with Ctrl-C (or q in the preview window) and the output file is still\n"
-            "finalized. Frames that cannot be processed safely (a detector error, the\n"
+            "with Ctrl-C or SIGTERM (or q in the preview window) and the output file is\n"
+            "still finalized. Frames that cannot be processed safely (a detector error, the\n"
             "background not ready yet, a frame over budget) are written black."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -821,9 +821,9 @@ def _build_run_parser(modes: _ModeCatalog | None = None) -> argparse.ArgumentPar
         metavar="N",
         help=(
             "Limit OpenCV's worker threads in this process to N (1 to "
-            f"{_MAX_THREADS}). When several petrify processes share a machine (one per "
-            "camera), 2 is enough for one camera and keeps the processes from competing "
-            "for the cores. Some OpenCV builds (the macOS ones) honor only 1 and keep "
+            f"{_MAX_THREADS}), for several petrify processes on one machine (one per "
+            "camera). In every measured case with several processes, limiting the "
+            "threads helped. Some OpenCV builds (the macOS ones) honor only 1 and keep "
             "their own count for other values; the count in use is logged. FFmpeg's "
             "encoder threads are not limited by this flag. Default: OpenCV's own "
             "thread count."

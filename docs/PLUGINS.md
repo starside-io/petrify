@@ -281,11 +281,11 @@ Before a mode sees them, detector results go through these steps:
 
 - **Only what the mode requires runs.** A detector is active when it provides a kind in the mode's `requires`. petrify refuses to start when the mode requires detections and no active detector or refiner provides any of them, and when it requires `faces`, `landmarks`, or `mask` and the detector that provides that kind is not enabled (see [Which detector provides what](#which-detector-provides-what)).
 - **Built-in detectors.** `motion` (MOG2) is built with `--detector motion` or `both`, `persons` (HOG, or the DNN with `--person-detector dnn`) with `--detector person` or `both`, and `background_diff` only for a mode with `needs_background` (unless `--no-bg-diff`). A mode that requires `background_diff` without a background is refused unless the differ is turned off. The face detector and the segmenter are built only when enabled and the mode requires what they provide.
-- **Validated and normalized.** Each detector result is checked: a field may be set only when the detector declares the matching kind, flags become Python `bool`, boxes must have integer coordinates and non-negative size, and the mask must be a `bool` array of the frame's height and width. A malformed result fails the frame closed (black). The mode receives new objects built from the checked values, never the detector's own.
+- **Validated and normalized.** Each detector result is checked: a field may be set only when the detector declares the matching kind, flags become Python `bool`, boxes must have integer coordinates and non-negative size and a `held` of 0 (see [Held boxes](#what-the-mode-receives)), and the mask must be a `bool` array of the frame's height and width. A malformed result fails the frame closed (black). The mode receives new objects built from the checked values, never the detector's own.
 - **Boxes are clipped to the frame.** A box that starts before 0 or extends past the edge is clipped; a box wholly outside becomes a zero-area box on the nearest edge. Landmark points are not clipped.
 - **The mask is a read-only copy.**
 - **Results are merged as a union.** Flags are OR-ed, boxes and faces are concatenated, masks are OR-ed pixel by pixel. A field left `None` by every detector stays `None` ("not computed").
-- **Refiners run after the detectors.** With `--track` (or `--track-hold N`), petrify adds a box tracker for each kind the mode requires that it can hold and that a detector the run builds provides: `persons` only with `--detector person` or `both`, `faces` only with `--faces` (a mode that requires `landmarks` without `faces` also gets the faces tracker). It holds the last box of a lost subject for N frames (default 15) without moving it. When the tracker is on and cannot hold a kind the mode requires, for example `persons` with `--detector motion`, the run logs a warning and the web page lists it as a weakened protection; a mode that requires neither kind gets a warning that the tracker has no effect. A live detector switch rebuilds the trackers. Refiners need `detect_policy = "all"`: `--track` with a `"first_hit"` mode is refused, at startup and on a live change, whatever trackers would be built. That is why `erase` refuses `--track`. Refiners do not run on a frame whose detection failed; that frame is written black.
+- **Refiners run after the detectors.** With `--track` (or `--track-hold N`), petrify adds a box tracker for each kind the mode requires that it can hold and that a detector the run builds provides: `persons` only with `--detector person` or `both`, `faces` only with `--faces` (a mode that requires `landmarks` without `faces` also gets the faces tracker). It holds the last box of a lost subject for N frames (default 15) without moving it, and marks it with its held count (`Box.held`, see [What the mode receives](#what-the-mode-receives)). When the tracker is on and cannot hold a kind the mode requires, for example `persons` with `--detector motion`, the run logs a warning and the web page lists it as a weakened protection; a mode that requires neither kind gets a warning that the tracker has no effect. A live detector switch rebuilds the trackers. Refiners need `detect_policy = "all"`: `--track` with a `"first_hit"` mode is refused, at startup and on a live change, whatever trackers would be built. That is why `erase` refuses `--track`. Refiners do not run on a frame whose detection failed; that frame is written black.
 - **A subject is present** when motion, a person box, a background difference, a face, or a mask pixel is found.
 
 ## Which detector provides what
@@ -326,7 +326,19 @@ Each field below is `None` when it was not computed (its detector is not active,
 
 With `--track`, the box tracker also holds face boxes for `--track-hold` frames after a miss.
 
-A held box reaches the mode exactly like a fresh one: `Detections` carries no marker for it, and a held face keeps its last landmarks and score. A mode cannot tell that a box is held, nor for how long. `petrify-shadow` works around this by treating a box exactly equal to one of the previous frame as held, growing its cover per held frame and no longer trusting it after 10 frames; a box that truly stays still is then seen as held too. A core marker for held boxes is not implemented yet.
+**Held boxes: `Box.held`.** Every `Box`, in `detections.persons` and in `face.box`, carries `held`: the number of refined frames since the box last had a matching detection. It is 0 for a box detected on this frame and for any box that was not carried over. A held box keeps its last position, score, and (for a face) landmarks; the tracker does not move it. What a mode can rely on:
+
+- Only refiner results may carry `held` above 0. The tracker refiner sets it on the person and face boxes it holds. A detector that returns a box with `held` above 0 fails the frame closed (black), so a detector cannot make a mode treat a fresh detection as stale.
+- The count is cumulative across refiners: a refiner that holds a box another refiner already held adds to its count instead of restarting it.
+- It counts refined frames, not stream frames. Refiners do not run on a frame whose detection failed, so such frames are not counted and a hold then lasts more stream frames.
+- `petrify.core.detections.check_detections` requires a Python `int` (not a bool, not a numpy integer) from 0 to `MAX_HELD` (1000000); anything else fails the frame closed.
+
+Use it to trust a held box less than a fresh one. `petrify-shadow`, for example, grows a held box's cover by 25 percent per held frame up to 3 times its size, no longer lets a held face clear its person box, and stops counting a box held for 8 frames or more as a region.
+
+Two consequences for existing code:
+
+- **`held` is part of box equality and hashing.** A held box differs from the fresh box it was carried over from (`held` 0 against 1 and more), and from itself on the next held frame. A plugin that compares a box with the previous frame's box to guess that it is held will no longer see a held box as equal. Read `held` instead.
+- **`Box` has six fields** (`x`, `y`, `w`, `h`, `score`, `held`). Code that unpacks a box into five values, for example through `dataclasses.astuple`, breaks. Read the fields by name.
 
 ## A mode that uses faces
 
@@ -425,8 +437,8 @@ YuNet found a face on 805 frames, and those frames have the face box painted. Th
 ## What is not available yet
 
 - **No built-in mode uses faces or a mask.** `erase` uses motion, person boxes, and the background differ only, so `--faces` and `--segment` matter only to a plugin mode, such as `shadow` from [`petrify-shadow`](../plugins/petrify-shadow/README.md).
-- **No held marker.** A box the tracker holds reaches the mode like a fresh detection (see [What the mode receives](#what-the-mode-receives)).
 - **`requires(options)` and `mandatory(options)` do not see the config.** A rule that depends on the detector settings must be checked in `create`, which receives the config in `ModeContext`; raise `ValueError` there.
 - **`needs_background` cannot follow the options.** It is one value for the mode, so a mode cannot use the background differ for some options only.
 - **`choices` values arrive in different orders.** The command line passes them in typed order and the web page in option order. Do not let the order change what the mode draws, or whether `create` returns `previous`.
-- **No head-from-body estimation, webcam or CCTV profiles, or multi-camera support.** They are planned for Phase 6 of the [refactor plan](REFACTOR.md).
+- **No head estimate from a person box in core.** `petrify-shadow` has its own, as the opt-in option `orphan=head`; a mode that wants one computes it from the person boxes.
+- **No webcam profile, and one camera per process.** `--profile cctv` is the only profile. Several cameras need one petrify process each (see [Running several cameras](../README.md#running-several-cameras)).

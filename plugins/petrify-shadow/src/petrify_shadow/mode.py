@@ -442,21 +442,23 @@ class ShadowMode:
     black. A held cover below the cap can still miss a subject that moved faster
     than it grows.
 
-    Two coverage changes against the earlier rule, which guessed held boxes by
-    comparing each box with the previous frame's boxes, accepted because the box
-    is in fact fresh:
+    Three coverage reductions against the earlier rule, which guessed held boxes
+    by comparing each box with the previous frame's boxes, all from one cause: a
+    fresh detection identical to the previous frame's box is no longer treated
+    as held, because the box is in fact fresh.
 
-    1. A fresh detection identical to the previous frame's box is no longer
-       treated as held: it gets no growth, and a face with such a box clears its
-       person box from the orphan rule.
+    1. Such a box gets no growth, and a face with such a box clears its person
+       box from the orphan rule.
     2. A still subject with fresh detections is no longer cut off: its boxes
        stay regions however many identical frames follow, where the earlier rule
        stopped counting them after 10 identical frames and turned a frame
        with nothing else black.
+    3. A held box that follows a still period grows from its held frames only,
+       where the earlier rule also counted the identical frames before them.
 
-    On every other frame the mode covers at least as much as before: a held box
-    whose last detection differed from the box on the frame before it gets the
-    same count as before, with more growth and an earlier cut-off.
+    Apart from these three cases the mode covers at least as much as before: a
+    held box whose last detection differed from the box on the frame before it
+    gets the same count as before, with more growth and an earlier cut-off.
 
     State: apart from its noise generator the mode keeps no per-frame state, since
     the held count travels with each box. A new instance built after a live

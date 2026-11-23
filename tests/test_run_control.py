@@ -1583,7 +1583,7 @@ def test_the_end_log_lists_each_component_mean_after_the_summary(
     messages = [r.getMessage() for r in caplog.records if r.name == "petrify.pipeline"]
     done = next(i for i, m in enumerate(messages) if m.startswith("Run done: "))
     line = messages[done + 1]
-    assert line.startswith("Detector and refiner times (mean): ")
+    assert line.startswith("Detector and refiner times (moving average): ")
     assert line.endswith(" ms")
     assert sum(m.startswith("Detector and refiner times") for m in messages) == 1
 
@@ -1597,6 +1597,6 @@ def test_the_end_log_line_format(caplog: pytest.LogCaptureFixture) -> None:
         pipeline_module._log_summary(EngineStats(frames=3, frozen=3), 0, ())
     messages = [r.getMessage() for r in caplog.records if r.name == "petrify.pipeline"]
     assert messages[0].startswith("Run done: ")
-    assert messages[1] == "Detector and refiner times (mean): Motion 1.3 ms, Tracker (faces) n/a"
+    assert messages[1] == "Detector and refiner times (moving average): Motion 1.3 ms, Tracker (faces) n/a"
     # Without any component, only the summary line is logged.
     assert messages[2].startswith("Run done: ") and len(messages) == 3

@@ -92,9 +92,17 @@ proves the subject is covered: it is still drawn, but it is not trusted.
 HEAD_SHARE = Fraction(1, 2)
 """The head rect of a person box reaches this top share of the box height, rounded up.
 
-Measured on both demo clips: for the boxes :func:`head_rect` accepts, the
-padded face cover of the face that cleared the box reached at most 0.44 of the
-box height (729 of 729 and 79 of 79 inside the head rect).
+Evidence, measured on the two demo clips only, not a guarantee:
+
+- On orphan boxes, the boxes this rect is drawn on: across 400 frames (two
+  ranges of 200 frames, one per clip), no real head or face was left visible. The tightest pose was arms
+  raised over the head, where the face sat at 0.40 of the box height with
+  about 6 percent of the box height to spare. Bending, sitting low
+  and two people in one box were not in the footage and remain a risk.
+- On boxes a face had cleared, the padded face cover reached at most 0.44 of
+  the box height (729 of 729 and 79 of 79 inside the head rect). Those boxes
+  have the face center in the top third by construction (:data:`FACE_ZONE`), so
+  this figure does not show where the head sits in an orphan box.
 """
 
 HEAD_MIN_HEIGHT_PX = 150

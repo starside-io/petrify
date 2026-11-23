@@ -1,6 +1,6 @@
 # petrify refactor plan: real-time core + plugin modes
 
-Status: phases 0 to 3 are done. Phase 4 is done, pending the user's sign-off: the plugin API, the mode registry, the tracker, the model file lookup, and the YuNet face, DNN person, and segmentation detectors have landed. Phase 5 is done, pending the user's sign-off: the `petrify-shadow` plugin (mode `shadow`) with its nine styles and five options, and the tracker fixes it needed in core. Phase 6 is planned and not implemented yet.
+Status: phases 0 to 3 are done. Phase 4 is done, pending the user's sign-off: the plugin API, the mode registry, the tracker, the model file lookup, and the YuNet face, DNN person, and segmentation detectors have landed. Phase 5 is done, pending the user's sign-off: the `petrify-shadow` plugin (mode `shadow`) with its nine styles and five options, and the tracker fixes it needed in core. Phase 6 is done, pending the owner's sign-off: the held count on boxes, the opt-in head fill of the shadow mode, `--threads`, stop signal handling that keeps the recording, `--source-timeout`, `--profile cctv`, per-detector timings, a faster DNN resize, and fault injection tests. With it all phases are complete; the [findings from phase 6](#findings-from-phase-6) list what the owner still has to decide.
 
 ## Goals
 
@@ -122,17 +122,19 @@ plugins/petrify-shadow/      # separate package with its own pyproject (mode `sh
   src/
     petrify_shadow/
       __init__.py    # exports SHADOW
-      options.py     # the five options, style groups, fixed drawing order, colors
+      options.py     # the six options, style groups, fixed drawing order, colors
       factory.py     # ShadowFactory: requires / mandatory per style, refusals, weakened
-      mode.py        # plan (pure decision: pass, black, draw) and ShadowMode (render,
-                     # held-box memory)
-      regions.py     # face and person padding, held growth, mask preparation, orphan rule
+      mode.py        # plan (pure decision: pass, black, draw) and ShadowMode (render;
+                     # held counts read from Box.held)
+      regions.py     # face and person padding, held growth, mask preparation, orphan rule,
+                     # head rect (orphan=head)
       styles/
         face.py      # gaussian, pixelate, noise, facebox (fill), eyebar
         body.py      # silhouette, silhouette_color, outline, bodybox
   tests/             # unit, contract, end-to-end (models marker), and timing tests
   tools/
     padding_sheet.py # contact sheets of padded face crops, to judge the padding
+    head_sheet.py    # where heads sit in person boxes, to check the orphan=head rule
 ```
 
 ### Plugin mechanism
@@ -155,7 +157,7 @@ Implemented in phase 4. [PLUGINS.md](PLUGINS.md) is the guide for plugin authors
 | `gaussian` | Face box |
 | `pixelate` | Face box |
 | `noise` | Face box (random noise refilled every frame) |
-| `facebox` | Face box, filled with a solid color. No head-from-body fallback yet (phase 6) |
+| `facebox` | Face box, filled with a solid color. A person box whose face is missed is filled as an orphan; `orphan=head` (phase 6, opt-in) fills only its top half |
 | `eyebar` | Eye landmarks (YuNet 5 points); bar rotates with the head |
 | `silhouette` | Person mask, filled black |
 | `silhouette_color` | Person mask, filled with a solid color (no blur) |
@@ -178,6 +180,8 @@ Profiles are presets of defaults, not code forks. Every value can be overridden.
 | Lookahead | 0 to 3 frames | 10+ frames |
 | Typical sink | virtual cam + webapp | file / RTSP + webapp |
 
+Built in phase 6: `--profile cctv` only. It sets `--detector both`, `--person-detector dnn`, `--lookahead 10`, `--faces` when the mode uses faces or landmarks, `--background-check hog,dnn` when the mode uses a `running` or `calibrate` background, and `--source-timeout 10` on a live source, each only where the flag was not given. It does not estimate heads from bodies in core and never turns on `--track` or `--segment`. `--profile webcam` was not built, since nothing was tested on a webcam.
+
 ## Webapp
 
 - FastAPI + uvicorn, one static HTML page with vanilla JS. No build step.
@@ -189,7 +193,7 @@ Profiles are presets of defaults, not code forks. Every value can be overridden.
 
 Implemented in phase 3 (`petrify run --web`): the processed MJPEG feed, the opt-in raw preview (`--web-raw-preview`), run stats and per-stage timings, a stop button, and controls for the erase settings only (detector, detector thresholds, background differ, lookahead, frame budget, ROI), with a list of weakened protections. Changes are sent over REST only (the page polls the state); there is no WebSocket. Mode, style, strength, box padding, hold frames, and the debug overlay belong to later phases.
 
-Added in phase 4: a Mode section that shows the active mode, its origin and options, and the installed modes, with controls for the options the mode marks `runtime`, the mode's own weakened protections in the weakened list, and a trust notice for a plugin mode. The mode cannot be switched during a run. Added in phase 5: style, strength, and box padding are options of the shadow mode (`styles`, `strength`, `padding`, with `color` and `dilate`), changeable from the page. The debug overlay is not implemented. Hold frames are set with `--track-hold` and are not changeable from the page.
+Added in phase 4: a Mode section that shows the active mode, its origin and options, and the installed modes, with controls for the options the mode marks `runtime`, the mode's own weakened protections in the weakened list, and a trust notice for a plugin mode. The mode cannot be switched during a run. Added in phase 5: style, strength, and box padding are options of the shadow mode (`styles`, `strength`, `padding`, with `color` and `dilate`), changeable from the page. The debug overlay is not implemented. Hold frames are set with `--track-hold` and are not changeable from the page. Added in phase 6: the shadow option `orphan`, and one line per detector and refiner with its mean and last call time.
 
 ## Findings from phases 2 and 3
 
@@ -232,6 +236,59 @@ Design points from building `petrify-shadow` that phase 6 and later plugins must
 - A `choices` option arrives in typed order from the command line and in option order from the web page. A mode that compares options to decide whether to rebuild must not depend on that order; the plugin stores its styles as a set and draws in a fixed order.
 - The plugin was tested on the two demo clips (CCTV-style footage) only, not on a real webcam or any live hardware.
 
+## Findings from phase 6
+
+What a maintainer must know after CCTV hardening. Every number was measured on the two demo clips on one development machine; none is a guarantee.
+
+**Held boxes.**
+
+- `Box.held` (`petrify/core/detections.py`) is the number of refined frames a box has been carried without a matching detection, 0 for a box not carried over. The tracker refiner sets it, cumulatively across chained refiners. Frames that failed closed are not counted. Only refiner results may carry it above 0: a detector result that does fails the frame closed, so a detector cannot make a fresh box look stale. It must be a Python `int`, at most `MAX_HELD` (1000000).
+- `held` takes part in box equality and hashing, and `Box` now has six fields. A plugin that compared a box with the previous frame's box to guess that it was held no longer sees a held box as equal, and code that unpacks a box into five values breaks. [PLUGINS.md](PLUGINS.md#what-the-mode-receives) says so.
+- `petrify-shadow` reads `held` and keeps no per-frame state apart from its noise generator. A held cover grows 25 percent per held frame up to 3 times, and a box held 8 frames or more is drawn but is not a region. This replaces the phase 5 rule (10 percent per frame, twice the size, 10 frames).
+- Three stated coverage reductions against that rule, all from one cause (a fresh detection equal to the previous frame's box is no longer taken for a held one): such a box is not grown and its face clears its person box again; a still subject is no longer cut off (black) after 10 identical frames; a held box that follows a still period grows from the held frames only. On the 640x480 clip with the tracker, 27 or 28 frames per run were covered less than before, and on none of them was a detected face or person box left uncovered.
+
+**Shadow `orphan` option.**
+
+- `orphan=box` (default, unchanged) fills the whole orphan box. `orphan=head` fills only the top half of an orphan box that is fresh, at least 150 px tall, and at least 1.4 times as tall as wide; every other box, and under the mask styles a box the segmenter missed as a whole, keeps the whole fill. It is listed as a weakened protection unless `bodybox` is selected.
+- On 400 frames (two ranges of 200 frames, one per clip) no real head or face was left visible. The tightest pose was arms raised over the head (face at 0.40 of the box height, about 6 percent of the box height to spare). Bending, sitting low, and two people in one box were not in the footage and stay a risk.
+- An earlier figure (the padded face inside the top half in every case) was measured on boxes a face had cleared, which have the face in their top third by construction; it is not evidence for orphan boxes. The 400 frame result is.
+- On those ranges, with `silhouette` 94 of 168 orphan boxes got the head rect and 74 kept the whole-box fill (1080p), 95 of 141 and 46 (640x480); with `gaussian` alone 97 of 97 (1080p) and 108 of 116 (640x480) got the head rect. Under the mask styles a large share keeps the whole fill, so `head` changes the most for face-only stacks.
+
+**Several cameras and stops.**
+
+- One process per camera, each with its own `--output` and `--web-port`. `--threads N` limits OpenCV's worker threads and logs the count OpenCV reports, with a warning when it differs: the macOS builds honor only 1. FFmpeg's encoder threads are not limited.
+- Capacity with the DNN detector on the 1080p clip, 12 core machine: 1 process about 23 to 25 fps, 2 processes about 8.5 to 10 fps each, 4 processes about 6.5 to 7.5 fps each. Two processes together deliver less than one alone, because the decoder and the encoder also use threads.
+- SIGTERM is handled like Ctrl-C in `petrify run`. On a live source the first signal is deferred during the open, every frame, and the close, and the recording is finalized; a second signal aborts; a file source aborts. A crash on Ctrl-C that lost the recording is fixed: the handler logged, and a signal during another write to stderr raised a reentrant call error inside the frame step.
+- When the stop signal reaches the whole process group (the default of `systemctl stop`), FFmpeg finalizes its own file. The sink keeps it only after reading it back, with a warning that it ends early and how many frames it holds; any other FFmpeg failure fails the run as before. 10 of 10 group stops kept the recording, against 0 of 10 before the fix.
+- Known limit: the older form `petrify INPUT OUTPUT` writes its final encode directly to the output path, so a stop can leave a truncated file there.
+- `--source-timeout SECONDS` ends a stalled live run with an error (exit code 1) and keeps the recording. It covers the first frame and applies to live sources only. It does not cover a detector call that never returns: the frame budget is checked after the call, so a hung detector stalls the output.
+
+**Profile, timings, speed, tests.**
+
+- `--profile cctv` sets `--detector both`, `--person-detector dnn`, `--lookahead 10`, `--faces` when the mode uses faces or landmarks, `--background-check hog,dnn` for a mode with a `running` or `calibrate` background, and `--source-timeout 10` on a live source; explicit flags always win, also abbreviated or in `--flag=value` form. The run logs `Profile cctv: set ...; explicit flags win`. There is no webcam profile, because nothing was tested on a webcam.
+- The engine times each detector and refiner (label: class name, plus the detection kind for the trackers). The settings page shows one line per component, and the run logs `Detector and refiner times (moving average): ...` after the summary line. The values are exponentially weighted moving averages (alpha 0.1), not means over the whole run.
+- The DNN person detector resizes its letterbox one axis at a time on large frames: byte-identical output, about 9.5 ms saved per 1080p frame, used only for frame sizes where it was shown identical (both axes shrink at least 3 times and neither by a whole factor).
+- Detector cost per frame, median, idle machine: DNN person detector about 33 ms at 640x480 and 45 ms at 1080p; YuNet about 7 ms and 29 ms; segmenter about 10 ms and 15 ms; motion 1 to 2 ms. A shadow run with the DNN and faces at 1080p runs at about 12 to 13 fps.
+- `tests/faults.py` is a fault injection harness (detectors, refiners, stages, and a mode that inject scheduled faults, a deterministic clock, a recording sink). `tests/test_fail_closed_property.py` runs 300 seeded scenarios and checks at the sink that every written frame is black or the mode's output for that frame, that every faulted frame is black and counted, and that the lookahead and reconfiguration windows hold.
+- `plugins/petrify-shadow/tools/head_sheet.py` measures where heads sit in person boxes and writes contact sheets, using the mode's own `head_rect`.
+
+**Not built, by decision.**
+
+- One process with several cameras, and a launcher for several processes.
+- Detecting on every Nth frame only (a detection stride).
+- A `--person-detector both` option (HOG and the DNN together).
+- Running YuNet at a reduced resolution: it lost 20 percent of the faces.
+- Tiling the DNN for distant people: 3.3 times the cost, and it found nobody under 110 px.
+
+**Open decisions for the owner.**
+
+1. Whether to add `--person-detector both`.
+2. Whether to delete the old two-pass `petrify.run()`, which the golden tests still use as their reference.
+3. The exit code when frames failed closed: 0 today, so a service manager or script does not see them.
+4. Whether to narrow the head zone of `orphan=head`.
+5. A webcam profile, once something has been measured on a webcam.
+6. Whether the older form `petrify INPUT OUTPUT` should write a partial file and rename it, as `petrify run --output` does.
+
 ## Phases
 
 | # | Phase | Done when |
@@ -242,7 +299,7 @@ Design points from building `petrify-shadow` that phase 6 and later plugins must
 | 3 | Webapp (done) | Live feed visible in the browser; erase config tweakable live. |
 | 4 | Plugin API + new detectors (done, pending sign-off) | Entry-point loading, the mode contract and registry, `--mode`, `--mode-option`, `--list-modes`, detection policies and refiners in the engine, the tracker (`--track`), model file lookup with pinned SHA-256 (`--model-dir`), the Mode section of the web page, and the YuNet face (`--faces`), DNN person (`--person-detector dnn`), and segmentation (`--segment`) detectors with their three pinned model files, a startup check of every model file a run needs, and `--background-check`. |
 | 5 | `petrify-shadow` plugin (done, pending sign-off) | All styles implemented and stackable: the nine styles and five options of the mode `shadow`, the orphan rule, held-box growth with the tracker, weakened protections, and the tracker fixes in the pipeline. |
-| 6 | CCTV hardening | Head-from-body fallback, multi-camera, performance budgets, fail-closed tests. |
+| 6 | CCTV hardening (done, pending sign-off) | Held count on boxes (`Box.held`) read by the shadow mode, the opt-in head fill `orphan=head`, one process per camera with `--threads`, SIGTERM handled like Ctrl-C and the recording kept on a process group stop, `--source-timeout`, `--profile cctv`, per-detector and per-refiner timings, a faster DNN letterbox resize, and the fault injection harness with a fail-closed property test. See [Findings from phase 6](#findings-from-phase-6). |
 
 ## Open decisions
 
