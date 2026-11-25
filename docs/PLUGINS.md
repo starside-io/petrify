@@ -299,7 +299,7 @@ Before a mode sees them, detector results go through these steps:
 | `LANDMARKS` | YuNet (on the faces it returns) | `--faces` |
 | `MASK` | PP-HumanSeg | `--segment` |
 
-YuNet, NanoDet-Plus, and PP-HumanSeg need model files that the user places on disk; petrify never downloads them. The README's [Model-based detectors](../README.md#model-based-detectors) section lists the files, where petrify looks for them, and the measured limits of each detector. Read the limits before you rely on one: the segmenter, for example, misses small, distant people and marks parts of empty scenes.
+YuNet, NanoDet-Plus, and PP-HumanSeg need model files that the user places on disk; petrify never downloads them. The [Model-based detectors](run.md#model-based-detectors) section of the `petrify run` docs lists the files, where petrify looks for them, and the measured limits of each detector. Read the limits before you rely on one: the segmenter, for example, misses small, distant people and marks parts of empty scenes.
 
 When a mode requires `faces`, `landmarks`, or `mask` and the user did not enable the detector that provides it, petrify refuses to start, whatever else the mode requires:
 
@@ -441,4 +441,4 @@ YuNet found a face on 805 frames, and those frames have the face box painted. Th
 - **`needs_background` cannot follow the options.** It is one value for the mode, so a mode cannot use the background differ for some options only.
 - **`choices` values arrive in different orders.** The command line passes them in typed order and the web page in option order. Do not let the order change what the mode draws, or whether `create` returns `previous`.
 - **No head estimate from a person box in core.** `petrify-shadow` has its own, as the opt-in option `orphan=head`; a mode that wants one computes it from the person boxes.
-- **No webcam profile, and one camera per process.** `--profile cctv` is the only profile. Several cameras need one petrify process each (see [Running several cameras](../README.md#running-several-cameras)).
+- **No webcam profile, and one camera per process.** `--profile cctv` is the only profile. Several cameras need one petrify process each (see [Running several cameras](deployment.md)).

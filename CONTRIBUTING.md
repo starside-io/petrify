@@ -49,7 +49,7 @@ Be kind. Criticism is welcome; personal attacks are not. We follow the [Contribu
 ### System requirements
 
 - Python 3.10 or later
-- `ffmpeg` on your `PATH` (see [README installation](README.md#installation))
+- `ffmpeg` on your `PATH` (see [Installation](docs/installation.md))
 - `pipx` or `pip` for Python package management
 
 ### Create a virtual environment
