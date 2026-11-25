@@ -28,14 +28,19 @@ from conftest import ShadowEntryPoint
 from petrify_shadow import SHADOW
 from petrify_shadow.factory import (
     BODYBOX_NEEDS_PERSONS,
+    WARN_MASK_WITHOUT_PERSONS,
     WEAK_DILATE,
     WEAK_EYEBAR_ONLY,
     WEAK_NO_BODY,
+    WEAK_NO_BODY_OFF,
     WEAK_ORPHAN_HEAD,
     WEAK_ORPHAN_HEAD_MASK,
+    WEAK_ORPHAN_OFF,
+    WEAK_ORPHAN_OFF_MASK,
     WEAK_PADDING,
     WEAK_REVERSIBLE,
     WEAK_SEGMENT_MISS,
+    WEAK_SEGMENT_MISS_OFF,
     WEAK_STRENGTH,
 )
 from petrify_shadow.mode import ShadowMode
@@ -147,9 +152,10 @@ def test_option_specs_match_the_design_table() -> None:
         "float", 0.01, 0.0, 0.1)
     orphan = by_name["orphan"]
     assert (orphan.kind, orphan.default, orphan.choices, orphan.runtime) == (
-        "choice", "box", ("box", "head"), True)
+        "choice", "off", ("off", "box", "head"), True)
     # The help states the trade-off, not only the choices.
     assert "covers less" in orphan.help and "top half" in orphan.help
+    assert "off (the default) fills nothing" in orphan.help
 
 
 def test_every_option_is_runtime_with_help_and_bounded_numbers() -> None:
@@ -164,7 +170,8 @@ def test_no_text_holds_an_em_or_en_dash() -> None:
     texts = [spec.help for spec in OPTIONS] + [
         WEAK_NO_BODY, WEAK_REVERSIBLE, WEAK_STRENGTH, WEAK_EYEBAR_ONLY, WEAK_PADDING,
         WEAK_DILATE, WEAK_SEGMENT_MISS, WEAK_ORPHAN_HEAD, WEAK_ORPHAN_HEAD_MASK,
-        BODYBOX_NEEDS_PERSONS, SHADOW.summary,
+        WEAK_NO_BODY_OFF, WEAK_SEGMENT_MISS_OFF, WEAK_ORPHAN_OFF, WEAK_ORPHAN_OFF_MASK,
+        WARN_MASK_WITHOUT_PERSONS, BODYBOX_NEEDS_PERSONS, SHADOW.summary,
     ]
     for text in texts:
         assert chr(0x2014) not in text and chr(0x2013) not in text, text
@@ -179,6 +186,7 @@ def test_no_text_holds_an_em_or_en_dash() -> None:
         (["color=red", "dilate=0.02"], {"color": "red", "dilate": 0.02}),
         (["orphan=head"], {"orphan": "head"}),
         (["orphan= box "], {"orphan": "box"}),
+        (["orphan=off"], {"orphan": "off"}),
     ],
 )
 def test_resolve_option_text_round_trips_cli_input(
@@ -200,6 +208,9 @@ def test_resolve_option_text_refuses_unknown_styles_and_out_of_range() -> None:
         resolve_option_text(OPTIONS, ["orphan=face"])
     with pytest.raises(ValueError):
         parse_params({"orphan": "Head"})
+    for bad in ("Off", "none", "", False, None):
+        with pytest.raises(ValueError):
+            parse_params({"orphan": bad})
 
 
 # ---------------------------------------------------------------------------
@@ -210,11 +221,11 @@ def test_resolve_option_text_refuses_unknown_styles_and_out_of_range() -> None:
 def test_parse_params_defaults() -> None:
     expected = ShadowParams(
         styles=frozenset({"facebox"}), padding=0.3, strength="high", color=(0, 0, 0),
-        dilate=0.01, orphan="box",
+        dilate=0.01, orphan="off",
     )
     assert parse_params({}) == expected
     assert parse_params(_opts()) == expected
-    # A hand-built instance without the field gets the default, which covers as before.
+    # A hand-built instance without the field gets the option's default.
     assert ShadowParams(frozenset({"facebox"}), 0.3, "high", (0, 0, 0), 0.01) == expected
 
 
@@ -349,15 +360,21 @@ def _weak(**given: Any) -> tuple[str, ...]:
     return SHADOW.weakened(_opts(**given))
 
 
-def test_weakened_default_lists_only_the_face_only_sentence() -> None:
-    assert _weak() == (WEAK_NO_BODY,)
+def test_weakened_default_lists_the_face_only_and_orphan_off_sentences() -> None:
+    assert _weak() == (WEAK_NO_BODY_OFF, WEAK_ORPHAN_OFF)
 
 
 def test_weakened_no_body_style() -> None:
-    assert WEAK_NO_BODY in _weak(styles="facebox")
-    assert WEAK_NO_BODY in _weak(styles="outline,facebox")  # outline is no body cover.
+    assert WEAK_NO_BODY in _weak(styles="facebox", orphan="box")
+    # outline is no body cover.
+    assert WEAK_NO_BODY in _weak(styles="outline,facebox", orphan="box")
     for body in sorted(BODY_STYLES):
-        assert WEAK_NO_BODY not in _weak(styles=f"{body},facebox"), body
+        assert WEAK_NO_BODY not in _weak(styles=f"{body},facebox", orphan="box"), body
+    # With off, no person box is filled: the form without the person detector clause.
+    assert WEAK_NO_BODY_OFF in _weak(styles="facebox", orphan="off")
+    assert WEAK_NO_BODY not in _weak(styles="facebox", orphan="off")
+    for body in sorted(BODY_STYLES):
+        assert WEAK_NO_BODY_OFF not in _weak(styles=f"{body},facebox", orphan="off"), body
 
 
 def test_weakened_reversible_blur() -> None:
@@ -429,11 +446,15 @@ def test_weakened_dilate_boundary() -> None:
 def test_weakened_segmenter_miss() -> None:
     for styles in ("silhouette", "silhouette_color", "silhouette,facebox", "silhouette,noise",
                    "silhouette_color,outline,eyebar"):
-        assert WEAK_SEGMENT_MISS in _weak(styles=styles), styles
+        assert WEAK_SEGMENT_MISS in _weak(styles=styles, orphan="box"), styles
+        assert WEAK_SEGMENT_MISS_OFF in _weak(styles=styles, orphan="off"), styles
+        assert WEAK_SEGMENT_MISS not in _weak(styles=styles, orphan="off"), styles
     # bodybox fills every person box; outline covers no body, which WEAK_NO_BODY says.
     for styles in ("silhouette,bodybox", "silhouette_color,bodybox,facebox", "outline,facebox",
                    "facebox", "bodybox"):
-        assert WEAK_SEGMENT_MISS not in _weak(styles=styles), styles
+        for orphan in ("off", "box", "head"):
+            weak = _weak(styles=styles, orphan=orphan)
+            assert WEAK_SEGMENT_MISS not in weak and WEAK_SEGMENT_MISS_OFF not in weak, styles
 
 
 @pytest.mark.parametrize("name", ["padding", "dilate"])
@@ -448,22 +469,26 @@ def test_negative_zero_is_normalized(name: str, text: str) -> None:
 
 
 def test_weakened_combination_lists_all_in_order() -> None:
-    assert _weak(styles="gaussian,eyebar,outline", strength="low", padding=0.1, dilate=0.0) == (
+    assert _weak(styles="gaussian,eyebar,outline", strength="low", padding=0.1, dilate=0.0,
+                 orphan="box") == (
         WEAK_NO_BODY,
         WEAK_REVERSIBLE,
         WEAK_STRENGTH.format(v="low"),
         WEAK_PADDING.format(v="0.1"),
     )
     assert _weak(styles="pixelate,silhouette", strength="medium", padding=0.0,
-                 dilate=0.0) == (
+                 dilate=0.0, orphan="box") == (
         WEAK_REVERSIBLE,
         WEAK_STRENGTH.format(v="medium"),
         WEAK_PADDING.format(v="0"),
         WEAK_DILATE.format(v="0"),
         WEAK_SEGMENT_MISS,
     )
-    assert _weak(styles="eyebar", padding=0.0) == (
+    assert _weak(styles="eyebar", padding=0.0, orphan="box") == (
         WEAK_NO_BODY, WEAK_EYEBAR_ONLY, WEAK_PADDING.format(v="0"),
+    )
+    assert _weak(styles="eyebar", padding=0.0) == (
+        WEAK_NO_BODY_OFF, WEAK_EYEBAR_ONLY, WEAK_PADDING.format(v="0"), WEAK_ORPHAN_OFF,
     )
 
 
@@ -484,9 +509,74 @@ def test_weakened_orphan_head() -> None:
     for styles in ("bodybox", "bodybox,facebox", "silhouette,bodybox,noise"):
         weak = _weak(styles=styles, orphan="head")
         assert WEAK_ORPHAN_HEAD not in weak and WEAK_ORPHAN_HEAD_MASK not in weak
-    # An unreadable value counts as the default.
+    # An unreadable value counts as the default, off.
     for bad in ("Head", 1, None):
-        assert SHADOW.weakened({"styles": ("facebox",), "orphan": bad}) == (WEAK_NO_BODY,)
+        assert SHADOW.weakened({"styles": ("facebox",), "orphan": bad}) == (
+            WEAK_NO_BODY_OFF, WEAK_ORPHAN_OFF)
+
+
+def test_weakened_orphan_off_sentence_wording() -> None:
+    assert WEAK_ORPHAN_OFF == (
+        "orphan is off: a person whose face is not found is shown when another face is "
+        "found on the same frame; orphan=box covers the whole box of such a person."
+    )
+    assert WEAK_ORPHAN_OFF_MASK == (
+        "orphan is off: the body of a person the segmenter does not mark is shown when "
+        "another person is segmented on the same frame; orphan=box covers the whole box "
+        "of such a person."
+    )
+    # The off forms drop the clause saying the person detector helps, which is
+    # false when no person box is filled.
+    assert WEAK_NO_BODY.startswith(WEAK_NO_BODY_OFF[:-1])
+    assert "person detector" not in WEAK_NO_BODY_OFF
+    assert "person detector" not in WEAK_SEGMENT_MISS_OFF
+
+
+STACKS = [
+    "facebox", "eyebar", "gaussian", "noise,eyebar", "outline,facebox",
+    "silhouette", "silhouette_color", "silhouette,facebox", "silhouette_color,outline,eyebar",
+    "bodybox", "bodybox,facebox", "silhouette,bodybox,noise",
+]
+
+
+def _orphan_sentences(styles: str, orphan: str) -> list[str]:
+    """Every sentence whose truth depends on ``orphan``, written out independently."""
+    names = set(styles.split(","))
+    body = bool(names & {"silhouette", "silhouette_color", "bodybox"})
+    silhouette = bool(names & {"silhouette", "silhouette_color"})
+    out: list[str] = []
+    if not body:
+        out.append(WEAK_NO_BODY_OFF if orphan == "off" else WEAK_NO_BODY)
+    if silhouette and "bodybox" not in names:
+        out.append(WEAK_SEGMENT_MISS_OFF if orphan == "off" else WEAK_SEGMENT_MISS)
+    if "bodybox" not in names and orphan == "head":
+        out.append(WEAK_ORPHAN_HEAD_MASK if silhouette else WEAK_ORPHAN_HEAD)
+    if "bodybox" not in names and orphan == "off":
+        out.append(WEAK_ORPHAN_OFF_MASK if silhouette else WEAK_ORPHAN_OFF)
+    return out
+
+
+ORPHAN_SENTENCES = {
+    WEAK_NO_BODY, WEAK_NO_BODY_OFF, WEAK_SEGMENT_MISS, WEAK_SEGMENT_MISS_OFF,
+    WEAK_ORPHAN_HEAD, WEAK_ORPHAN_HEAD_MASK, WEAK_ORPHAN_OFF, WEAK_ORPHAN_OFF_MASK,
+}
+
+
+@pytest.mark.parametrize("orphan", ["off", "box", "head"])
+@pytest.mark.parametrize("styles", STACKS)
+def test_every_weakened_sentence_holds_for_each_orphan_value(styles: str, orphan: str) -> None:
+    weak = _weak(styles=styles, orphan=orphan)
+    assert [s for s in weak if s in ORPHAN_SENTENCES] == _orphan_sentences(styles, orphan)
+    off_forms = {WEAK_NO_BODY_OFF, WEAK_SEGMENT_MISS_OFF, WEAK_ORPHAN_OFF, WEAK_ORPHAN_OFF_MASK}
+    if orphan == "off":
+        assert not {WEAK_NO_BODY, WEAK_SEGMENT_MISS} & set(weak)
+        # No sentence listed with off claims that the person detector helps.
+        assert not any("unless the person detector" in s for s in weak)
+    else:
+        assert not off_forms & set(weak)
+    # The other sentences do not depend on orphan.
+    rest = [s for s in weak if s not in ORPHAN_SENTENCES]
+    assert rest == [s for s in _weak(styles=styles, orphan="box") if s not in ORPHAN_SENTENCES]
 
 
 def test_weakened_orphan_head_sentence_wording() -> None:
@@ -548,9 +638,10 @@ def test_weakened_never_raises(options: Any) -> None:
 
 
 def test_weakened_on_invalid_styles_still_reports_the_other_settings() -> None:
-    assert SHADOW.weakened({"styles": (), "padding": 0.0}) == (WEAK_NO_BODY,)
-    assert SHADOW.weakened({"styles": ("outline",), "dilate": 0.0}) == (WEAK_NO_BODY,)
-    assert SHADOW.weakened({"styles": ("silhouette", 7), "dilate": 0.0}) == (
+    box = {"orphan": "box"}
+    assert SHADOW.weakened({"styles": (), "padding": 0.0, **box}) == (WEAK_NO_BODY,)
+    assert SHADOW.weakened({"styles": ("outline",), "dilate": 0.0, **box}) == (WEAK_NO_BODY,)
+    assert SHADOW.weakened({"styles": ("silhouette", 7), "dilate": 0.0, **box}) == (
         WEAK_DILATE.format(v="0"), WEAK_SEGMENT_MISS,
     )
 

@@ -29,7 +29,9 @@ otherwise:
 - a subject, and the primary group has no trusted region (no own region and no
   orphan person box that is fresh enough, see :func:`plan`): a full black
   frame, since the subject is not localized;
-- otherwise: the styles drawn on their regions, orphan person boxes filled black.
+- otherwise: the styles drawn on their regions, and with ``orphan`` ``box`` or
+  ``head`` the orphan person boxes filled black. With the default ``orphan``
+  ``off`` no orphan is filled.
 """
 
 from __future__ import annotations
@@ -168,7 +170,8 @@ class Plan:
     - ``person_rects``: the padded person boxes when bodybox is selected;
     - ``orphans``: the rects filled black for the person boxes the primary
       group does not cover: each padded person box, or with ``orphan`` ``"head"``
-      its head rect where :func:`plan` takes one.
+      its head rect where :func:`plan` takes one. Always empty with ``orphan``
+      ``"off"``.
     """
 
     action: Action
@@ -204,7 +207,7 @@ def _checked_orphan(orphan: object) -> str:
     """Return ``orphan`` if it is one of :data:`ORPHAN_CHOICES`, or raise ValueError.
 
     Checked here too so that a hand-built :class:`ShadowParams` with a misspelled
-    value fails the frame closed instead of silently drawing one of the two fills.
+    value fails the frame closed instead of silently taking one of the choices.
     """
     if type(orphan) is not str or orphan not in ORPHAN_CHOICES:
         raise ValueError(f"orphan must be one of {list(ORPHAN_CHOICES)}, got {orphan!r}")
@@ -247,7 +250,9 @@ def plan(
     1. A None field counts as empty, and zero-area boxes yield no region.
     2. The primary group is the body group when any body style is selected,
        else the face group (:func:`primary_of`).
-    3. Orphans come from :func:`~petrify_shadow.regions.orphan_indices` for the
+    3. With ``orphan`` ``"off"`` there are no orphans: no person box is filled,
+       and the box-share and head-zone mask tests are not applied. Otherwise
+       orphans come from :func:`~petrify_shadow.regions.orphan_indices` for the
        primary group, only when ``detections.persons`` is not None. Only faces
        with a held count of 0 may clear a person box: a held face no longer
        proves where the head is, so its person box is filled as an orphan while
@@ -267,6 +272,14 @@ def plan(
     6. ``subject_present`` False, and the detections show no subject either:
        ``"pass"``. A subject, and the primary group has no regions: ``"black"``.
        Otherwise ``"draw"``.
+
+       What ``"off"`` changes, rule by rule: rule 3 yields no orphan, so in rule 5
+       the primary group has regions only through its own trusted regions, and in
+       rule 6 a frame with a subject (a person box included) and no such region is
+       ``"black"``, exactly as when no person detector runs. Rules 1, 2, 4 and 7
+       are unchanged. So ``"off"`` never turns a frame that would be black into a
+       drawn one: it only leaves person boxes unfilled on frames drawn for another
+       region.
     7. In ``"draw"``, every selected group draws everything it has, trusted or
        not: a secondary group with no region draws nothing.
 
@@ -279,11 +292,14 @@ def plan(
     without a region (motion) are taken to belong to it. So a second person whom
     no detector localizes is shown, and with a mask primary a real mask
     anywhere makes the frame "draw" while a person the segmenter misses is shown
-    unless a person box makes that person an orphan. The mask share minimum only
-    stops a few stray pixels from doing this; it does not solve it.
+    unless a person box makes that person an orphan and ``orphan`` is ``"box"`` or
+    ``"head"``. With ``"off"`` a person whose face (face primary) or mask (mask
+    primary) is not found is shown whenever another trusted region is on the
+    frame. The mask share minimum only stops a few stray pixels from doing this;
+    it does not solve it.
 
     Raises ValueError for a style set the mode cannot draw, an ``orphan`` value
-    other than ``"box"`` or ``"head"``, a box whose ``held``
+    other than ``"off"``, ``"box"`` or ``"head"``, a box whose ``held``
     is not a non-negative integer, a mask whose shape is not the frame's, or a
     malformed box.
     """
@@ -322,7 +338,12 @@ def plan(
                 trusted_person = trusted_person or _trusted(count)
     orphans: list[Rect] = []
     trusted_orphan = False
-    if persons is not None:
+    if persons is not None and orphan == "off":
+        # No orphan is filled, but every person box is still read, so a malformed
+        # one raises on every frame as it does with box and head.
+        for box in persons:
+            pad_person(box, h, w)
+    elif persons is not None:
         fresh = [face for face, count in zip(faces, face_counts, strict=True) if count == 0]
         for i, reason in orphan_reasons(persons, fresh, mask, primary, h, w):
             rect = None

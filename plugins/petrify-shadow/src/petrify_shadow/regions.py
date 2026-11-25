@@ -24,9 +24,9 @@ clipping and threshold decision errs toward covering more:
   and bottom edges up.
 - Rectangles are clipped to the frame only after rounding, so clipping never
   removes an in-frame pixel that the padding reached.
-- A face center on the edge of a person box, or on the lower edge of its head
+- A face center on the edge of a person box, or on the lower edge of its face
   zone, does not count as inside it, so that person box stays an orphan and is
-  filled.
+  filled (with ``orphan`` ``box`` or ``head``).
 
 Option values (``padding``, ``dilate``) are decimals a person typed. They are read
 as the shortest decimal that round-trips to the float, so ``0.3`` means exactly
@@ -59,7 +59,11 @@ PERSON_PAD = Fraction(5, 100)
 """Padding of a person box on each side, as a share of the box width or height."""
 
 FACE_ZONE = Fraction(1, 3)
-"""A face clears a person box only when its center lies in this top share of the box height."""
+"""A face clears a full standing body box only when its center lies in this top share of its height.
+
+Tuned on CCTV footage, where person boxes hold whole standing bodies. It does
+not apply to a box that is not a full standing body (see :func:`_is_standing`).
+"""
 
 ORPHAN_MASK_SHARE = Fraction(30, 100)
 """A person box whose own area holds less than this share of mask pixels is an orphan."""
@@ -119,6 +123,31 @@ HEAD_MIN_ASPECT = Fraction(7, 5)
 A wider box is more likely a seated or bending person, a person cut at the chest
 by the frame edge, or two people side by side, whose head need not lie in the
 top half.
+"""
+
+STANDING_MIN_ASPECT = HEAD_MIN_ASPECT
+"""Smallest height over width of a person box that counts as a full standing body.
+
+The same 7/5 as :data:`HEAD_MIN_ASPECT`: a wider box is more likely a person cut
+off by a frame edge, seated or bending, or two people side by side, and there the
+face need not lie in the top third.
+"""
+
+BOTTOM_TOUCH_PX = 2
+"""A person box whose bottom edge lies this many rows or fewer above the frame bottom touches it.
+
+HOG and tracker-held boxes can end 1 or 2 px short of the last row of a body cut
+off by the frame, so ``y + h_box >= h - BOTTOM_TOUCH_PX`` counts as cut off.
+"""
+
+LOOSE_FACE_ZONE = Fraction(1, 2)
+"""A face clears a box that is not a full standing body only with its center in this top share."""
+
+LOOSE_MIN_FACE_SHARE = Fraction(1, 6)
+"""A face clears a box that is not a full standing body only when at least this share of its width.
+
+A small face inside a large cut-off box is more likely someone behind that
+person than that person's own face, and must not clear the box.
 """
 
 Primary = Literal["face", "mask", "bodybox"]
@@ -489,18 +518,55 @@ def _has_area(box: Box) -> bool:
     return bw > 0 and bh > 0
 
 
-def _clears(cx2: int, cy2: int, box: Box) -> bool:
-    """True when the point (cx2 / 2, cy2 / 2) may clear ``box``.
+def _is_standing(box: Box, h: int) -> bool:
+    """True when ``box`` may hold a full standing body in a frame ``h`` rows tall.
 
-    The point must lie strictly inside the box, and strictly above the lower edge
-    of its face zone (the top :data:`FACE_ZONE` of its height). Doubled
-    coordinates keep the half-pixel center of an odd-sized box exact. A point on
-    any edge does not clear: the person box then stays an orphan and is filled.
+    That is when its raw bottom edge ``y + h_box`` (not clipped to the frame)
+    lies more than :data:`BOTTOM_TOUCH_PX` rows above the bottom of the frame
+    (``y + h_box < h - BOTTOM_TOUCH_PX``), and its height over width is at least
+    :data:`STANDING_MIN_ASPECT` (compared in integers, so 7/5 is exact). A box
+    that touches the bottom of the frame is cut off there, as the upper body of
+    a person in front of a webcam is. Raises ValueError for a malformed box or a
+    negative ``h``.
+    """
+    _, y, bw, bh = _box(box)
+    frame_h = _count(h, "h")
+    if y + bh >= frame_h - BOTTOM_TOUCH_PX:
+        return False
+    n, d = STANDING_MIN_ASPECT.numerator, STANDING_MIN_ASPECT.denominator
+    return bh * d >= bw * n
+
+
+def _clear_rank(cx2: int, cy2: int, fw: int, box: Box, h: int) -> int | None:
+    """Return how the face centered at (cx2 / 2, cy2 / 2), ``fw`` wide, may clear ``box``.
+
+    None when it may not. The center must lie strictly inside the box and
+    strictly above the lower edge of a zone at the top of it: the top
+    :data:`FACE_ZONE` of its height when the box may hold a full standing body
+    (:func:`_is_standing`). In a box that is not a full standing body (cut off by
+    the bottom of the frame, or wider), the zone is the top
+    :data:`LOOSE_FACE_ZONE` and the face must also be at least
+    :data:`LOOSE_MIN_FACE_SHARE` of the box width. The rank is 0 when the center
+    also lies in the top :data:`FACE_ZONE` (the stricter fit) and 1 otherwise, so
+    a face prefers a box it fits under the stricter rule. Doubled coordinates
+    keep the half-pixel center of an odd-sized box exact. A point on any edge
+    does not clear: the person box then stays an orphan and is filled.
     """
     x, y, bw, bh = _box(box)
+    if not (2 * x < cx2 < 2 * (x + bw) and 2 * y < cy2):
+        return None
     n, d = FACE_ZONE.numerator, FACE_ZONE.denominator
     # cy2 / 2 < y + bh * n / d, multiplied through by 2 * d.
-    return 2 * x < cx2 < 2 * (x + bw) and 2 * y < cy2 and cy2 * d < 2 * (y * d + bh * n)
+    in_third = cy2 * d < 2 * (y * d + bh * n)
+    if _is_standing(box, h):
+        return 0 if in_third else None
+    sn, sd = LOOSE_MIN_FACE_SHARE.numerator, LOOSE_MIN_FACE_SHARE.denominator
+    if fw * sd < bw * sn:
+        return None
+    n, d = LOOSE_FACE_ZONE.numerator, LOOSE_FACE_ZONE.denominator
+    if cy2 * d >= 2 * (y * d + bh * n):
+        return None
+    return 0 if in_third else 1
 
 
 def _below_share(mask: np.ndarray, x: int, y: int, bw: int, bh: int, share: Fraction) -> bool:
@@ -545,12 +611,20 @@ def orphan_indices(
     Only runs when ``persons`` is not None; zero-area person boxes are never
     orphans. By ``primary``:
 
-    - ``"face"``: each face with a non-zero area clears at most one person box:
-      the smallest-area box whose interior holds the face-box center strictly
-      inside its top :data:`FACE_ZONE` (ties go to the first box in input order).
-      Every box no face cleared is an orphan. So one face cannot clear two
-      overlapping or nested persons, and a face found at belt height or lower
-      clears nothing. The caller decides which faces may clear a box: the
+    - ``"face"``: each face with a non-zero area clears at most one person box
+      that qualifies. A box that may hold a full standing body
+      (:func:`_is_standing`) qualifies when the face-box center lies strictly
+      inside its top :data:`FACE_ZONE`. A box that touches the bottom of the
+      frame (within :data:`BOTTOM_TOUCH_PX`), or whose height over width is below
+      :data:`STANDING_MIN_ASPECT`, qualifies when the center lies strictly inside
+      its top :data:`LOOSE_FACE_ZONE` and the face is at least
+      :data:`LOOSE_MIN_FACE_SHARE` of the box width. Of the boxes that qualify,
+      the face clears one where its center lies in the top :data:`FACE_ZONE`
+      before one where it does not, then the smallest area, then the first in
+      input order. Every box no face cleared is an orphan. So one face cannot
+      clear two overlapping or nested persons, a face found at belt height or
+      lower clears nothing, and a small face of someone behind a large cut-off
+      box does not clear it. The caller decides which faces may clear a box: the
       shadow mode passes only the faces whose box has ``held`` 0.
     - ``"mask"``: a person box is an orphan when its own area holds less than
       :data:`ORPHAN_MASK_SHARE` mask pixels, or when its head zone (the top
@@ -566,8 +640,11 @@ def orphan_indices(
     - Mask primary: the mask carries no identity, so another person's
       silhouette that fills the head zone and the box share keeps an unsegmented
       person from being an orphan.
-    - Face primary: a false face detection inside the top third of a person box
-      whose real face was missed still clears that box.
+    - Face primary: a false face detection, or the face of someone else, that
+      qualifies for a person box whose real face was missed still clears that
+      box: in the top third of a standing body box, or in the top half of a box
+      cut off by the bottom of the frame or wider than a standing body when it
+      is at least a sixth of the box width.
 
     Indices are returned in increasing order. ``h`` and ``w`` are the frame
     size. Raises ValueError for an unknown ``primary``, a mask whose shape is not
@@ -606,14 +683,16 @@ def orphan_reasons(
                 continue
             fx, fy, fw, fh = _box(face.box)
             cx2, cy2 = 2 * fx + fw, 2 * fy + fh
-            best: tuple[int, Box] | None = None
+            best: tuple[tuple[int, int], int] | None = None
             for i, box in boxes:
-                if _clears(cx2, cy2, box) and (
-                    best is None or box.w * box.h < best[1].w * best[1].h
-                ):
-                    best = (i, box)
+                rank = _clear_rank(cx2, cy2, fw, box, frame_h)
+                if rank is None:
+                    continue
+                key = (rank, box.w * box.h)
+                if best is None or key < best[0]:
+                    best = (key, i)
             if best is not None:
-                cleared.add(best[0])
+                cleared.add(best[1])
         return tuple((i, "face") for i, _ in boxes if i not in cleared)
     if mask is not None and mask.shape != (frame_h, frame_w):
         raise ValueError(

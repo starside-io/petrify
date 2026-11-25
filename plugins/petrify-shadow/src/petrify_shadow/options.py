@@ -77,9 +77,15 @@ COLORS: Mapping[str, tuple[int, int, int]] = MappingProxyType({
 
 DEFAULT_PADDING = 0.3
 DEFAULT_DILATE = 0.01
-DEFAULT_ORPHAN = "box"
-ORPHAN_CHOICES: tuple[str, ...] = ("box", "head")
-"""How an orphan person box is filled: ``box`` the whole padded box, ``head`` its head rect."""
+DEFAULT_ORPHAN = "off"
+ORPHAN_CHOICES: tuple[str, ...] = ("off", "box", "head")
+"""How an orphan person box is filled.
+
+``off`` fills none, so only the regions of the selected styles are drawn. ``box``
+fills the whole padded box, ``head`` its head rect. Off is the default because
+covering a whole body when only face styles are selected must be the user's
+choice.
+"""
 
 OPTIONS: tuple[OptionSpec, ...] = (
     OptionSpec(
@@ -143,14 +149,16 @@ OPTIONS: tuple[OptionSpec, ...] = (
         kind="choice",
         default=DEFAULT_ORPHAN,
         help=(
-            "How a person box the selected styles do not cover is filled black: a box no "
-            "face clears, or, with silhouette or silhouette_color, a box the mask does "
-            "not fill. box fills the whole box. head fills only its top half when the box "
-            "is fresh, at least 150 px tall and at least 1.4 times as tall as wide. This "
-            "covers less: the rest of that box, a head outside the top half included "
-            "(bending, sitting low, two people in one box), is left to the other styles. "
-            "Every other box, and a box the segmenter missed as a whole, keeps the "
-            "whole-box fill. No effect with bodybox, which covers every person box."
+            "Whether a person box the selected styles do not cover is filled black: a box "
+            "no face clears, or, with silhouette or silhouette_color, a box the mask does "
+            "not fill. off (the default) fills nothing, so a person whose face or mask is "
+            "not found is shown when another region is on the frame. box fills the whole "
+            "box. head fills only its top half when the box is fresh, at least 150 px tall "
+            "and at least 1.4 times as tall as wide. This covers less than box: the rest "
+            "of that box, a head outside the top half included (bending, sitting low, two "
+            "people in one box), is left to the other styles. Every other box, and a box "
+            "the segmenter missed as a whole, keeps the whole-box fill. No effect with "
+            "bodybox, which covers every person box."
         ),
         choices=ORPHAN_CHOICES,
         runtime=True,
@@ -167,8 +175,9 @@ class ShadowParams:
     the web page sends styles in option order and the command line in typed
     order, and both must give equal parameters for the same selection.
 
-    ``orphan`` is ``"box"`` or ``"head"`` (:data:`ORPHAN_CHOICES`). Its default
-    keeps a hand-built instance from before the option existed covering as it did.
+    ``orphan`` is ``"off"``, ``"box"`` or ``"head"`` (:data:`ORPHAN_CHOICES`). Its
+    default is the option's default, ``"off"``, so a hand-built instance without
+    it equals the parameters of options that leave it out.
     """
 
     styles: frozenset[str]

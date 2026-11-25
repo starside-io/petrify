@@ -26,6 +26,7 @@ from fractions import Fraction
 import numpy as np
 import pytest
 from petrify_shadow.regions import (
+    BOTTOM_TOUCH_PX,
     FACE_ZONE,
     HEAD_MIN_ASPECT,
     HEAD_MIN_HEIGHT_PX,
@@ -34,10 +35,13 @@ from petrify_shadow.regions import (
     HELD_GROWTH_CAP,
     HELD_GROWTH_PER_FRAME,
     HELD_REGION_FRAMES,
+    LOOSE_FACE_ZONE,
+    LOOSE_MIN_FACE_SHARE,
     MIN_PAD_PX,
     ORPHAN_HEAD_MASK_SHARE,
     ORPHAN_MASK_SHARE,
     PERSON_PAD,
+    STANDING_MIN_ASPECT,
     PreparedMask,
     Rect,
     dilate_px,
@@ -685,6 +689,7 @@ def test_orphan_constants() -> None:
     assert ORPHAN_HEAD_MASK_SHARE == Fraction(30, 100)
     assert FACE_ZONE == Fraction(1, 3)
     assert HEAD_ZONE == Fraction(1, 4)
+    assert STANDING_MIN_ASPECT == HEAD_MIN_ASPECT == Fraction(7, 5)
 
 
 def test_orphans_need_person_boxes() -> None:
@@ -736,7 +741,9 @@ def test_face_center_half_pixel_inside() -> None:
 
 
 def test_face_zone_line_with_fractional_third() -> None:
-    person = Box(0, 0, 100, 100)  # face zone ends at 33.33
+    # 60 wide, so a standing body box (height over width 5/3) where the top
+    # third applies.
+    person = Box(0, 0, 60, 100)  # face zone ends at 33.33
     assert orphan_persons((person,), (_face(40, 23, 20, 20),), None, "face", H, W) == ()
     assert orphan_persons((person,), (_face(40, 24, 20, 20),), None, "face", H, W) == (
         pad_person(person, H, W),
@@ -744,11 +751,237 @@ def test_face_zone_line_with_fractional_third() -> None:
 
 
 def test_face_low_in_the_box_does_not_clear() -> None:
-    big = Box(50, 50, 300, 400)
+    # 280 wide, so a standing body box (height over width 10/7) where the top
+    # third applies.
+    big = Box(50, 50, 280, 400)
     padded = pad_person(big, 480, 640)
     # A 3x3 false positive at belt height, and a hand near the feet.
     assert orphan_persons((big,), (_face(200, 300, 3, 3),), None, "face", 480, 640) == (padded,)
     assert orphan_persons((big,), (_face(200, 430, 20, 20),), None, "face", 480, 640) == (padded,)
+
+
+# --- clearing a box that is not a full standing body -------------------------
+#
+# H is 1080. Such a box touches the frame bottom (within BOTTOM_TOUCH_PX) or is
+# less than 7/5 as tall as wide. A face clears it with its center in the top half
+# and a width of at least a sixth of the box width.
+
+
+def _min_face_w(box: Box) -> int:
+    """The narrowest face width that is at least LOOSE_MIN_FACE_SHARE of ``box.w``."""
+    return -(-box.w * LOOSE_MIN_FACE_SHARE.numerator // LOOSE_MIN_FACE_SHARE.denominator)
+
+
+def _mid_face(box: Box, fw: int | None = None) -> Face:
+    """A face centered at 5/12 of ``box`` height: below its top third, above its half line."""
+    fw = _min_face_w(box) if fw is None else fw
+    cx, cy = box.x + box.w // 2, box.y + box.h * 5 // 12
+    return _face(cx - fw // 2, cy - 10, fw, 20)
+
+
+def _low_face(box: Box) -> Face:
+    """A wide face centered in the bottom quarter of ``box``, below its half line."""
+    fw = _min_face_w(box) + 1
+    cx, cy = box.x + box.w // 2, box.y + box.h * 7 // 8
+    return _face(cx - fw // 2, cy - 10, fw, 20)
+
+
+def test_loose_rule_constants() -> None:
+    assert BOTTOM_TOUCH_PX == 2
+    assert LOOSE_FACE_ZONE == Fraction(1, 2)
+    assert LOOSE_MIN_FACE_SHARE == Fraction(1, 6)
+
+
+@pytest.mark.parametrize(
+    ("box", "loose"),
+    [
+        (Box(100, 500, 300, 580), True),  # bottom edge at 1080: cut off by the frame
+        (Box(100, 501, 300, 580), True),  # bottom edge past the frame
+        (Box(100, 498, 300, 580), True),  # 2 px short of the bottom: still touching
+        (Box(100, 497, 300, 580), False),  # 3 px short of the bottom: standing body
+    ],
+)
+def test_a_box_touching_the_bottom_edge_takes_the_top_half_rule(box: Box, loose: bool) -> None:
+    # Height over width 580 / 300 is above 7/5, so only the bottom edge decides.
+    padded = pad_person(box, H, W)
+    expected = () if loose else (padded,)
+    assert orphan_persons((box,), (_mid_face(box),), None, "face", H, W) == expected
+    # Below the half line clears neither kind of box.
+    assert orphan_persons((box,), (_low_face(box),), None, "face", H, W) == (padded,)
+    # A face in the top third, wide enough, clears either way.
+    top = _face(box.x + 120, box.y + 20, 60, 20)
+    assert orphan_persons((box,), (top,), None, "face", H, W) == ()
+
+
+@pytest.mark.parametrize(
+    ("box", "loose"),
+    [
+        (Box(100, 100, 500, 700), False),  # exactly 7/5: standing body
+        (Box(100, 100, 500, 699), True),  # 699 / 500 just below 7/5
+        (Box(100, 100, 501, 700), True),  # 700 / 501 just below 7/5
+        (Box(100, 100, 400, 700), False),  # 7/4: standing body
+    ],
+)
+def test_a_box_wider_than_a_standing_body_takes_the_top_half_rule(box: Box, loose: bool) -> None:
+    # The bottom edge (at most 800) is far above the frame bottom at 1080.
+    assert box.y + box.h < H - BOTTOM_TOUCH_PX
+    padded = pad_person(box, H, W)
+    expected = () if loose else (padded,)
+    assert orphan_persons((box,), (_mid_face(box),), None, "face", H, W) == expected
+    assert orphan_persons((box,), (_low_face(box),), None, "face", H, W) == (padded,)
+
+
+@pytest.mark.parametrize(
+    "box", [Box(100, 500, 300, 580), Box(100, 100, 500, 699)], ids=["cut_off", "wide"]
+)
+def test_the_top_half_line_does_not_clear(box: Box) -> None:
+    padded = pad_person(box, H, W)
+    fw = 100
+    cx = box.x + box.w // 2
+    half2 = 2 * box.y + box.h  # the half line, doubled
+    # Center exactly on the half line (doubled cy == half2): does not clear.
+    fh = 20 + half2 % 2
+    on_line = _face(cx - 50, (half2 - fh) // 2, fw, fh)
+    assert 2 * on_line.box.y + on_line.box.h == half2
+    assert orphan_persons((box,), (on_line,), None, "face", H, W) == (padded,)
+    # Half a pixel above the half line clears.
+    above = _face(cx - 50, on_line.box.y, fw, on_line.box.h - 1)
+    assert 2 * above.box.y + above.box.h == half2 - 1
+    assert orphan_persons((box,), (above,), None, "face", H, W) == ()
+
+
+@pytest.mark.parametrize(
+    "box", [Box(100, 500, 300, 580), Box(100, 100, 500, 699)], ids=["cut_off", "wide"]
+)
+def test_a_face_narrower_than_a_sixth_of_the_box_does_not_clear(box: Box) -> None:
+    fw = _min_face_w(box)
+    assert fw * 6 >= box.w > (fw - 1) * 6
+    face = _mid_face(box)
+    narrow = Face(Box(face.box.x, face.box.y, fw - 1, face.box.h))
+    wide = Face(Box(face.box.x, face.box.y, fw, face.box.h))
+    assert orphan_persons((box,), (wide,), None, "face", H, W) == ()
+    assert orphan_persons((box,), (narrow,), None, "face", H, W) == (pad_person(box, H, W),)
+
+
+def test_the_face_width_share_does_not_apply_to_a_standing_body_box() -> None:
+    person = Box(300, 100, 200, 600)
+    assert orphan_persons((person,), (_face(395, 150, 5, 5),), None, "face", H, W) == ()
+
+
+def test_a_standing_body_box_keeps_the_top_third_rule() -> None:
+    person = Box(300, 100, 200, 600)  # face zone: y 100 to 300, bottom 700
+    padded = pad_person(person, H, W)
+    # Center y 299.5 clears, y 300 (on the zone line) and y 310 do not.
+    assert orphan_persons((person,), (_face(390, 289, 20, 21),), None, "face", H, W) == ()
+    assert orphan_persons((person,), (_face(390, 290, 20, 20),), None, "face", H, W) == (padded,)
+    assert orphan_persons((person,), (_face(390, 300, 20, 20),), None, "face", H, W) == (padded,)
+
+
+@pytest.mark.parametrize(
+    "box", [Box(100, 500, 300, 580), Box(100, 100, 500, 699)], ids=["cut_off", "wide"]
+)
+def test_a_box_that_is_not_standing_keeps_the_strict_edges(box: Box) -> None:
+    padded = pad_person(box, H, W)
+    right = box.x + box.w
+    cy = box.y + box.h // 4
+    cx = box.x + box.w // 2
+    on_edges = [
+        _face(box.x - 50, cy - 10, 100, 20),  # center on the left edge
+        _face(right - 50, cy - 10, 100, 20),  # center on the right edge
+        _face(cx - 50, box.y - 10, 100, 20),  # center on the top edge
+    ]
+    for face in on_edges:
+        assert orphan_persons((box,), (face,), None, "face", H, W) == (padded,), face
+    # Half a pixel inside the left edge clears: center x is x + 0.5.
+    assert orphan_persons((box,), (_face(box.x - 49, cy - 10, 99, 20),), None, "face", H, W) == ()
+    # A zero-area face clears nothing.
+    zero = (_face(cx, cy, 0, 20), _face(cx, cy, 100, 0))
+    assert orphan_persons((box,), zero, None, "face", H, W) == (padded,)
+
+
+def test_a_face_clears_at_most_one_box_that_is_not_standing() -> None:
+    # Two side by side upper bodies cut off by the frame bottom, overlapping, and a
+    # wide box nested in the first.
+    a, b = Box(100, 400, 800, 680), Box(600, 400, 800, 680)
+    inner = Box(500, 500, 300, 200)
+    face = _face(630, 530, 140, 40)  # center (700, 550): in the top third of a, b and inner
+    pa, pb, pi = (pad_person(x, H, W) for x in (a, b, inner))
+    # The smallest box that qualifies is cleared, and only it.
+    assert orphan_persons((a, b, inner), (face,), None, "face", H, W) == (pa, pb)
+    # Without the inner box, a and b have equal areas: the first one wins.
+    assert orphan_persons((a, b), (face,), None, "face", H, W) == (pb,)
+    assert orphan_persons((b, a), (face,), None, "face", H, W) == (pa,)
+    # Two faces that both pick the same box leave the other an orphan.
+    assert orphan_persons((a, b), (face, face), None, "face", H, W) == (pb,)
+    # A second face only inside b clears b too.
+    only_b = _face(1130, 530, 140, 40)
+    assert orphan_persons((a, b), (face, only_b), None, "face", H, W) == ()
+    assert pi not in orphan_persons((a, b, inner), (face,), None, "face", H, W)
+
+
+def test_a_small_far_face_inside_a_near_cut_off_box_does_not_clear_it() -> None:
+    # CCTV: a near person walks toward the camera, feet cut off by the frame
+    # bottom, and their face is missed. A second person stands behind, with a
+    # 60 px face inside the near box's top half.
+    near = Box(400, 200, 1200, 880)  # bottom 1080
+    far = Box(880, 260, 100, 300)  # standing, bottom 560
+    far_face = _face(900, 300, 60, 60)  # center (930, 330): in far's top third
+    assert 2 * far_face.box.y + far_face.box.h < 2 * near.y + near.h  # in near's top half
+    assert far_face.box.w * 6 < near.w
+    # The far face clears only the far box: the near person stays an orphan.
+    assert orphan_persons((near, far), (far_face,), None, "face", H, W) == (
+        pad_person(near, H, W),
+    )
+    # Without the far person's own box, the far face still does not clear the near one.
+    assert orphan_persons((near,), (far_face,), None, "face", H, W) == (pad_person(near, H, W),)
+
+
+def test_a_face_prefers_the_box_it_fits_under_the_top_third() -> None:
+    # Face A lies in the top third of its own cut-off box A, and below the top
+    # third but in the top half of a smaller cut-off box B whose face was missed.
+    a = Box(500, 300, 400, 780)  # third line 560, area 312000
+    b = Box(600, 100, 300, 980)  # third line 426.67, half line 590, area 294000
+    face = _face(640, 360, 120, 140)  # center (700, 430)
+    assert b.w * b.h < a.w * a.h
+    # A wins over the smaller B, so B stays an orphan.
+    assert orphan_persons((a, b), (face,), None, "face", H, W) == (pad_person(b, H, W),)
+    assert orphan_persons((b, a), (face,), None, "face", H, W) == (pad_person(b, H, W),)
+    # On B alone the face qualifies and clears it.
+    assert orphan_persons((b,), (face,), None, "face", H, W) == ()
+
+
+def test_webcam_framing_a_large_face_clears_its_wide_cut_off_box() -> None:
+    # The first webcam test: chest-up at 1920x1080, the person box cut off by the
+    # frame bottom and wider than tall, a 300 px face below the top third.
+    person = Box(330, 175, 1500, 905)
+    face = _face(930, 400, 300, 340)  # center (1080, 570)
+    cy2 = 2 * face.box.y + face.box.h
+    assert 2 * (person.y * 3 + person.h) < cy2 * 3  # below the top third
+    assert cy2 < 2 * person.y + person.h  # above the half line
+    assert orphan_persons((person,), (face,), None, "face", H, W) == ()
+    # The same face 249 px wide is less than a sixth of 1500 and does not clear.
+    narrow = _face(930, 400, 249, 340)
+    assert orphan_persons((person,), (narrow,), None, "face", H, W) == (
+        pad_person(person, H, W),
+    )
+
+
+def test_the_new_clearing_applies_to_the_face_primary_only() -> None:
+    cut_off = Box(100, 500, 300, 580)
+    padded = pad_person(cut_off, H, W)
+    faces = (_mid_face(cut_off),)
+    assert orphan_indices((cut_off,), faces, None, "face", H, W) == ()
+    # The mask primary ignores faces, and bodybox has no orphans.
+    assert orphan_persons((cut_off,), faces, None, "mask", H, W) == (padded,)
+    assert orphan_persons((cut_off,), faces, None, "bodybox", H, W) == ()
+
+
+def test_the_frame_height_decides_whether_a_box_is_cut_off() -> None:
+    box = Box(10, 20, 40, 80)  # bottom edge at 100, height over width 2
+    face = _mid_face(box)
+    assert orphan_indices((box,), (face,), None, "face", 100, 200) == ()
+    assert orphan_indices((box,), (face,), None, "face", 102, 200) == ()
+    assert orphan_indices((box,), (face,), None, "face", 103, 200) == (0,)
 
 
 def test_one_face_clears_one_of_two_overlapping_persons() -> None:

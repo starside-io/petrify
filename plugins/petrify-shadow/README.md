@@ -50,7 +50,7 @@ All six can be changed while a run is in progress, from the web page.
 | `strength` | choice | `high` | `high`, `medium`, `low` | Strength of `gaussian` and `pixelate`. Lower values are easier to reverse |
 | `color` | choice | `black` | `black`, `white`, `gray`, `red`, `green`, `blue` | Fill of `facebox`, `eyebar`, `bodybox`, `silhouette_color`, and `outline` |
 | `dilate` | float | 0.01 | 0.0 to 0.1 | How far the mask styles grow the person mask, as a share of the frame height, rounded up to whole pixels (11 px at 1080p, 5 px at 480p with the default) |
-| `orphan` | choice | `box` | `box`, `head` | How an orphan person box is filled black: `box` the whole padded box, `head` only its top half where the box qualifies. `head` covers less; see "Orphan fill: box or head" under [Coverage rules](#coverage-rules). No effect with `bodybox` |
+| `orphan` | choice | `off` | `off`, `box`, `head` | Whether an orphan person box is filled black: `off` fills none, so only the regions of the selected styles are drawn; `box` fills the whole padded box; `head` only its top half where the box qualifies. `off` and `head` cover less; see "Orphan fill: off, box or head" under [Coverage rules](#coverage-rules). No effect with `bodybox` |
 
 ```bash
 petrify run --source input.mp4 --output out.mp4 --mode shadow --faces \
@@ -66,7 +66,7 @@ Styles are always drawn in this fixed order, whatever order they were given in, 
 1. `silhouette` (black)
 2. `silhouette_color`
 3. `bodybox`
-4. orphan person boxes, filled black (see [Coverage rules](#coverage-rules))
+4. orphan person boxes, filled black with `orphan=box` or `head` (see [Coverage rules](#coverage-rules))
 5. `outline`
 6. `gaussian`, `pixelate`, `noise`, `facebox`, each over every face before the next starts
 7. `eyebar`
@@ -79,19 +79,19 @@ Every frame gets one of three outcomes:
 
 - **Passed through.** No subject is present: the frame is written unchanged.
 - **Black.** A subject is present but the mode has nothing to draw it on. This includes the frames the lookahead fills around a detection and the cold-start frames at the beginning of the run, which carry no detections of their own, and, for example, a face-only setup with `--detector motion` on a frame where motion fired and no face was found.
-- **Drawn.** The selected styles are drawn on their regions, and orphan person boxes are filled black.
+- **Drawn.** The selected styles are drawn on their regions, and with `orphan=box` or `head` orphan person boxes are filled black.
 
-Which regions decide between black and drawn depends on the styles. When any body style is selected (`silhouette`, `silhouette_color`, `bodybox`), the body styles decide: the frame is drawn when there is a person box (with `bodybox`), or a mask that marks at least 0.1 percent of the frame (with `silhouette` or `silhouette_color`). Otherwise the face styles decide: the frame is drawn when there is a face. An orphan person box also counts. Once a frame is drawn, every selected style draws everything it has, so a face style draws its faces even when the body styles decided.
+Which regions decide between black and drawn depends on the styles. When any body style is selected (`silhouette`, `silhouette_color`, `bodybox`), the body styles decide: the frame is drawn when there is a person box (with `bodybox`), or a mask that marks at least 0.1 percent of the frame (with `silhouette` or `silhouette_color`). Otherwise the face styles decide: the frame is drawn when there is a face. With `orphan=box` or `head`, an orphan person box also counts. With the default `orphan=off` it does not, so a frame with a subject (a person box included) and no region of the deciding styles is black, exactly as when no person detector runs. Once a frame is drawn, every selected style draws everything it has, so a face style draws its faces even when the body styles decided.
 
-**Orphan rule.** With person boxes (`--detector person` or `both`), a person box that the deciding styles do not cover is filled black, as a whole with the default `orphan=box` (see "Orphan fill: box or head" below for `orphan=head`):
+**Orphan rule.** With person boxes (`--detector person` or `both`) and `orphan=box` or `head`, a person box that the deciding styles do not cover is filled black, as a whole with `orphan=box` (see "Orphan fill: off, box or head" below). With the default `orphan=off` no person box is filled, whatever the styles: covering a whole body when only face styles are selected is a choice you make.
 
-- Face styles decide: each face clears at most one person box, the smallest one whose top third holds the face's center. A person box no face cleared is an orphan. So a person whose face the face detector misses is covered by a black box, as long as the person detector finds them.
+- Face styles decide: each face clears at most one person box that holds the face's center strictly inside it. In a box that can hold a full standing body, the center must lie in its top third. A box whose bottom edge is within 2 px of the bottom of the frame (cut off there, as the upper body in front of a webcam is) or that is less than 1.4 times as tall as wide is not a full standing body: there the center must lie in its top half, and the face must be at least a sixth of the box width, so the small face of someone further back does not clear a near person's box. Of the boxes a face qualifies for, it clears one where its center lies in the top third first, then the smallest, then the first in input order. A face held by the tracker clears nothing. A person box no face cleared is an orphan. So a person whose face the face detector misses is covered by a black box, as long as the person detector finds them and no other face clears their box (see limit 7).
 - Mask styles decide: a person box is an orphan when the mask covers less than 30 percent of its area, or less than 30 percent of its head zone (its top quarter). So a person the segmenter misses, or segments without the head, is covered by a black box.
 - `bodybox` decides: there are no orphans, since `bodybox` fills every person box itself.
 
 **Mask specks.** A mask that marks less than 0.1 percent of the frame's pixels does not count as a region, so a few stray pixels from the segmenter cannot make a frame "drawn" on their own. Such a small mask is still drawn when the frame is drawn for another region.
 
-**Orphan fill: box or head.** `orphan=box` (the default) fills the whole padded orphan box. `orphan=head` fills only the head rect of an orphan box that qualifies, and leaves the rest of that box to the other styles:
+**Orphan fill: off, box or head.** `orphan=off` (the default) fills no orphan box: a person whose face (or, with `silhouette` or `silhouette_color`, whose mask) is not found is shown when another region is on the frame. `orphan=box` fills the whole padded orphan box. `orphan=head` fills only the head rect of an orphan box that qualifies, and leaves the rest of that box to the other styles:
 
 - The head rect has the left, right, and top edges of the padded person box (5 percent of the box size per side, at least 2 px, not grown) and its bottom edge at the box's top plus half its height, rounded up to whole rows, then clipped to the frame. It spans the full padded width, because a face can sit anywhere across a box that touches a frame edge or holds two people.
 - A box qualifies when it is fresh (not held by the tracker), at least 150 px tall, and at least 1.4 times as tall as wide.
@@ -116,7 +116,7 @@ An earlier figure, that the padded face lay inside the top half of the box in ev
 **Held boxes with the tracker.** With `--track`, the tracker keeps the last box of a lost person or face for `--track-hold` frames (default 15) without moving it, and marks it with its held count (`Box.held` in petrify core: the frames it has been carried without a matching detection; 0 for a fresh detection). The mode reads that count from each box and keeps no state between frames apart from its noise generator:
 
 - a held box's cover grows by 25 percent of its size per held frame, around its center, up to 3 times its size;
-- a held face no longer clears its person box, so that box is filled black as an orphan;
+- a held face no longer clears its person box, so with `orphan=box` or `head` that box is filled black as an orphan;
 - from 8 held frames on, when the growth reaches its cap, the box is still drawn but no longer counts as a region: a frame with nothing else turns black.
 
 A held cover can still miss a subject that moves faster than the cover grows. Measured on both demo clips, 98.2 to 99.5 percent of the real person boxes one to three frames later lay fully inside the cover grown by 25 percent per frame, against 90.5 to 96.9 percent with 10 percent per frame. Frames that failed closed do not count as held frames, so a hold then lasts more stream frames.
@@ -132,8 +132,9 @@ Measured on the 640x480 clip with `--track`: 27 or 28 frames per run were covere
 **Left uncovered by design.** Once a frame has at least one region, every other presence signal (motion) is taken to belong to it:
 
 - a second person whom no detector localizes is shown;
-- when the mask styles decide, a real mask anywhere makes the frame drawn, and a person the segmenter misses is shown unless a person box makes them an orphan;
-- when the face styles decide, a false face inside the top third of a person box whose real face was missed clears that box.
+- when the mask styles decide, a real mask anywhere makes the frame drawn, and a person the segmenter misses is shown unless a person box makes them an orphan and `orphan` is `box` or `head`;
+- with the default `orphan=off`, a person whose face (or, when the mask styles decide, whose mask) is not found is shown when another region is on the frame;
+- when the face styles decide, a false face, or the face of someone else, that qualifies for a person box whose real face was missed clears that box: in the top third of a standing body box, or in the top half of a box cut off by the bottom of the frame or less than 1.4 times as tall as wide when the face is at least a sixth of the box width.
 
 A frame on which a detector or the mode fails is written black, as for every mode. The mode turns the live timestamp ROI overlay off, so a face inside the timestamp region is not pasted back: that region is covered like the rest of the frame.
 
@@ -141,19 +142,19 @@ A frame on which a detector or the mode fails is written black, as for every mod
 
 The numbers below were measured on the two demo clips (CCTV-style footage, 1920x1080 and 640x480). They describe those clips, not every camera, and they are not guarantees.
 
-1. **Not tested on live hardware.** The demo footage is CCTV style. The plugin has not been tested on a real webcam or any live source.
+1. **Barely tested on live hardware.** The demo footage is CCTV style. The plugin has had one test on a real webcam and none on any other live source. The top third rule for clearing a person box (see [Coverage rules](#coverage-rules)) was tuned on that CCTV footage, where person boxes hold whole standing bodies. The first webcam test (1920x1080, chest-up framing, `styles=eyebar`) showed a detected face failing to clear its own person box: the box was the upper body cut off by the bottom of the frame, the face sat below its top third, and the whole box was filled black under the eye bar, also with `orphan=head`, which refuses a box wider than tall. This is fixed: a box whose bottom edge is within 2 px of the bottom of the frame, or that is less than 1.4 times as tall as wide, is now cleared by a face whose center lies in its top half and that is at least a sixth of the box width. Other framings were not tested.
 2. **gaussian and pixelate leak the face.** With two visibly different real faces, the share of the difference between them that survives the cover was about 25 percent for `gaussian` at high strength, 41 to 46 percent at medium, and 56 to 60 percent at low; for `pixelate`, 50 to 57 percent at high, 61 to 72 percent at medium, and 75 to 83 percent at low. The share is nearly the same for faces from 16 to 400 px. Averaging the pixelated frames of a moving face recovers detail with any pixelation. Use `noise` or `facebox` for a face cover that cannot be undone.
 3. **The eyebar leaves most of the face visible.** It covered the eye fissure on all 226 measured faces, but only 66 to 85 percent of the eye and brow region, and the rest of the face stays visible.
 4. **The face padding does not cover everything.** With the default 0.3, the padded box covered a median of 94 percent of the head zone on the 640x480 clip (faces of 10 to 44 px, seen from above) and 100 percent on the 1080p clip (faces of 24 to 214 px). Hair, ears, and chin were covered on the contact sheets, except the top of a hair bun on the 640x480 clip, which padding 0.5 does not cover either.
-5. **The orphan rule over-covers.** At its thresholds (30 percent of the box and of its head zone), no person box that the segmenter missed escaped on either clip. The cost: 77 percent (640x480) and 86 percent (1080p) of correctly segmented persons were also turned into black boxes.
-6. **Mask styles need person boxes.** `silhouette` with `--detector motion` left a fully visible head on 94 of 655 frames of the 640x480 clip, because the segmenter marks something on almost every frame and misses the person, and the orphan rule needs person boxes. With `--detector both --person-detector dnn` that count was 0. Without `bodybox`, the run logs a warning for mask styles with `--detector motion`.
-7. **A false face can clear a person box.** YuNet sometimes reports a face on a torso (one case in the clips). A false face in the top third of a person box whose real face was missed clears that box, and that person is then shown.
+5. **The orphan rule over-covers** (with `orphan=box`). At its thresholds (30 percent of the box and of its head zone), no person box that the segmenter missed escaped on either clip. The cost: 77 percent (640x480) and 86 percent (1080p) of correctly segmented persons were also turned into black boxes.
+6. **Mask styles need person boxes and an orphan fill.** `silhouette` with `--detector motion` left a fully visible head on 94 of 655 frames of the 640x480 clip, because the segmenter marks something on almost every frame and misses the person, and the orphan rule needs person boxes. With `--detector both --person-detector dnn` and `orphan=box` that count was 0. With the default `orphan=off` the orphan rule is off and such a person is shown. Without `bodybox`, the run logs a warning for mask styles with `--detector motion`.
+7. **A false face, or someone else's face, can clear a person box.** YuNet sometimes reports a face on a torso (one case in the clips). A false face in the top third of a person box whose real face was missed clears that box, and that person is then shown. The same holds for the face of another person that lies in that box, as when two people overlap. In a box cut off by the bottom of the frame or less than 1.4 times as tall as wide, such a face clears the box when its center lies in the top half and it is at least a sixth of the box width; a face that is also in the top third of another box it qualifies for clears that box first.
 8. **A person no detector localizes is shown** when another region is on the frame (see [Coverage rules](#coverage-rules)).
-9. **Without `--track`, nothing escaped on the clips.** On every tested stack and both clips, no independently detected face, mask pixel, or person box was left uncovered, and every frame the engine marked as having a subject without detections of its own (lookahead gap fill, cold start) was black. That covers what a detector found; it says nothing about people every detector missed.
+9. **Without `--track`, nothing escaped on the clips.** On every tested stack and both clips, measured with `orphan=box` (the default then), no independently detected face, mask pixel, or person box was left uncovered, and every frame the engine marked as having a subject without detections of its own (lookahead gap fill, cold start) was black. That covers what a detector found; it says nothing about people every detector missed.
 10. **The detectors set the speed.** Rendering takes under 1 ms per frame at 640x480 and about 0.2 to 6 ms at 1080p depending on the styles (about 2 to 6 ms with all nine). The detectors dominate: on an idle machine the DNN person detector takes a median of about 33 ms per frame at 640x480 and 45 ms at 1080p, and YuNet about 7 ms and 29 ms. A run with `--detector both --person-detector dnn --faces` at 1080p ran at about 12 to 13 frames per second, so a 25 fps live source drops frames. See [Performance](../../README.md#performance) in the main README.
 11. **No background differ, so distant people can be shown.** The mode does not use the clean background, so the background differ, which covers small and distant people in `erase`, never runs. With `--person-detector dnn` the run warns that people smaller than about 110 px tall on a 1080p frame can be shown: the DNN does not find them, and on a frame that has another region nothing covers them. Running the DNN on tiles of the frame was tried and not kept: it cost 3.3 times as much and found nobody under 110 px. Running YuNet at a reduced resolution was also not kept: it lost 20 percent of the faces.
-12. **`orphan=head` shows the rest of an orphan box.** Only the top half of a qualifying orphan box is filled, so the body is shown, and so is a head that lies lower in the box, as when bending, sitting low, or with two people in one box. None of those poses were in the footage it was measured on (see "Orphan fill: box or head" under [Coverage rules](#coverage-rules)). It is opt-in and listed as a weakened protection; the default `orphan=box` fills the whole box.
-13. **Not built.** A webcam profile (nothing was tested on a webcam; `--profile cctv` exists, see the [main README](../../README.md#run-options)), and one process for several cameras (run one process per camera, see [Running several cameras](../../README.md#running-several-cameras)).
+12. **`orphan=head` shows the rest of an orphan box.** Only the top half of a qualifying orphan box is filled, so the body is shown, and so is a head that lies lower in the box, as when bending, sitting low, or with two people in one box. None of those poses were in the footage it was measured on (see "Orphan fill: off, box or head" under [Coverage rules](#coverage-rules)). It is opt-in and listed as a weakened protection; `orphan=box` fills the whole box.
+13. **Not built.** A webcam profile (only one webcam test so far; `--profile cctv` exists, see the [main README](../../README.md#run-options)), and one process for several cameras (run one process per camera, see [Running several cameras](../../README.md#running-several-cameras)).
 
 The detectors' own limits apply too: see [Limits, before you choose one](../../README.md#limits-before-you-choose-one) in the main README. The DNN person detector misses people smaller than about 110 px tall on a 1080p frame, and the segmenter misses small, distant people.
 
@@ -176,11 +177,11 @@ petrify run --source camera.mp4 --output out.mp4 --mode shadow \
 
 The warning is expected: the shadow mode does not use the background differ (see limit 11).
 
-**Silhouette with a person box detector.** The mask is filled black, and a person the segmenter misses is filled as an orphan box. Keep a person box detector with the mask styles (see limit 6).
+**Silhouette with a person box detector.** The mask is filled black, and with `orphan=box` a person the segmenter misses is filled as an orphan box. Keep a person box detector and `orphan=box` with the mask styles (see limit 6).
 
 ```bash
 petrify run --source camera2.mp4 --output out.mp4 --mode shadow \
-    --mode-option styles=silhouette \
+    --mode-option styles=silhouette --mode-option orphan=box \
     --segment --detector both --person-detector dnn
 ```
 
@@ -206,14 +207,18 @@ With `--web`, the settings page lists these sentences under "Weakened protection
 
 | Listed when | Sentence | What it means |
 |---|---|---|
-| No body style is selected | Only faces are covered: bodies, clothing and posture stay visible, and a face the face detector misses is shown when another face is found on the same frame, unless the person detector finds that person. | Only the face cover protects the person, and only the person detector's orphan rule catches a missed face |
+| No body style is selected, `orphan=box` or `head` | Only faces are covered: bodies, clothing and posture stay visible, and a face the face detector misses is shown when another face is found on the same frame, unless the person detector finds that person. A face of someone else inside that person's box can still clear the box and leave them shown. | Only the face cover protects the person, and only the person detector's orphan rule catches a missed face (limit 7) |
+| No body style is selected, `orphan=off` | Only faces are covered: bodies, clothing and posture stay visible, and a face the face detector misses is shown when another face is found on the same frame. | Only the face cover protects the person |
 | `gaussian` or `pixelate` without `noise` or `facebox` | The gaussian and pixelate styles can be partially reversed by machine learning models, and a face no body style covers is protected only by them; add noise or facebox for a cover that cannot be undone. | The face cover leaks (limit 2), with or without a body style, since a person the body style misses keeps only the face cover |
 | The above, with `strength` medium or low (VALUE) | strength is VALUE: the blur or pixelation is weaker than the default and easier to reverse. | More of the face survives (limit 2) |
 | `eyebar` is the only face style | The eyebar style covers only the eyes: a face no body style covers stays visible apart from the eyes and can be recognized. | See limit 3 |
 | A face style with `padding` below 0.3 | padding is VALUE, below the default of 0.3: hair, ears and chin around the face box can be shown. | Less of the head is covered (limit 4) |
 | `silhouette` or `silhouette_color` with `dilate` below 0.01 | dilate is VALUE, below the default of 0.01: the edge of the person can show around the silhouette. | The mask edge is not grown enough to cover the outline of the person |
-| `silhouette` or `silhouette_color` without `bodybox` | The body of a person the segmenter misses is shown when another person is segmented on the same frame, unless the person detector finds that person; add bodybox to cover every person box. | Only the orphan rule catches a person the segmenter misses, and only with person boxes |
+| `silhouette` or `silhouette_color` without `bodybox`, `orphan=box` or `head` | The body of a person the segmenter misses is shown when another person is segmented on the same frame, unless the person detector finds that person; add bodybox to cover every person box. | Only the orphan rule catches a person the segmenter misses, and only with person boxes |
+| `silhouette` or `silhouette_color` without `bodybox`, `orphan=off` | The body of a person the segmenter misses is shown when another person is segmented on the same frame; add bodybox to cover every person box. | Nothing catches a person the segmenter misses |
 | `orphan=head` without `bodybox` and without a body style | orphan is head: a person box whose face is not found is covered only on its top half; the body, and a head outside the top half as when bending, sitting low or two people in one box, are shown. | A person whose face is missed keeps only the head rect (limit 12) |
+| `orphan=off` without `bodybox` and without a body style | orphan is off: a person whose face is not found is shown when another face is found on the same frame; orphan=box covers the whole box of such a person. | No person box is filled, so a person whose face is missed is not covered at all |
+| `orphan=off` without `bodybox`, with `silhouette` or `silhouette_color` | orphan is off: the body of a person the segmenter does not mark is shown when another person is segmented on the same frame; orphan=box covers the whole box of such a person. | No person box is filled, so a person the segmenter misses keeps only a face cover, if any |
 | `orphan=head` without `bodybox`, with `silhouette` or `silhouette_color` | orphan is head: a person box whose head the segmenter does not mark is covered only on its top half; a head outside the top half, as when bending, sitting low or two people in one box, is shown, and so is any part of the body the segmenter misses. | A person segmented without the head keeps only the head rect and the mask (limit 12) |
 
 petrify itself adds `The tracker is on but does not hold persons: no detector in use provides them, so persons are not held between detections.` when `--track` is on and no person box detector runs (`--detector motion`), since the mode requires person boxes.
@@ -221,7 +226,7 @@ petrify itself adds `The tracker is on but does not hold persons: no detector in
 At startup, a mask style without `bodybox` and with `--detector motion` logs this warning:
 
 ```
-shadow: the mask styles run without person boxes (--detector motion). A person the segmenter misses is shown whenever the segmenter marks anything else on the frame, and the orphan rule that would cover that person needs person boxes. Use --detector person or both, with --person-detector dnn.
+shadow: the mask styles run without person boxes (--detector motion). A person the segmenter misses is shown whenever the segmenter marks anything else on the frame, and the orphan rule that would cover that person (orphan box or head) needs person boxes. Use --detector person or both, with --person-detector dnn, and --mode-option orphan=box (or head): with the default orphan=off no person box is filled.
 ```
 
 ## Tests and tools

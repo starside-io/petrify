@@ -37,8 +37,9 @@ from petrify_shadow import SHADOW
 from petrify_shadow.factory import (
     BODYBOX_NEEDS_PERSONS,
     WEAK_DILATE,
-    WEAK_NO_BODY,
+    WEAK_NO_BODY_OFF,
     WEAK_ORPHAN_HEAD_MASK,
+    WEAK_ORPHAN_OFF,
     WEAK_PADDING,
     WEAK_REVERSIBLE,
     WEAK_SEGMENT_MISS,
@@ -677,13 +678,13 @@ def test_the_snapshot_lists_the_six_options_and_the_mode_weakened_sentences_and_
         "dilate": {**_mode_options(before)["dilate"], "kind": "float", "value": 0.01,
                    "default": 0.01, "choices": [], "minimum": 0.0, "maximum": 0.1,
                    "runtime": True},
-        "orphan": {**_mode_options(before)["orphan"], "kind": "choice", "value": "box",
-                   "default": "box", "choices": ["box", "head"], "minimum": None,
+        "orphan": {**_mode_options(before)["orphan"], "kind": "choice", "value": "off",
+                   "default": "off", "choices": ["off", "box", "head"], "minimum": None,
                    "maximum": None, "runtime": True},
     }
     assert [o["name"] for o in before.to_dict()["mode"]["options"]] == [
         "styles", "padding", "strength", "color", "dilate", "orphan"]
-    assert before.weakened == (*builtin, WEAK_NO_BODY)
+    assert before.weakened == (*builtin, WEAK_NO_BODY_OFF, WEAK_ORPHAN_OFF)
 
     values = {name: o["value"] for name, o in _mode_options(after).items()}
     assert values == {"styles": ["silhouette", "gaussian"], "padding": 0.1,
@@ -802,7 +803,7 @@ def test_cli_list_modes_with_mode_shadow_prints_the_six_options(
         f"    changeable while running: yes\n    help: {helps['color']}\n"
         "  dilate\n    kind: float\n    default: 0.01\n    range: 0.0 to 0.1\n"
         f"    changeable while running: yes\n    help: {helps['dilate']}\n"
-        "  orphan\n    kind: choice\n    default: box\n    choices: box, head\n"
+        "  orphan\n    kind: choice\n    default: off\n    choices: off, box, head\n"
         f"    changeable while running: yes\n    help: {helps['orphan']}\n"
     )
 
@@ -817,7 +818,7 @@ def test_cli_mode_option_styles_reaches_the_config_as_a_tuple_in_typed_order(
     assert config.mode == "shadow"
     assert config.mode_options_dict() == {
         "styles": ("silhouette", "facebox"), "padding": 0.3, "strength": "high",
-        "color": "black", "dilate": 0.01, "orphan": "box",
+        "color": "black", "dilate": 0.01, "orphan": "off",
     }
 
 

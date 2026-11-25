@@ -49,7 +49,13 @@ BODYBOX_NEEDS_PERSONS = (
 WEAK_NO_BODY = (
     "Only faces are covered: bodies, clothing and posture stay visible, and a face the "
     "face detector misses is shown when another face is found on the same frame, "
-    "unless the person detector finds that person."
+    "unless the person detector finds that person. A face of someone else inside that "
+    "person's box can still clear the box and leave them shown."
+)
+# The orphan=off form: no person box is filled, so finding the person does not help.
+WEAK_NO_BODY_OFF = (
+    "Only faces are covered: bodies, clothing and posture stay visible, and a face the "
+    "face detector misses is shown when another face is found on the same frame."
 )
 # Worded to hold with and without a body style: a person the person detector or
 # the segmenter misses keeps only the face cover.
@@ -79,6 +85,23 @@ WEAK_SEGMENT_MISS = (
     "segmented on the same frame, unless the person detector finds that person; add "
     "bodybox to cover every person box."
 )
+# The orphan=off form, for the same reason as WEAK_NO_BODY_OFF.
+WEAK_SEGMENT_MISS_OFF = (
+    "The body of a person the segmenter misses is shown when another person is "
+    "segmented on the same frame; add bodybox to cover every person box."
+)
+
+WEAK_ORPHAN_OFF = (
+    "orphan is off: a person whose face is not found is shown when another face is "
+    "found on the same frame; orphan=box covers the whole box of such a person."
+)
+# The mask-primary form: there the region that makes the frame drawn is a mask, and
+# a face style, if any, still covers a face that is found.
+WEAK_ORPHAN_OFF_MASK = (
+    "orphan is off: the body of a person the segmenter does not mark is shown when "
+    "another person is segmented on the same frame; orphan=box covers the whole "
+    "box of such a person."
+)
 
 WEAK_ORPHAN_HEAD = (
     "orphan is head: a person box whose face is not found is covered only on its top "
@@ -97,8 +120,10 @@ WEAK_ORPHAN_HEAD_MASK = (
 WARN_MASK_WITHOUT_PERSONS = (
     "shadow: the mask styles run without person boxes (--detector motion). A person the "
     "segmenter misses is shown whenever the segmenter marks anything else on the frame, "
-    "and the orphan rule that would cover that person needs person boxes. Use --detector "
-    "person or both, with --person-detector dnn."
+    "and the orphan rule that would cover that person (orphan box or head) needs person "
+    "boxes. Use --detector person or both, with --person-detector dnn, and "
+    "--mode-option orphan=box (or head): with the default orphan=off no person box is "
+    "filled."
 )
 """Logged once per newly built mode with a mask style, no bodybox, and --detector motion."""
 
@@ -146,9 +171,10 @@ class ShadowFactory:
         has_body = bool(styles & BODY_STYLES)
         weak_blur = bool(styles & {"gaussian", "pixelate"}) and not styles & _OPAQUE_FACE_STYLES
         silhouette = bool(styles & _SILHOUETTE_STYLES)
+        orphan = _read_orphan(options)
         sentences: list[str] = []
         if not has_body:
-            sentences.append(WEAK_NO_BODY)
+            sentences.append(WEAK_NO_BODY_OFF if orphan == "off" else WEAK_NO_BODY)
         # A body style does not lift these two: a person it misses while another is
         # found keeps only the face cover.
         if weak_blur:
@@ -164,10 +190,12 @@ class ShadowFactory:
         # With bodybox every person box is filled; without it the silhouette is the
         # body cover and only the orphan rule catches a person the segmenter misses.
         if silhouette and "bodybox" not in styles:
-            sentences.append(WEAK_SEGMENT_MISS)
+            sentences.append(WEAK_SEGMENT_MISS_OFF if orphan == "off" else WEAK_SEGMENT_MISS)
         # bodybox covers every person box, so it leaves no orphan to fill.
-        if _read_orphan(options) == "head" and "bodybox" not in styles:
+        if orphan == "head" and "bodybox" not in styles:
             sentences.append(WEAK_ORPHAN_HEAD_MASK if has_body else WEAK_ORPHAN_HEAD)
+        if orphan == "off" and "bodybox" not in styles:
+            sentences.append(WEAK_ORPHAN_OFF_MASK if has_body else WEAK_ORPHAN_OFF)
         return tuple(sentences)
 
     def create(self, ctx: ModeContext, previous: Mode | None = None) -> Mode:
@@ -248,7 +276,7 @@ def _read_strength(options: object) -> str:
 
 
 def _read_orphan(options: object) -> str:
-    """Return ``options["orphan"]`` when it is a known value, else the default ``"box"``."""
+    """Return ``options["orphan"]`` when it is a known value, else the default ``"off"``."""
     value = _get(options, "orphan")
     if type(value) is str and value in ORPHAN_CHOICES:
         return value

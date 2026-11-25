@@ -146,12 +146,13 @@ def _frame(image: np.ndarray, index: int = 0) -> Frame:
 
 def _oracle(
     present: bool, faces: str, mask: str, persons: str, group: str,
-    face_held: int = 0, person_held: int = 0,
+    face_held: int = 0, person_held: int = 0, orphan: str = "box",
 ) -> tuple[str, tuple[Box, ...]]:
     """The decision table written out in plain terms, independent of mode.py.
 
     ``face_held`` and ``person_held`` are the held counts of every face and of
-    every person box.
+    every person box. ``orphan`` is the option value: ``"off"`` fills no orphan,
+    ``"box"`` fills each orphan's whole padded box.
     """
     styles = set(GROUPS[group])
     one_face = faces == "one"
@@ -164,7 +165,7 @@ def _oracle(
         primary = "mask"
     else:
         primary = "face"
-    if boxes is None or primary == "bodybox":
+    if boxes is None or primary == "bodybox" or orphan == "off":
         orphans: list[Box] = []
     elif primary == "face":
         # Only a face that is not held clears its person box.
@@ -190,10 +191,12 @@ def _oracle(
 
 def _check_plan(
     result: Plan, present: bool, faces: str, mask: str, persons: str, group: str,
-    face_held: int = 0, person_held: int = 0,
+    face_held: int = 0, person_held: int = 0, orphan: str = "box",
 ) -> None:
-    params = _params(GROUPS[group])
-    action, orphan_boxes = _oracle(present, faces, mask, persons, group, face_held, person_held)
+    params = _params(GROUPS[group], orphan=orphan)
+    action, orphan_boxes = _oracle(
+        present, faces, mask, persons, group, face_held, person_held, orphan
+    )
     assert result.action == action
     pgrow = held_growth(person_held)
     assert result.orphans == tuple(pad_person(b, H, W, grow=pgrow) for b in orphan_boxes)
@@ -234,16 +237,18 @@ def _held_for(detections: Detections, face_held: int, person_held: int) -> Detec
     )
 
 
+@pytest.mark.parametrize("orphan", ["off", "box"])
 @pytest.mark.parametrize("group", list(GROUPS))
 @pytest.mark.parametrize("persons", list(PERSONS))
 @pytest.mark.parametrize("mask", list(MASKS))
 @pytest.mark.parametrize("faces", list(FACES))
 @pytest.mark.parametrize("present", [False, True])
 def test_plan_follows_the_decision_table(
-    present: bool, faces: str, mask: str, persons: str, group: str
+    present: bool, faces: str, mask: str, persons: str, group: str, orphan: str
 ) -> None:
-    result = plan(_params(GROUPS[group]), _detections(faces, mask, persons), present, SHAPE)
-    _check_plan(result, present, faces, mask, persons, group)
+    params = _params(GROUPS[group], orphan=orphan)
+    result = plan(params, _detections(faces, mask, persons), present, SHAPE)
+    _check_plan(result, present, faces, mask, persons, group, orphan=orphan)
 
 
 @pytest.mark.parametrize("group", list(GROUPS))
@@ -252,12 +257,14 @@ def test_plan_follows_the_decision_table(
 @pytest.mark.parametrize("faces", ["empty", "one"])
 @pytest.mark.parametrize("person_held", [0, 1, CAP - 1, CAP, CAP + 3])
 @pytest.mark.parametrize("face_held", [0, 1, CAP - 1, CAP, CAP + 3])
+@pytest.mark.parametrize("orphan", ["off", "box"])
 def test_plan_follows_the_decision_table_for_held_boxes(
-    face_held: int, person_held: int, faces: str, mask: str, persons: str, group: str
+    orphan: str, face_held: int, person_held: int, faces: str, mask: str, persons: str,
+    group: str,
 ) -> None:
     detections = _held_for(_detections(faces, mask, persons), face_held, person_held)
-    result = plan(_params(GROUPS[group]), detections, True, SHAPE)
-    _check_plan(result, True, faces, mask, persons, group, face_held, person_held)
+    result = plan(_params(GROUPS[group], orphan=orphan), detections, True, SHAPE)
+    _check_plan(result, True, faces, mask, persons, group, face_held, person_held, orphan)
 
 
 E = "empty"
@@ -341,7 +348,7 @@ def test_plan_written_out_held_cases(
     orphans: tuple[Box, ...],
 ) -> None:
     detections = _held_for(_detections(faces, "none", persons), face_held, person_held)
-    result = plan(_params(GROUPS[group]), detections, True, SHAPE)
+    result = plan(_params(GROUPS[group], orphan="box"), detections, True, SHAPE)
     assert result.action == action
     grow = held_growth(person_held)
     assert result.orphans == tuple(pad_person(b, H, W, grow=grow) for b in orphans)
@@ -357,15 +364,75 @@ def test_plan_written_out_cases(
     present: bool, faces: str, mask: str, persons: str, group: str, action: str,
     orphans: tuple[Box, ...],
 ) -> None:
-    result = plan(_params(GROUPS[group]), _detections(faces, mask, persons), present, SHAPE)
+    params = _params(GROUPS[group], orphan="box")
+    result = plan(params, _detections(faces, mask, persons), present, SHAPE)
     assert result.action == action
     assert result.orphans == tuple(pad_person(b, H, W) for b in orphans)
     # The oracle agrees with every written-out row.
     assert _oracle(present, faces, mask, persons, group) == (action, orphans)
 
 
+# (subject_present, faces, mask, persons, group, action), written out for orphan=off:
+# no orphan is ever filled, and a person box alone is no region.
+OFF_TABLE = [
+    # Face primary: a person box no face clears is not filled, and alone it is no
+    # region, so the frame is black exactly as with no person detector.
+    (True, "empty", "none", "with_face", "face", "black"),
+    (True, "empty", "none", "without_face", "face", "black"),
+    (True, "empty", "none", "both", "face", "black"),
+    (False, "none", "none", "without_face", "face", "black"),
+    (True, "one", "none", "both", "face", "draw"),
+    (True, "one", "none", "with_face", "face", "draw"),
+    # Mask primary: the mask is the only region.
+    (True, "none", "false", "both", "mask", "black"),
+    (True, "none", "speck", "with_face", "mask", "black"),
+    (True, "none", "populated", "both", "mask", "draw"),
+    (True, "none", "populated", "without_face", "outline_face", "black"),
+    # Bodybox primary: unaffected, it fills every person box itself.
+    (True, "none", "none", "both", "bodybox", "draw"),
+    (True, "none", "none", "zero", "bodybox", "black"),
+    (False, "none", "none", "none", "face", "pass"),
+]
+
+
+@pytest.mark.parametrize(("present", "faces", "mask", "persons", "group", "action"), OFF_TABLE)
+def test_plan_written_out_cases_with_orphan_off(
+    present: bool, faces: str, mask: str, persons: str, group: str, action: str
+) -> None:
+    params = _params(GROUPS[group], orphan="off")
+    result = plan(params, _detections(faces, mask, persons), present, SHAPE)
+    assert result.action == action
+    assert result.orphans == ()
+    assert _oracle(present, faces, mask, persons, group, orphan="off") == (action, ())
+
+
+@pytest.mark.parametrize("group", list(GROUPS))
+@pytest.mark.parametrize("persons", list(PERSONS))
+@pytest.mark.parametrize("mask", list(MASKS))
+@pytest.mark.parametrize("faces", list(FACES))
+def test_orphan_off_never_draws_a_frame_box_would_turn_black(
+    faces: str, mask: str, persons: str, group: str
+) -> None:
+    # off only removes orphan fills: a frame black with box stays black, and a
+    # frame drawn with off is drawn with box, with the same face, mask and
+    # bodybox regions.
+    detections = _detections(faces, mask, persons)
+    off = plan(_params(GROUPS[group], orphan="off"), detections, True, SHAPE)
+    box = plan(_params(GROUPS[group], orphan="box"), detections, True, SHAPE)
+    if box.action == "black":
+        assert off.action == "black"
+    if off.action == "draw":
+        assert box.action == "draw"
+        assert (off.faces, off.face_rects, off.person_rects) == (
+            box.faces, box.face_rects, box.person_rects)
+        assert (off.mask is None) == (box.mask is None)
+        if off.mask is not None:
+            assert off.mask.rect == box.mask.rect  # type: ignore[union-attr]
+            assert np.array_equal(off.mask.crop, box.mask.crop)  # type: ignore[union-attr]
+
+
 def test_face_style_with_no_face_and_one_person_box_fills_that_box_black() -> None:
-    params = _params(["facebox"], color="red")
+    params = _params(["facebox"], color="red", orphan="box")
     detections = Detections(faces=(), persons=(PERSON_EMPTY,))
     image = _image()
     out = ShadowMode(params).render(_frame(image), detections, True)
@@ -622,7 +689,7 @@ def test_a_face_cover_wins_over_an_orphan_fill() -> None:
     # A face at belt height does not clear its person box, so the box is an
     # orphan filled black, and the face cover is drawn on top of it.
     low = Face(Box(62, 80, 16, 18))
-    params = _params(["facebox"], color="red")
+    params = _params(["facebox"], color="red", orphan="box")
     detections = Detections(faces=(low,), persons=(PERSON_FACE,))
     p = plan(params, detections, True, SHAPE)
     assert p.orphans == (pad_person(PERSON_FACE, H, W),)
@@ -637,7 +704,7 @@ def test_an_orphan_fill_wins_over_a_silhouette_color() -> None:
     # fill is drawn after the colored silhouette.
     mask = np.array(MASKS["populated"])
     mask[40:60, 108:116] = True
-    params = _params(["silhouette_color"], color="red", dilate=0.0)
+    params = _params(["silhouette_color"], color="red", dilate=0.0, orphan="box")
     detections = Detections(mask=mask, persons=PERSONS["both"])
     p = plan(params, detections, True, SHAPE)
     assert p.orphans == (pad_person(PERSON_EMPTY, H, W),)
@@ -807,7 +874,7 @@ def test_camera2_frame_280_held_face_leaves_its_person_box_an_orphan() -> None:
     held = Face(Box(429, 118, 11, 14, held=2))
     person = Box(409, 111, 60, 154)
     detections = Detections(faces=(held,), persons=(person,), motion=True)
-    p = plan(_params(["facebox"]), detections, True, (480, 640, 3))
+    p = plan(_params(["facebox"], orphan="box"), detections, True, (480, 640, 3))
     assert p.action == "draw"
     assert p.face_rects == (pad_face(held.box, 0.3, 480, 640, grow=held_growth(2)),)
     assert p.orphans == (pad_person(person, 480, 640),)
@@ -816,11 +883,11 @@ def test_camera2_frame_280_held_face_leaves_its_person_box_an_orphan() -> None:
     assert r.x0 <= x and r.y0 <= y and x + w <= r.x1 and y + h <= r.y1
     # The same face detected fresh still clears the box.
     fresh = Detections(faces=(_held_face(held, 0),), persons=(person,), motion=True)
-    assert plan(_params(["facebox"]), fresh, True, (480, 640, 3)).orphans == ()
+    assert plan(_params(["facebox"], orphan="box"), fresh, True, (480, 640, 3)).orphans == ()
 
 
 def test_a_held_face_with_a_person_box_gives_the_orphan_fill() -> None:
-    mode = ShadowMode(_params(["facebox"], color="red"))
+    mode = ShadowMode(_params(["facebox"], color="red", orphan="box"))
     image = _image()
     detections = Detections(faces=(FACE,), persons=(PERSON_FACE,))
     first = mode.render(_frame(image), detections, True)
@@ -855,7 +922,7 @@ def test_held_person_boxes_grow_and_stop_counting_at_the_cap() -> None:
 
 
 def test_held_orphans_grow() -> None:
-    mode = ShadowMode(_params(["facebox"]))
+    mode = ShadowMode(_params(["facebox"], orphan="box"))
     image = _image(0, BIG)
     person = Box(80, 60, 30, 60)
     for n in range(4):
@@ -886,7 +953,7 @@ def test_a_mask_on_the_exact_share_boundary_counts_as_a_region(pixels: int, acti
 
 
 def test_a_mask_speck_is_drawn_when_the_frame_is_drawn_for_another_region() -> None:
-    params = _params(["silhouette", "facebox"], color="red")
+    params = _params(["silhouette", "facebox"], color="red", orphan="box")
     detections = Detections(mask=_speck_mask(), persons=(PERSON_EMPTY,))
     p = plan(params, detections, True, SHAPE)
     assert p.action == "draw" and p.mask is not None
@@ -1026,7 +1093,9 @@ def test_tracker_held_face_and_person_grow_then_turn_black_past_the_cut_off(
     faces = {i: TRACKED_FACE for i in DETECTED}
     persons = {i: TRACKED_PERSON for i in DETECTED}
     image = _image(0, BIG)
-    engine = _tracked_engine(ShadowMode(_params(styles, color="red")), BIG_INFO, faces, persons)
+    engine = _tracked_engine(
+        ShadowMode(_params(styles, color="red", orphan="box")), BIG_INFO, faces, persons
+    )
     outs: list[Output] = []
     for i in range(14):
         outs += engine.step(_big_frame(image, i))
@@ -1389,7 +1458,9 @@ def _sweep_digest(**options: object) -> tuple[int, str]:
     return len(cases), digest.hexdigest()
 
 
-@pytest.mark.parametrize("options", [{}, {"orphan": "box"}], ids=["default", "box"])
+# Only orphan=box: the default is now off, which no longer draws what the
+# recorded sweeps drew.
+@pytest.mark.parametrize("options", [{"orphan": "box"}], ids=["box"])
 def test_orphan_box_renders_the_decision_table_sweeps_byte_identical_to_before(
     options: dict[str, object],
 ) -> None:
@@ -1580,7 +1651,7 @@ def test_head_changes_only_the_orphan_fills_and_never_whether_the_frame_has_regi
         group = list(GROUPS)[int(rng.integers(0, len(GROUPS)))]
         detections = Detections(faces=faces, mask=mask, persons=persons)
         present = bool(rng.random() < 0.8)
-        box = plan(_params(GROUPS[group]), detections, present, HS)
+        box = plan(_params(GROUPS[group], orphan="box"), detections, present, HS)
         head = plan(_params(GROUPS[group], orphan="head"), detections, present, HS)
         assert head.action == box.action
         assert (head.faces, head.face_rects, head.person_rects) == (
@@ -1614,7 +1685,7 @@ def test_a_live_switch_of_orphan_takes_effect_on_the_next_frame() -> None:
         for value in ("box", "head")
     }
     assert not np.array_equal(expected["box"], expected["head"])
-    mode = SHADOW.create(_ctx(("facebox",), info=info))
+    mode = SHADOW.create(_ctx(("facebox",), info=info, orphan="box"))
     engine = _head_engine(mode, info)  # type: ignore[arg-type]
     outs: list[Output] = []
     switches = {3: "head", 6: "box"}
@@ -1631,3 +1702,101 @@ def test_a_live_switch_of_orphan_takes_effect_on_the_next_frame() -> None:
     assert len(outs) == 9
     for i, (out, value) in enumerate(zip(outs, values, strict=True)):
         assert np.array_equal(out.image, expected[value]), f"frame {i}"
+
+
+# ---------------------------------------------------------------------------
+# orphan = off, and the webcam frame that showed the clearing defect
+# ---------------------------------------------------------------------------
+
+WEBCAM = (1080, 1920, 3)
+WEBCAM_PERSON = Box(330, 175, 1500, 905)
+"""The owner's webcam frame: the upper body, cut off by the bottom of the frame.
+
+Its padded box spans x 255 to 1905 and y 129 to 1080, about the black rect seen
+on the first webcam test (x 255 to 1859, y 130 to 1080).
+"""
+WEBCAM_FACE = Face(Box(930, 400, 300, 340), landmarks=((1020.0, 530.0), (1140.0, 530.0)))
+"""A face 300 px wide centered at (1080, 570): below the top third of WEBCAM_PERSON, in its top half."""
+
+
+def _webcam_render(orphan: str, face: Face = WEBCAM_FACE) -> tuple[Plan, np.ndarray, np.ndarray]:
+    params = _params(("eyebar",), orphan=orphan)
+    detections = Detections(faces=(face,), persons=(WEBCAM_PERSON,), motion=True)
+    image = _image(9, WEBCAM)
+    out = ShadowMode(params).render(_frame(image), detections, True)
+    return plan(params, detections, True, WEBCAM), image, out
+
+
+def test_webcam_frame_fixture_matches_what_the_owner_saw() -> None:
+    p = WEBCAM_PERSON
+    assert p.y + p.h == WEBCAM[0]
+    assert pad_person(p, *WEBCAM[:2]) == Rect(255, 129, 1905, 1080)
+    # The face center lies below the top third of the box, so the rule tuned on
+    # CCTV footage alone would leave the box an orphan.
+    cy2 = 2 * WEBCAM_FACE.box.y + WEBCAM_FACE.box.h
+    assert cy2 * 3 > 2 * (p.y * 3 + p.h)
+
+
+@pytest.mark.parametrize("orphan", ["box", "head"])
+def test_webcam_frame_a_detected_face_clears_its_cut_off_box(orphan: str) -> None:
+    p, image, out = _webcam_render(orphan)
+    assert p.action == "draw"
+    assert p.orphans == ()
+    # Only the eye bar is drawn: every changed pixel lies inside the face rect,
+    # and most of the padded person box is shown unchanged.
+    face = _region_in(p.face_rects[0], WEBCAM)
+    changed = np.any(out != image, axis=2)
+    assert changed.any()
+    assert not (changed & ~face).any()
+    _, _, off = _webcam_render("off")
+    assert np.array_equal(out, off)
+
+
+def test_webcam_frame_with_orphan_off_draws_only_the_eye_bar() -> None:
+    p, image, out = _webcam_render("off")
+    assert p.action == "draw" and p.orphans == ()
+    face = _region_in(p.face_rects[0], WEBCAM)
+    assert not (np.any(out != image, axis=2) & ~face).any()
+
+
+def test_webcam_frame_a_held_face_still_leaves_the_box_an_orphan() -> None:
+    held = _held_face(WEBCAM_FACE, 1)
+    p, _, out = _webcam_render("box", held)
+    assert p.orphans == (pad_person(WEBCAM_PERSON, *WEBCAM[:2]),)
+    box = _region_in(p.orphans[0], WEBCAM)
+    face = _region_in(p.face_rects[0], WEBCAM)
+    assert not out[box & ~face].any()
+    # With off the held face is still covered, and the box is not filled.
+    p_off, image, out_off = _webcam_render("off", held)
+    assert p_off.orphans == ()
+    assert not (np.any(out_off != image, axis=2) & ~face).any()
+
+
+def test_orphan_off_reads_every_person_box() -> None:
+    # A malformed person box raises with off too, so the engine fails the frame
+    # closed exactly as with box and head.
+    bad = Detections(faces=(FACE,), persons=(Box(1.5, 2, 3, 4),))  # type: ignore[arg-type]
+    for orphan in ("off", "box", "head"):
+        with pytest.raises(ValueError):
+            plan(_params(("facebox",), orphan=orphan), bad, True, SHAPE)
+
+
+def test_orphan_off_with_a_person_box_and_no_face_is_black() -> None:
+    # The same as with no person detector: the subject is not localized.
+    for persons in (None, (PERSON_EMPTY,), (PERSON_FACE, PERSON_EMPTY)):
+        detections = Detections(faces=(), persons=persons, motion=True)
+        assert plan(_params(("facebox",), orphan="off"), detections, True, SHAPE).action == "black"
+        out = ShadowMode(_params(("facebox",))).render(_frame(_image()), detections, True)
+        assert not out.any()
+
+
+def test_create_builds_a_new_mode_when_orphan_changes() -> None:
+    first = SHADOW.create(_ctx(("facebox",)))
+    assert first.params.orphan == "off"  # type: ignore[attr-defined]
+    assert SHADOW.create(_ctx(("facebox",), orphan="off"), first) is first
+    previous = first
+    for value in ("box", "head", "off", "box"):
+        new = SHADOW.create(_ctx(("facebox",), orphan=value), previous)
+        assert new is not previous and new.params.orphan == value  # type: ignore[attr-defined]
+        assert SHADOW.create(_ctx(("facebox",), orphan=value), new) is new
+        previous = new
