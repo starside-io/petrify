@@ -131,6 +131,25 @@ Both clips are AI-generated (Runway Gen-4.5) webcam-style test footage; no real 
 
 On webcam framing, the silhouette styles with `orphan=head` currently black most of the frame (a known issue being tracked), and `bodybox` covers the whole body box by design.
 
+## Security camera test
+
+<table>
+  <tr>
+    <th>Original</th>
+    <th>Shadow mode</th>
+  </tr>
+  <tr>
+    <td><img src="docs/security-camera1-src.gif" alt="Driveway camera, original" width="100%" /></td>
+    <td><img src="docs/security-camera1-out.gif" alt="Driveway camera, shadow mode" width="100%" /></td>
+  </tr>
+  <tr>
+    <td><img src="docs/security-camera2-src.gif" alt="School corridor camera, original" width="100%" /></td>
+    <td><img src="docs/security-camera2-out.gif" alt="School corridor camera, shadow mode" width="100%" /></td>
+  </tr>
+</table>
+
+The same two clips as the erase demo above, with the same shadow command and style cycle as the webcam test.
+
 ---
 
 ## Documentation
